@@ -846,6 +846,33 @@ export interface NodeInfo {
   guardian_iroh_addr?: string | null;
 }
 
+/** Authenticated, server-derived PQC posture. `unavailable` is a verified
+ * statement that PQC is not in use; absent response data is instead rendered
+ * as "Status unavailable" for nodes that predate this endpoint. */
+export interface PqcOperation {
+  operation: string;
+  applied_at: string;
+  algorithm: string;
+  parameter_set: string | null;
+  available: boolean;
+  session_mode: "hybrid" | "pqc-only" | "classical-only" | null;
+  key_id: string | null;
+  activated_at_ms: number | null;
+  last_verified_at_ms: number | null;
+  reason: string | null;
+}
+
+export interface PqcStatusResponse {
+  observed_at_ms: number;
+  pqc: {
+    status: "active" | "partial" | "unavailable";
+    telemetry: "verified" | "unavailable";
+    scope: string;
+    reason: string | null;
+    operations: PqcOperation[];
+  };
+}
+
 export interface AnycastTable {
   region: string;
   selected: string | null;

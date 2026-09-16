@@ -21,11 +21,92 @@ use anyhow::Result;
 use iroh::{
     endpoint::presets::N0, endpoint::Connection, endpoint::QuicTransportConfig, EndpointAddr,
 };
+use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 // Re-export the endpoint type so callers (hive-cloud) don't depend on iroh directly.
 pub use iroh::Endpoint;
+
+/// Cryptographic state that can be disclosed to an authenticated dashboard
+/// without exposing peer identities, key material, or fleet topology.
+///
+/// This is intentionally derived from the endpoint implementation, rather than
+/// an environment flag: a configured intent is not proof that a KEM or signing
+/// suite was ever enabled or negotiated. `available` therefore means the
+/// current process has a verified live-use signal for the operation.
+#[derive(Clone, Debug, Serialize)]
+pub struct PqcStatus {
+    /// `active`, `partial`, or `unavailable`.
+    pub status: &'static str,
+    /// Whether the endpoint can report authoritative live-use telemetry.
+    pub telemetry: &'static str,
+    /// Narrow statement of what this status covers.
+    pub scope: &'static str,
+    /// Why the requested PQC state is not active, when applicable.
+    pub reason: Option<&'static str>,
+    pub operations: Vec<PqcOperation>,
+}
+
+/// One PQC operation. Null identifiers and times are intentional when an
+/// operation is not active: inventing a fingerprint or activation timestamp
+/// would make an unavailable state look verified.
+#[derive(Clone, Debug, Serialize)]
+pub struct PqcOperation {
+    pub operation: &'static str,
+    pub applied_at: &'static str,
+    pub algorithm: &'static str,
+    pub parameter_set: Option<&'static str>,
+    pub available: bool,
+    pub session_mode: Option<&'static str>,
+    pub key_id: Option<&'static str>,
+    pub activated_at_ms: Option<u64>,
+    pub last_verified_at_ms: Option<u64>,
+    pub reason: Option<&'static str>,
+}
+
+/// Authoritative status for the currently linked iroh endpoint implementation.
+///
+/// Hive presently builds iroh with its default/ring provider and does not
+/// create ML-DSA signatures. Keep this explicit until code both enables the
+/// suite and records negotiated/live signing use; a Cargo feature or planned
+/// migration alone must never turn the UI green.
+pub fn pqc_status(now_ms: u64) -> PqcStatus {
+    PqcStatus {
+        status: "unavailable",
+        telemetry: "verified",
+        scope: "No post-quantum operation is active for this authenticated tenant's mesh use.",
+        reason: Some(
+            "This process has no ML-KEM or ML-DSA live-use telemetry because those suites are not enabled.",
+        ),
+        operations: vec![
+            PqcOperation {
+                operation: "Key encapsulation",
+                applied_at: "Transport handshake",
+                algorithm: "ML-KEM (Kyber)",
+                parameter_set: None,
+                available: false,
+                session_mode: Some("classical-only"),
+                key_id: None,
+                activated_at_ms: None,
+                last_verified_at_ms: Some(now_ms),
+                reason: Some("The active transport uses classical X25519, not ML-KEM."),
+            },
+            PqcOperation {
+                operation: "Signing",
+                applied_at: "Mesh gossip and signed artifacts",
+                algorithm: "ML-DSA (Dilithium)",
+                parameter_set: None,
+                available: false,
+                session_mode: None,
+                key_id: None,
+                activated_at_ms: None,
+                last_verified_at_ms: Some(now_ms),
+                reason: Some("ML-DSA is not used for mesh gossip, API signing, or artifact signing."),
+            },
+        ],
+    }
+}
 
 /// Public mainline-DHT address lookup (`bind_full` registers it; `--dht-probe`
 /// and `GET /v1/mesh/discovery` read it). See the module docs for what becomes

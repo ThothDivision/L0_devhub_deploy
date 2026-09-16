@@ -33,6 +33,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         // incident). Unauthenticated like /healthz, for the same reason: the
         // watchdog polling it has no JWT.
         .route("/v1/mesh", get(mesh_health))
+        .route("/v1/security/pqc", get(pqc_status))
         .route("/v1/overview", get(overview))
         .route("/v1/tasks/health", get(tasks_health))
         .route("/v1/nodes", get(nodes))
@@ -8153,6 +8154,23 @@ pub(crate) async fn nodes(
         })
         .collect();
     Ok(Json(json!(sanitized)))
+}
+
+/// Authenticated, tenant-safe PQC posture for the Dev Hub.
+///
+/// This deliberately returns no peer identifiers, raw certificates, or
+/// cross-tenant deployment metadata. The p2p layer reports only suites that
+/// its current process has actually enabled and verified; unknown or legacy
+/// telemetry must remain unavailable rather than being inferred from config.
+async fn pqc_status(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    let observed_at_ms = now_ms();
+    Ok(Json(json!({
+        "observed_at_ms": observed_at_ms,
+        "pqc": hive_p2p::pqc_status(observed_at_ms),
+    })))
 }
 
 async fn cluster_status(
