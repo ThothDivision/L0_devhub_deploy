@@ -14,11 +14,13 @@ tokio = { workspace = true }
 bytes = "1"
 anyhow = { workspace = true }
 tracing = { workspace = true }
-# `tls-aws-lc-rs` is required for rustls's hybrid X25519MLKEM768 group.  Keep
-# iroh's classical groups too: an older peer must negotiate X25519 rather than
-# becoming unreachable during a rolling upgrade.
-iroh = { version = "1", features = ["tls-aws-lc-rs"] }
-rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
+# Do not inherit iroh's `tls-ring` default: the endpoint supplies the AWS-LC
+# provider explicitly and keeps X25519 only as an interoperability fallback.
+iroh = { version = "1", default-features = false, features = ["metrics", "portmapper", "tls-aws-lc-rs"] }
+# `Connection::handshake_data` is an erased value.  This direct dependency is
+# solely for downcasting it to rustls' authoritative negotiated KEX metadata.
+noq = { version = "1.0.1", default-features = false, features = ["runtime-tokio", "rustls-aws-lc-rs"] }
+rustls = { version = "0.23.40", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "std"] }
 # Public mainline-DHT (pkarr/BEP-44) address lookup — see `src/dht.rs` for what
 # becomes publicly resolvable and how it is gated. `iroh-mainline-address-lookup`
 # 0.4 depends on iroh ^1.0 / iroh-dns ^1.0, matching the pins above; it does NOT
@@ -32,6 +34,7 @@ n0-future = "0.3"
 url = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+ml-dsa = { version = "0.1.1", features = ["zeroize"] }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

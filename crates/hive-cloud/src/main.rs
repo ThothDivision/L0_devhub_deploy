@@ -934,6 +934,11 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::info!(%url, "this node's relay_url (advertised via gossip)");
     }
 
+    // This exports only cross-signed public enrollment material. The ML-DSA
+    // seed remains node-local (0600) inside hive-p2p.
+    let pq_enrollment = iroh_ep
+        .as_ref()
+        .and_then(|endpoint| hive_p2p::pqc_enrollment(endpoint.secret_key()));
     let me = NodeInfo {
         id: args.name.clone(),
         name: args.name.clone(),
@@ -1021,6 +1026,11 @@ async fn async_main() -> anyhow::Result<()> {
         oom_restarts_24h: crate::restart_audit::oom_restarts_24h(),
         last_oom_ms: crate::restart_audit::last_oom_ms(),
         backend: backend_name.clone(),
+        pq_mldsa44_public: pq_enrollment.as_ref().map(|e| e.public_key_hex.clone()),
+        pq_ed25519_binding: pq_enrollment
+            .as_ref()
+            .map(|e| e.ed25519_binding_hex.clone()),
+        pq_mldsa_binding: pq_enrollment.as_ref().map(|e| e.mldsa_binding_hex.clone()),
         gpu_count: gpus.0,
         wasm_runtime: wasm_rt,
         bun_runtime: bun_rt,
@@ -1102,9 +1112,11 @@ async fn async_main() -> anyhow::Result<()> {
     // therefore before deployment_ledger, the integrity chain's backing
     // store) existed, so the observer is wired in here instead of at
     // `Fluid::start`.
-    cloud.fluid.set_execution_observer(
-        crate::deployment_ledger::LedgerExecutionObserver::new(cloud.deployment_ledger.clone()),
-    );
+    cloud
+        .fluid
+        .set_execution_observer(crate::deployment_ledger::LedgerExecutionObserver::new(
+            cloud.deployment_ledger.clone(),
+        ));
     // Advertise the sealed-artifact transfer receiver only after CloudState
     // construction PROVED it initialized (durable store opened, worker
     // spawned, interrupted transactions recovered). A receiver that failed
@@ -1486,6 +1498,7 @@ async fn async_main() -> anyhow::Result<()> {
                             cloud.peer_iroh.write().insert(remote_id.clone(), (remote_id.clone(), addr));
                         }
                         let name = node.name.clone();
+                        crate::admin::enroll_node_pqc(&node);
                         cloud.registry.upsert_peer_self_report(node);
                         cloud.audit.record("_global", "mesh", "join", "node", &name, &format!("endpoint {remote_id} admitted via join proof"));
                         tracing::info!(peer = %remote_id, node = %name, "mesh join ADMITTED (hot-join, key-addressed)");
@@ -3786,8 +3799,10 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                     // upsert_peer_self_report); everything after it is a
                     // relayed third-party copy that must never rename.
                     if peer_self_id.as_deref() == Some(n.id.as_str()) {
+                        crate::admin::enroll_node_pqc(&n);
                         cloud.registry.upsert_peer_self_report(n);
                     } else {
+                        crate::admin::enroll_node_pqc(&n);
                         cloud.registry.upsert_peer(n);
                     }
                 }
@@ -5200,11 +5215,14 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
                         tracing::warn!(tenant, error = %e, "ledger checkpoint prune: relational delete failed, retrying next tick");
                         continue;
                     }
-                    let removed =
-                        cloud
-                            .billing
-                            .prune_ledger_range(tenant, cp.period_start_ms, cp.period_end_ms);
-                    cloud.billing.mark_checkpoint_pruned(tenant, cp.period_start_ms);
+                    let removed = cloud.billing.prune_ledger_range(
+                        tenant,
+                        cp.period_start_ms,
+                        cp.period_end_ms,
+                    );
+                    cloud
+                        .billing
+                        .mark_checkpoint_pruned(tenant, cp.period_start_ms);
                     tracing::info!(
                         tenant,
                         removed,

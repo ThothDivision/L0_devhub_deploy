@@ -33,7 +33,6 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         // incident). Unauthenticated like /healthz, for the same reason: the
         // watchdog polling it has no JWT.
         .route("/v1/mesh", get(mesh_health))
-        .route("/v1/security/pqc", get(pqc_status))
         .route("/v1/overview", get(overview))
         .route("/v1/tasks/health", get(tasks_health))
         .route("/v1/nodes", get(nodes))
@@ -51,9 +50,6 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/functions", get(functions))
         .route("/v1/tunnels", get(tunnels))
         .route("/v1/relay", get(relay_stats))
-        // Authenticated, server-derived PQC posture for the Developer Hub.
-        // It describes this node's real endpoint configuration, not an
-        // unobservable claim about every peer connection.
         .route("/v1/security/pqc", get(pqc_status))
         .route("/v1/gpu-pools", get(gpu_pools))
         .route("/v1/inference", get(inference_endpoints))
@@ -1985,7 +1981,13 @@ pub(crate) async fn post_to_host_json(
             }
         }
         if crate::auth::enforced() {
-            if let Ok(token) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+            if let Ok(token) = crate::auth::issue(
+                "mesh-internal",
+                team,
+                "service",
+                false,
+                crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+            ) {
                 request = request.bearer_auth(token);
             }
         }
@@ -3480,8 +3482,7 @@ pub(crate) async fn deployment_integrity(
         if !team_ok {
             return Err(StatusCode::NOT_FOUND);
         }
-        let chain_head_sha256 =
-            hive_core::fold_integrity_chain(&id, &acceptance.integrity_chain);
+        let chain_head_sha256 = hive_core::fold_integrity_chain(&id, &acceptance.integrity_chain);
         let signature = c.integrity_signer.sign_chain_head(&chain_head_sha256);
         let sep_public_keys: Vec<&hive_core::IntegrityEntryKind> = acceptance
             .integrity_chain
@@ -5983,9 +5984,13 @@ pub(crate) async fn dispatch_project_delete_with(
                     }
                 }
                 if crate::auth::enforced() {
-                    if let Ok(token) =
-                        crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS)
-                    {
+                    if let Ok(token) = crate::auth::issue(
+                        "mesh-internal",
+                        team,
+                        "service",
+                        false,
+                        crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+                    ) {
                         request = request.bearer_auth(token);
                     }
                 }
@@ -6802,7 +6807,13 @@ pub(crate) async fn fetch_bytes_from_host(
         .header("x-hive-team", team)
         .timeout(std::time::Duration::from_secs(15));
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+        if let Ok(tok) = crate::auth::issue(
+            "mesh-internal",
+            team,
+            "service",
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
             rb = rb.bearer_auth(tok);
         }
     }
@@ -6824,7 +6835,13 @@ async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str
     // proxied here silently 403'd. Attach the same short-lived signed service
     // delegation `fanout_remote` uses so this node-to-node read authenticates.
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+        if let Ok(tok) = crate::auth::issue(
+            "mesh-internal",
+            team,
+            "service",
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
             rb = rb.bearer_auth(tok);
         }
     }
@@ -6932,7 +6949,13 @@ pub(crate) fn mesh_team_qs(team: &str) -> String {
         return String::new();
     }
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+        if let Ok(tok) = crate::auth::issue(
+            "mesh-internal",
+            team,
+            "service",
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
             return format!("team={team}&tok={tok}");
         }
     }
@@ -7915,8 +7938,31 @@ pub(crate) async fn node_announce(
     c.cluster.adopt_epoch(node.cp_epoch);
     // The announcing node is describing ITSELF — the authoritative copy that
     // may rename it past a stale registry entry (upsert_peer_self_report).
+    enroll_node_pqc(&node);
     c.registry.upsert_peer_self_report(node);
     Json(json!(c.registry.nodes()))
+}
+
+/// Enroll only self-consistent, dual-attested public ML-DSA material. This
+/// accepts no caller-provided trust decision: the existing Ed25519 endpoint
+/// itself and the ML-DSA key both verify the same domain-separated binding.
+pub(crate) fn enroll_node_pqc(node: &hive_edge::NodeInfo) {
+    let (Some(endpoint), Some(public_key_hex), Some(ed25519_binding_hex), Some(mldsa_binding_hex)) = (
+        node.peer_id.as_deref(),
+        node.pq_mldsa44_public.as_deref(),
+        node.pq_ed25519_binding.as_deref(),
+        node.pq_mldsa_binding.as_deref(),
+    ) else {
+        return;
+    };
+    let enrollment = hive_p2p::PqcEnrollment {
+        public_key_hex: public_key_hex.to_string(),
+        ed25519_binding_hex: ed25519_binding_hex.to_string(),
+        mldsa_binding_hex: mldsa_binding_hex.to_string(),
+    };
+    if let Err(error) = hive_p2p::enroll_pqc_peer(endpoint, &enrollment) {
+        tracing::warn!(node = %node.id, peer = %endpoint, error = %error, "ignored invalid ML-DSA enrollment");
+    }
 }
 
 /// Observability for the hot-join mesh: the persisted key-addressed roster (this
@@ -8156,23 +8202,6 @@ pub(crate) async fn nodes(
     Ok(Json(json!(sanitized)))
 }
 
-/// Authenticated, tenant-safe PQC posture for the Dev Hub.
-///
-/// This deliberately returns no peer identifiers, raw certificates, or
-/// cross-tenant deployment metadata. The p2p layer reports only suites that
-/// its current process has actually enabled and verified; unknown or legacy
-/// telemetry must remain unavailable rather than being inferred from config.
-async fn pqc_status(
-    claims: Option<axum::Extension<crate::auth::Claims>>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    require_auth_read(claims.as_ref().map(|e| &e.0))?;
-    let observed_at_ms = now_ms();
-    Ok(Json(json!({
-        "observed_at_ms": observed_at_ms,
-        "pqc": hive_p2p::pqc_status(observed_at_ms),
-    })))
-}
-
 async fn cluster_status(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
@@ -8394,41 +8423,85 @@ async fn relay_stats(
     })
 }
 
-/// Cryptographic posture exposed to authenticated Developer Hub users.
-///
-/// Iroh/rustls currently does not expose the negotiated KX group once a QUIC
-/// connection is established. Consequently `kem_preferred` means that this
-/// node creates new mesh connections with X25519MLKEM768 first in its offered
-/// group list; it does not overclaim that every live connection used it.
+/// Tenant-safe PQC posture for the current process.  This is intentionally an
+/// aggregate: endpoint IDs, certificates, handshake bytes, and per-peer
+/// topology remain operator diagnostics and are not emitted here.
 async fn pqc_status(
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_auth_read(claims.as_ref().map(|e| &e.0))?;
-    let status = hive_p2p::pqc_status();
+    let kex = hive_p2p::pqc_telemetry();
+    let signing = hive_p2p::pqc_signing_telemetry();
+    let (status, mode, detail) = if !kex.telemetry_available {
+        (
+            "unavailable",
+            "unknown",
+            "Status unavailable: negotiated KEX telemetry is absent.",
+        )
+    } else if kex.live_hybrid_sessions > 0 {
+        (
+            "active",
+            "hybrid",
+            "ML-KEM is currently in use on one or more live Hive mesh QUIC sessions.",
+        )
+    } else if kex.live_classical_sessions > 0 {
+        (
+            "fallback",
+            "classical",
+            "PQC is not currently in use; live sessions negotiated classical X25519.",
+        )
+    } else {
+        (
+            "unavailable",
+            "unknown",
+            "Status unavailable: this process has no live negotiated mesh session evidence.",
+        )
+    };
+    let (signing_status, signing_detail) = if signing.verified_total > 0 {
+        (
+            "active",
+            "ML-DSA has verified one or more live dual-signed Hive gossip messages.",
+        )
+    } else {
+        (
+            "unavailable",
+            "Status unavailable: no verified live ML-DSA signing or verification is enabled.",
+        )
+    };
+    let signing_fingerprint = (signing.verified_total > 0)
+        .then(hive_p2p::pqc_signing_key_fingerprint)
+        .flatten();
     Ok(Json(json!({
+        "status": status,
+        "detail": detail,
         "transport": {
-            "state": if status.kem_preferred { "preferred" } else { "unavailable" },
-            "algorithm": status.kem_preferred.then_some("X25519MLKEM768"),
-            "standard_name": status.kem_preferred.then_some("ML-KEM (Kyber)"),
-            "hybrid": status.kem_preferred,
-            "detail": if status.kem_preferred {
-                "New mesh connections prefer hybrid X25519MLKEM768; classical X25519 remains available for peers that do not support ML-KEM."
-            } else {
-                "This node has no post-quantum key-exchange provider configured."
-            },
+            "status": status,
+            "algorithm": "ML-KEM (Kyber)",
+            "hybrid_group": "X25519MLKEM768",
+            "mode": mode,
+            "operation_scope": ["Hive mesh QUIC sessions observed by this process"],
+            // iroh transport identity remains Ed25519 and uses raw public
+            // keys, so there is no PQ certificate/key ID to truthfully show.
+            "key_or_certificate_id": Value::Null,
+            "activated_ms": kex.activated_ms,
+            "last_verified_ms": kex.last_verified_ms,
+            "telemetry": kex,
         },
-        "signing": {
-            "state": if status.mldsa_active { "active" } else { "unavailable" },
-            "algorithm": status.mldsa_active.then_some("ML-DSA-44"),
-            "standard_name": status.mldsa_active.then_some("ML-DSA (Dilithium)"),
-            "detail": if status.mldsa_active {
-                "Mesh messages use ML-DSA signatures."
-            } else {
-                "ML-DSA (Dilithium) message signing is not enabled."
-            },
+        "message_signing": {
+            "status": signing_status,
+            "algorithm": "ML-DSA (Dilithium)",
+            "parameter_set": "ML-DSA-44",
+            "operation_scope": ["Dual-signed Hive mesh gossip messages"],
+            "key_id_or_fingerprint": signing_fingerprint,
+            "activated_ms": signing.activated_ms,
+            "last_verified_ms": signing.last_verified_ms,
+            "detail": signing_detail,
+            "telemetry": signing,
         },
-        "negotiated_connection_telemetry": false,
-        "updated_ms": now_ms(),
+        "limitations": [
+            "This status applies only to the listed operations, not all traffic, stored data, identities, or certificates.",
+            "Iroh transport identity and peer admission remain Ed25519; ML-KEM protects key exchange confidentiality, not transport identity."
+        ]
     })))
 }
 

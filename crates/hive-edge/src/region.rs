@@ -301,6 +301,17 @@ pub struct NodeInfo {
     /// this node is never a CCN-private dial target.
     #[serde(default)]
     pub private_addr: Option<String>,
+    /// ML-DSA-44 enrollment public key. This is useful only with both
+    /// cross-attestations below and is absent on pre-PQC nodes.
+    #[serde(default)]
+    pub pq_mldsa44_public: Option<String>,
+    /// Existing iroh Ed25519 identity attestation over the ML-DSA binding.
+    #[serde(default)]
+    pub pq_ed25519_binding: Option<String>,
+    /// ML-DSA attestation over the same binding. The two signatures prevent
+    /// a roster entry from substituting either identity independently.
+    #[serde(default)]
+    pub pq_mldsa_binding: Option<String>,
 }
 
 /// Great-circle distance (km) between two lat/lon points — for "nearest node".
@@ -1145,6 +1156,9 @@ mod tests {
             backend: String::new(),
             provider: None,
             private_addr: None,
+            pq_mldsa44_public: None,
+            pq_ed25519_binding: None,
+            pq_mldsa_binding: None,
         }
     }
 

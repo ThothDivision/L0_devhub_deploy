@@ -890,6 +890,52 @@ export interface RateLimitStats {
   blocked_total: number;
 }
 
+/** Authenticated, tenant-safe aggregate from `/v1/security/pqc`.
+ * Values are recorded from completed transport/signing operations by the
+ * backend; configuration and untrusted client input never contribute. */
+export interface PqcTransportStatus {
+  status: "active" | "fallback" | "unavailable";
+  algorithm: string;
+  hybrid_group: string;
+  mode: "hybrid" | "classical" | "unknown";
+  operation_scope: string[];
+  key_or_certificate_id: string | null;
+  activated_ms: number | null;
+  last_verified_ms: number | null;
+  telemetry: {
+    telemetry_available: boolean;
+    hybrid_connections_total: number;
+    classical_connections_total: number;
+    unknown_connections_total: number;
+    live_hybrid_sessions: number;
+    live_classical_sessions: number;
+    live_unknown_sessions: number;
+  };
+}
+export interface PqcStatus {
+  status: "active" | "fallback" | "unavailable";
+  detail: string;
+  transport: PqcTransportStatus;
+  message_signing: {
+    status: "active" | "partial" | "fallback" | "unavailable";
+    algorithm: string;
+    parameter_set: string;
+    operation_scope: string[];
+    key_id_or_fingerprint: string | null;
+    activated_ms: number | null;
+    last_verified_ms: number | null;
+    detail: string;
+    telemetry?: {
+      signing_total: number;
+      verified_total: number;
+      verification_failures: number;
+      missing_enrollment: number;
+      downgrade_events: number;
+    };
+  };
+  limitations: string[];
+}
+
 export interface Event {
   ts_ms: number;
   region: string;

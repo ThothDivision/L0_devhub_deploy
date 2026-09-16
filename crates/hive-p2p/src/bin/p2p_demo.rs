@@ -55,23 +55,62 @@ async fn spawn_function() -> Result<String> {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber_init();
+    let classical_peer = std::env::args().any(|arg| arg == "--classical-peer");
+    let mldsa_witness = std::env::args().any(|arg| arg == "--mldsa-witness");
+    let key_root = std::env::temp_dir().join(format!("hive-pqc-demo-{}", std::process::id()));
 
     // ---- Node B (the instance host) ----
     let function = spawn_function().await?;
-    let ep_b = hive_p2p::bind().await?;
+    // Create a genuinely classical-only TLS peer to demonstrate the precise
+    // mixed-fleet fallback. This affects its offered KEX groups before bind;
+    // the printed result still comes solely from the completed handshake.
+    if classical_peer {
+        std::env::set_var("HIVE_PQC_WITNESS_CLASSICAL_ONLY", "1");
+    }
+    let ep_b = if mldsa_witness {
+        hive_p2p::bind_full(Some(key_root.join("b-iroh.key")), &[], &[], true).await?
+    } else {
+        hive_p2p::bind().await?
+    };
+    if classical_peer {
+        std::env::remove_var("HIVE_PQC_WITNESS_CLASSICAL_ONLY");
+    }
     let node_b_id = ep_b.id();
     let addr_b = ep_b.addr();
+    let b_enrollment = mldsa_witness.then(|| {
+        hive_p2p::pqc_enrollment(ep_b.secret_key())
+            .expect("persistent endpoint initialized ML-DSA-44")
+    });
     println!("node B id: {node_b_id}");
     let max_conc = 100;
+    let gossip = mldsa_witness.then(|| {
+        std::sync::Arc::new(|_: u8, _: String, _: Vec<u8>, signer: Option<String>| {
+            Box::pin(async move {
+                format!(
+                    "verified dual-signed gossip from {}",
+                    signer.unwrap_or_default()
+                )
+                .into_bytes()
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + Send>>
+        }) as hive_p2p::GossipHandler
+    });
     tokio::spawn(hive_p2p::serve_tunnels(
-        ep_b, function, max_conc, None, None,
+        ep_b.clone(),
+        function,
+        max_conc,
+        None,
+        gossip,
     ));
 
     // ---- Node A (the gateway) dials B by endpoint id, over P2P ----
-    let ep_a = hive_p2p::bind().await?;
+    let ep_a = if mldsa_witness {
+        hive_p2p::bind_full(Some(key_root.join("a-iroh.key")), &[], &[], true).await?
+    } else {
+        hive_p2p::bind().await?
+    };
     println!("node A id: {}", ep_a.id());
     println!("dialing node B peer-to-peer over iroh...");
-    let stream = hive_p2p::dial(&ep_a, addr_b).await?;
+    let stream = hive_p2p::dial(&ep_a, addr_b.clone()).await?;
     let client = TunnelClient::new(stream);
 
     // Fire a handful of concurrent requests over the single P2P tunnel.
@@ -107,7 +146,48 @@ async fn main() -> Result<()> {
         assert_eq!(status, 200);
         assert!(body.contains("iroh-p2p"));
     }
-    println!("OK: 5 requests routed over an iroh P2P tunnel");
+    if mldsa_witness {
+        let enrollment = hive_p2p::pqc_enrollment(ep_a.secret_key())
+            .expect("persistent endpoint initialized ML-DSA-44");
+        hive_p2p::enroll_pqc_peer(&ep_a.id().to_string(), &enrollment)?;
+        hive_p2p::enroll_pqc_peer(
+            &node_b_id.to_string(),
+            b_enrollment.as_ref().expect("B enrollment"),
+        )?;
+        // This alters the sender's real wire mode; the response is admitted
+        // only after the receiver verifies both signatures against enrollment.
+        std::env::set_var("HIVE_GOSSIP_SIGN_V2", "1");
+        let response = hive_p2p::PeerPool::new(ep_a.clone())
+            .gossip_request(
+                &node_b_id.to_string(),
+                &serde_json::to_string(&addr_b)?,
+                hive_p2p::GOSSIP_POST,
+                "/pqc-witness",
+                b"dual signature",
+            )
+            .await?;
+        std::env::remove_var("HIVE_GOSSIP_SIGN_V2");
+        println!("ML-DSA witness: {}", String::from_utf8_lossy(&response));
+        println!(
+            "ML-DSA telemetry: {}",
+            serde_json::to_string(&hive_p2p::pqc_signing_telemetry())?
+        );
+        let _ = std::fs::remove_dir_all(&key_root);
+    }
+    println!(
+        "OK: 5 requests routed over an iroh P2P tunnel ({})",
+        if classical_peer {
+            "classical-only peer witness"
+        } else {
+            "hybrid peer witness"
+        }
+    );
+    // This is negotiated rustls handshake evidence, not the configured
+    // provider or an environment flag.
+    println!(
+        "negotiated KEX telemetry: {}",
+        serde_json::to_string(&hive_p2p::pqc_telemetry())?
+    );
     Ok(())
 }
 

@@ -12,7 +12,7 @@
 //! * [`dial`] — open a P2P connection to a remote instance and return a duplex
 //!   byte stream a [`fluid_tunnel::TunnelClient`] can drive (the gateway side).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -21,91 +21,382 @@ use anyhow::Result;
 use iroh::{
     endpoint::presets::N0, endpoint::Connection, endpoint::QuicTransportConfig, EndpointAddr,
 };
-use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 // Re-export the endpoint type so callers (hive-cloud) don't depend on iroh directly.
 pub use iroh::Endpoint;
 
-/// Cryptographic state that can be disclosed to an authenticated dashboard
-/// without exposing peer identities, key material, or fleet topology.
-///
-/// This is intentionally derived from the endpoint implementation, rather than
-/// an environment flag: a configured intent is not proof that a KEM or signing
-/// suite was ever enabled or negotiated. `available` therefore means the
-/// current process has a verified live-use signal for the operation.
-#[derive(Clone, Debug, Serialize)]
-pub struct PqcStatus {
-    /// `active`, `partial`, or `unavailable`.
-    pub status: &'static str,
-    /// Whether the endpoint can report authoritative live-use telemetry.
-    pub telemetry: &'static str,
-    /// Narrow statement of what this status covers.
-    pub scope: &'static str,
-    /// Why the requested PQC state is not active, when applicable.
-    pub reason: Option<&'static str>,
-    pub operations: Vec<PqcOperation>,
+const ML_DSA44_PUBLIC_BYTES: usize = 1312;
+const ML_DSA44_SIGNATURE_BYTES: usize = 2420;
+const PQ_BIND_DOMAIN: &[u8] = b"hive-pq-bind-v1\0";
+const GOSSIP_V2_DOMAIN: &[u8] = b"hive-gossip-v2\0";
+const GOSSIP_V2_CONTEXT: &[u8] = b"hive-gossip-v2";
+
+/// A public, cross-signed ML-DSA enrollment bound to the existing iroh
+/// Ed25519 identity. The private ML-DSA seed never leaves this process.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PqcEnrollment {
+    pub public_key_hex: String,
+    pub ed25519_binding_hex: String,
+    pub mldsa_binding_hex: String,
 }
 
-/// One PQC operation. Null identifiers and times are intentional when an
-/// operation is not active: inventing a fingerprint or activation timestamp
-/// would make an unavailable state look verified.
-#[derive(Clone, Debug, Serialize)]
-pub struct PqcOperation {
-    pub operation: &'static str,
-    pub applied_at: &'static str,
-    pub algorithm: &'static str,
-    pub parameter_set: Option<&'static str>,
-    pub available: bool,
-    pub session_mode: Option<&'static str>,
-    pub key_id: Option<&'static str>,
-    pub activated_at_ms: Option<u64>,
-    pub last_verified_at_ms: Option<u64>,
-    pub reason: Option<&'static str>,
+struct PqcSigningKey(ml_dsa::SigningKey<ml_dsa::MlDsa44>);
+
+static PQ_SIGNING_KEY: std::sync::LazyLock<std::sync::RwLock<Option<Arc<PqcSigningKey>>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+static PQ_PEERS: std::sync::LazyLock<StdMutex<HashMap<String, Vec<u8>>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+static PQ_V2_OBSERVED: std::sync::LazyLock<StdMutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(HashSet::new()));
+
+/// Counters are incremented only at the signing and dual-verification
+/// boundaries, never merely when a key exists or an enrollment is received.
+#[derive(Default)]
+struct PqcSigningStats {
+    signed: AtomicU64,
+    verified: AtomicU64,
+    failed: AtomicU64,
+    missing_enrollment: AtomicU64,
+    downgrade: AtomicU64,
+    activated_ms: Option<u64>,
+    last_verified_ms: Option<u64>,
 }
 
-/// Authoritative status for the currently linked iroh endpoint implementation.
-///
-/// Hive presently builds iroh with its default/ring provider and does not
-/// create ML-DSA signatures. Keep this explicit until code both enables the
-/// suite and records negotiated/live signing use; a Cargo feature or planned
-/// migration alone must never turn the UI green.
-pub fn pqc_status(now_ms: u64) -> PqcStatus {
-    PqcStatus {
-        status: "unavailable",
-        telemetry: "verified",
-        scope: "No post-quantum operation is active for this authenticated tenant's mesh use.",
-        reason: Some(
-            "This process has no ML-KEM or ML-DSA live-use telemetry because those suites are not enabled.",
-        ),
-        operations: vec![
-            PqcOperation {
-                operation: "Key encapsulation",
-                applied_at: "Transport handshake",
-                algorithm: "ML-KEM (Kyber)",
-                parameter_set: None,
-                available: false,
-                session_mode: Some("classical-only"),
-                key_id: None,
-                activated_at_ms: None,
-                last_verified_at_ms: Some(now_ms),
-                reason: Some("The active transport uses classical X25519, not ML-KEM."),
-            },
-            PqcOperation {
-                operation: "Signing",
-                applied_at: "Mesh gossip and signed artifacts",
-                algorithm: "ML-DSA (Dilithium)",
-                parameter_set: None,
-                available: false,
-                session_mode: None,
-                key_id: None,
-                activated_at_ms: None,
-                last_verified_at_ms: Some(now_ms),
-                reason: Some("ML-DSA is not used for mesh gossip, API signing, or artifact signing."),
-            },
-        ],
+static PQ_SIGNING_STATS: std::sync::LazyLock<StdMutex<PqcSigningStats>> =
+    std::sync::LazyLock::new(|| StdMutex::new(PqcSigningStats::default()));
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PqcSigningTelemetry {
+    pub signing_total: u64,
+    pub verified_total: u64,
+    pub verification_failures: u64,
+    pub missing_enrollment: u64,
+    pub downgrade_events: u64,
+    pub activated_ms: Option<u64>,
+    pub last_verified_ms: Option<u64>,
+}
+
+pub fn pqc_signing_telemetry() -> PqcSigningTelemetry {
+    let state = PQ_SIGNING_STATS.lock().unwrap_or_else(|p| p.into_inner());
+    PqcSigningTelemetry {
+        signing_total: state.signed.load(Ordering::Relaxed),
+        verified_total: state.verified.load(Ordering::Relaxed),
+        verification_failures: state.failed.load(Ordering::Relaxed),
+        missing_enrollment: state.missing_enrollment.load(Ordering::Relaxed),
+        downgrade_events: state.downgrade.load(Ordering::Relaxed),
+        activated_ms: state.activated_ms,
+        last_verified_ms: state.last_verified_ms,
     }
+}
+
+/// A short fingerprint of this node's ML-DSA public key. It intentionally
+/// exposes no peer enrollment or private material.
+pub fn pqc_signing_key_fingerprint() -> Option<String> {
+    use ml_dsa::Keypair;
+    let key = PQ_SIGNING_KEY.read().ok()?.as_ref()?.clone();
+    Some(hex_encode(&key.0.verifying_key().encode().as_slice()[..16]))
+}
+
+fn pq_bind_preimage(endpoint_id: &str, public: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(PQ_BIND_DOMAIN.len() + endpoint_id.len() + public.len());
+    message.extend_from_slice(PQ_BIND_DOMAIN);
+    message.extend_from_slice(&(endpoint_id.len() as u16).to_be_bytes());
+    message.extend_from_slice(endpoint_id.as_bytes());
+    message.extend_from_slice(public);
+    message
+}
+
+/// The KEX group rustls reports for an established iroh connection.  This is
+/// observation, not configuration: an AWS-LC endpoint can still negotiate
+/// classical X25519 with an older peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NegotiatedKex {
+    Hybrid,
+    Classical,
+    Unknown,
+}
+
+impl NegotiatedKex {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Hybrid => "X25519MLKEM768",
+            Self::Classical => "X25519",
+            Self::Unknown => "unknown/unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PqcTelemetry {
+    /// The process is built with the KEX metadata downcast and will report only
+    /// negotiated values from rustls, never an environment/configuration value.
+    pub telemetry_available: bool,
+    pub hybrid_connections_total: u64,
+    pub classical_connections_total: u64,
+    pub unknown_connections_total: u64,
+    pub live_hybrid_sessions: u64,
+    pub live_classical_sessions: u64,
+    pub live_unknown_sessions: u64,
+    pub activated_ms: Option<u64>,
+    pub last_verified_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy)]
+struct KexObservation {
+    group: NegotiatedKex,
+}
+
+#[derive(Default)]
+struct KexTelemetryState {
+    sessions: HashMap<usize, KexObservation>,
+    hybrid_total: u64,
+    classical_total: u64,
+    unknown_total: u64,
+    activated_ms: Option<u64>,
+    last_verified_ms: Option<u64>,
+}
+
+static KEX_TELEMETRY: std::sync::LazyLock<StdMutex<KexTelemetryState>> =
+    std::sync::LazyLock::new(|| StdMutex::new(KexTelemetryState::default()));
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn load_or_create_pqc_signing_key(path: &std::path::Path) -> Result<PqcSigningKey> {
+    use ml_dsa::{Generate, SigningKey};
+    let seed = match std::fs::read(path) {
+        Ok(bytes) => {
+            let seed = ml_dsa::Seed::try_from(bytes.as_slice())
+                .map_err(|_| anyhow::anyhow!("ML-DSA seed at {} is malformed", path.display()))?;
+            seed
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let key = SigningKey::<ml_dsa::MlDsa44>::generate();
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(path, key.to_seed().as_slice())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            tracing::info!(?path, "generated + persisted ML-DSA-44 signing seed");
+            return Ok(PqcSigningKey(key));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    Ok(PqcSigningKey(SigningKey::<ml_dsa::MlDsa44>::from_seed(
+        &seed,
+    )))
+}
+
+/// Initialize the node-local ML-DSA-44 key. A malformed or unreadable existing
+/// key fails closed: silently rotating would invalidate a roster enrollment.
+fn initialize_pqc_signing_key(path: &std::path::Path) -> Result<()> {
+    let key = Arc::new(load_or_create_pqc_signing_key(path)?);
+    *PQ_SIGNING_KEY
+        .write()
+        .map_err(|_| anyhow::anyhow!("ML-DSA signing key lock poisoned"))? = Some(key);
+    Ok(())
+}
+
+/// Return a dual attestation binding this process's ML-DSA-44 public key to its
+/// existing Ed25519 iroh identity. This is enrollment material, not proof that
+/// ML-DSA has protected a live message.
+pub fn pqc_enrollment(secret: &iroh::SecretKey) -> Option<PqcEnrollment> {
+    use ml_dsa::{signature::SignatureEncoding, Keypair};
+    let key = PQ_SIGNING_KEY.read().ok()?.as_ref()?.clone();
+    let public = key.0.verifying_key().encode();
+    let public = public.as_slice();
+    let binding = pq_bind_preimage(&secret.public().to_string(), public);
+    let ed = secret.sign(&binding);
+    let pq = key
+        .0
+        .expanded_key()
+        .sign_deterministic(&binding, PQ_BIND_DOMAIN)
+        .ok()?;
+    Some(PqcEnrollment {
+        public_key_hex: hex_encode(public),
+        ed25519_binding_hex: hex_encode(&ed.to_bytes()),
+        mldsa_binding_hex: hex_encode(pq.to_bytes().as_slice()),
+    })
+}
+
+/// Validate and retain a peer enrollment. Callers must supply the endpoint id
+/// authenticated by the enclosing gossip connection, never a body assertion.
+pub fn enroll_pqc_peer(endpoint_id: &str, enrollment: &PqcEnrollment) -> Result<()> {
+    let public = hex_decode(&enrollment.public_key_hex)
+        .ok_or_else(|| anyhow::anyhow!("invalid ML-DSA public key encoding"))?;
+    if public.len() != ML_DSA44_PUBLIC_BYTES {
+        anyhow::bail!("invalid ML-DSA-44 public key length");
+    }
+    let encoded = ml_dsa::EncodedVerifyingKey::<ml_dsa::MlDsa44>::try_from(public.as_slice())
+        .map_err(|_| anyhow::anyhow!("invalid ML-DSA-44 public key"))?;
+    let verifying = ml_dsa::VerifyingKey::<ml_dsa::MlDsa44>::decode(&encoded);
+    let binding = pq_bind_preimage(endpoint_id, &public);
+    let ed_sig = hex_decode(&enrollment.ed25519_binding_hex)
+        .filter(|s| s.len() == 64)
+        .ok_or_else(|| anyhow::anyhow!("invalid Ed25519 enrollment binding"))?;
+    let mut ed_bytes = [0u8; 64];
+    ed_bytes.copy_from_slice(&ed_sig);
+    let endpoint: iroh::PublicKey = endpoint_id
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid enrolled endpoint id"))?;
+    endpoint
+        .verify(&binding, &iroh::Signature::from_bytes(&ed_bytes))
+        .map_err(|_| anyhow::anyhow!("invalid Ed25519 enrollment binding"))?;
+    let pq_sig = hex_decode(&enrollment.mldsa_binding_hex)
+        .ok_or_else(|| anyhow::anyhow!("invalid ML-DSA enrollment binding"))?;
+    let pq_sig = ml_dsa::Signature::<ml_dsa::MlDsa44>::try_from(pq_sig.as_slice())
+        .map_err(|_| anyhow::anyhow!("invalid ML-DSA enrollment signature"))?;
+    if !verifying.verify_with_context(&binding, PQ_BIND_DOMAIN, &pq_sig) {
+        anyhow::bail!("invalid ML-DSA enrollment binding");
+    }
+    PQ_PEERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(endpoint_id.to_string(), public);
+    Ok(())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0xf) as usize] as char);
+    }
+    output
+}
+
+fn hex_decode(input: &str) -> Option<Vec<u8>> {
+    fn nibble(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return None;
+    }
+    bytes
+        .chunks_exact(2)
+        .map(|chunk| Some(nibble(chunk[0])? << 4 | nibble(chunk[1])?))
+        .collect()
+}
+
+fn negotiated_kex(conn: &Connection) -> NegotiatedKex {
+    conn.handshake_data()
+        .and_then(|data| data.downcast::<noq::crypto::rustls::HandshakeData>().ok())
+        .and_then(|data| data.negotiated_key_exchange_group)
+        .map(|group| match group {
+            rustls::NamedGroup::X25519MLKEM768 => NegotiatedKex::Hybrid,
+            rustls::NamedGroup::X25519 => NegotiatedKex::Classical,
+            _ => NegotiatedKex::Unknown,
+        })
+        .unwrap_or(NegotiatedKex::Unknown)
+}
+
+/// Record the concrete rustls KEX selected for a live iroh connection and
+/// remove it only once iroh says that exact connection has closed.  No caller
+/// provides the group; it comes from QUIC's completed TLS handshake metadata.
+fn observe_connection_kex(conn: &Connection) {
+    let stable_id = conn.stable_id();
+    let group = negotiated_kex(conn);
+    let observed_ms = now_ms();
+    {
+        let mut state = KEX_TELEMETRY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if state.sessions.contains_key(&stable_id) {
+            return;
+        }
+        state.sessions.insert(stable_id, KexObservation { group });
+        match group {
+            NegotiatedKex::Hybrid => {
+                state.hybrid_total = state.hybrid_total.saturating_add(1);
+                state.activated_ms.get_or_insert(observed_ms);
+            }
+            NegotiatedKex::Classical => {
+                state.classical_total = state.classical_total.saturating_add(1)
+            }
+            NegotiatedKex::Unknown => state.unknown_total = state.unknown_total.saturating_add(1),
+        }
+        state.last_verified_ms = Some(observed_ms);
+    }
+    tracing::info!(
+        kex = group.name(),
+        connection = stable_id,
+        "observed negotiated mesh KEX"
+    );
+    let conn = conn.clone();
+    tokio::spawn(async move {
+        conn.closed().await;
+        if let Ok(mut state) = KEX_TELEMETRY.lock() {
+            state.sessions.remove(&stable_id);
+        }
+    });
+}
+
+/// An aggregate-only snapshot suitable for authenticated tenant status.  It
+/// deliberately includes neither peer identity nor connection/certificate
+/// material.
+pub fn pqc_telemetry() -> PqcTelemetry {
+    let state = KEX_TELEMETRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut live_hybrid_sessions = 0;
+    let mut live_classical_sessions = 0;
+    let mut live_unknown_sessions = 0;
+    for observation in state.sessions.values() {
+        match observation.group {
+            NegotiatedKex::Hybrid => live_hybrid_sessions += 1,
+            NegotiatedKex::Classical => live_classical_sessions += 1,
+            NegotiatedKex::Unknown => live_unknown_sessions += 1,
+        }
+    }
+    PqcTelemetry {
+        telemetry_available: true,
+        hybrid_connections_total: state.hybrid_total,
+        classical_connections_total: state.classical_total,
+        unknown_connections_total: state.unknown_total,
+        live_hybrid_sessions,
+        live_classical_sessions,
+        live_unknown_sessions,
+        activated_ms: state.activated_ms,
+        last_verified_ms: state.last_verified_ms,
+    }
+}
+
+/// Explicit provider policy for every Hive mesh endpoint.  The explicit
+/// builder override remains authoritative even if Cargo feature unification
+/// brings iroh's ring feature back through another workspace dependency.
+fn pq_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    use rustls::crypto::aws_lc_rs::kx_group;
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    // This switch exists solely for the p2p diagnostic's old-peer witness:
+    // it changes the real TLS offer before bind, never the observed status.
+    provider.kx_groups = if std::env::var_os("HIVE_PQC_WITNESS_CLASSICAL_ONLY").is_some() {
+        vec![kx_group::X25519, kx_group::SECP256R1, kx_group::SECP384R1]
+    } else {
+        vec![
+            kx_group::X25519MLKEM768,
+            kx_group::X25519,
+            kx_group::SECP256R1,
+            kx_group::SECP384R1,
+        ]
+    };
+    Arc::new(provider)
 }
 
 /// Public mainline-DHT address lookup (`bind_full` registers it; `--dht-probe`
@@ -113,28 +404,6 @@ pub fn pqc_status(now_ms: u64) -> PqcStatus {
 /// publicly resolvable and every env flag that gates it.
 pub mod dht;
 pub mod private_path;
-
-/// The PQC posture of a newly-created mesh endpoint.
-///
-/// This is deliberately configuration-level telemetry. Iroh does not expose
-/// the negotiated TLS key-exchange group on an established connection, so it
-/// must never be presented as proof that a particular peer negotiated ML-KEM.
-#[derive(Clone, Copy, Debug, serde::Serialize)]
-pub struct PqcStatus {
-    /// Hybrid X25519MLKEM768 is offered first, with classical groups retained
-    /// for mixed-fleet compatibility.
-    pub kem_preferred: bool,
-    /// ML-DSA/Dilithium message signatures are not implemented yet.
-    pub mldsa_active: bool,
-}
-
-/// Return the exact cryptographic posture configured by [`bind_full`].
-pub fn pqc_status() -> PqcStatus {
-    PqcStatus {
-        kem_preferred: true,
-        mldsa_active: false,
-    }
-}
 
 /// Connection-level QUIC idle timeout for trunked connections.
 ///
@@ -357,6 +626,9 @@ const STREAM_GOSSIP: u8 = 0x02;
 /// signer to the QUIC connection's authenticated remote identity (signer == remote,
 /// so a signed message can't be replayed by a third party from another channel).
 const STREAM_GOSSIP_SIGNED: u8 = 0x03;
+/// Dual-signed gossip. This is deliberately a NEW mode: v1 has a fixed
+/// 104-byte trailer and must never be extended in place.
+const STREAM_GOSSIP_SIGNED_V2: u8 = 0x06;
 /// MESH JOIN (hot-join): a NOT-YET-TRUSTED node introduces itself. Framing:
 /// `[u32 node_len][node_json][u32 proof_len][proof]` -> response `[u32 len][bytes]`
 /// (empty = rejected). The caller's identity is the QUIC connection's
@@ -399,6 +671,7 @@ const GOSSIP_METHOD_GET: u8 = 0;
 const GOSSIP_METHOD_POST: u8 = 1;
 /// Domain separator for gossip signatures (versioned; bump on format change).
 const GOSSIP_SIG_DOMAIN: &[u8] = b"hive-gossip-v1";
+const GOSSIP_V2_SUITE_MLDSA44: u8 = 1;
 /// Cap on a single gossip frame (request path/body or response) — gossip payloads
 /// are small JSON rosters; this just bounds a malformed/hostile length prefix.
 const GOSSIP_MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -604,6 +877,15 @@ pub enum VerifyMode {
     Off,
     Log,
     Enforce,
+    /// Require dual-signed v2 gossip after a peer has demonstrated v2. This
+    /// ratchet is deliberately opt-in; rollout begins in Log mode.
+    EnforcePq,
+}
+
+impl VerifyMode {
+    fn enforces_signature(self) -> bool {
+        matches!(self, Self::Enforce | Self::EnforcePq)
+    }
 }
 
 /// Whether outbound gossip is signed (`HIVE_GOSSIP_SIGN=1`). Default OFF until the
@@ -611,6 +893,14 @@ pub enum VerifyMode {
 pub fn gossip_sign_enabled() -> bool {
     std::env::var("HIVE_GOSSIP_SIGN")
         .map(|v| v == "1" || v == "true")
+        .unwrap_or(false)
+}
+
+/// V2 is additionally gated by a validated peer enrollment, so enabling this
+/// flag cannot send an unknown stream mode to an older peer.
+pub fn gossip_sign_v2_enabled() -> bool {
+    std::env::var("HIVE_GOSSIP_SIGN_V2")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
 }
 
@@ -622,6 +912,7 @@ pub fn verify_mode() -> VerifyMode {
         .as_str()
     {
         "off" => VerifyMode::Off,
+        "enforce-pq" | "strict-pq" => VerifyMode::EnforcePq,
         "enforce" | "strict" | "1" => VerifyMode::Enforce,
         _ => VerifyMode::Log,
     }
@@ -701,6 +992,140 @@ pub fn sign_gossip(
     out[32..40].copy_from_slice(&ts_ms.to_be_bytes());
     out[40..104].copy_from_slice(&sig.to_bytes());
     out
+}
+
+/// Construct the v2 dual-signature preimage. Its distinct domain and suite id
+/// make a v1 signature or another ML-DSA use non-interchangeable.
+fn gossip_v2_preimage(method: u8, path: &str, body: &[u8], ts_ms: u64) -> Vec<u8> {
+    let mut message =
+        Vec::with_capacity(GOSSIP_V2_DOMAIN.len() + 1 + 1 + 4 + path.len() + 4 + body.len() + 8);
+    message.extend_from_slice(GOSSIP_V2_DOMAIN);
+    message.push(GOSSIP_V2_SUITE_MLDSA44);
+    message.push(method);
+    message.extend_from_slice(&(path.len() as u32).to_be_bytes());
+    message.extend_from_slice(path.as_bytes());
+    message.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    message.extend_from_slice(body);
+    message.extend_from_slice(&ts_ms.to_be_bytes());
+    message
+}
+
+/// Build the variable-length v2 trailer:
+/// `[u8 suite][32 ed25519 pk][8 timestamp][64 ed25519 sig][2420 ML-DSA-44 sig]`.
+fn sign_gossip_v2(
+    secret: &iroh::SecretKey,
+    method: u8,
+    path: &str,
+    body: &[u8],
+    ts_ms: u64,
+) -> Option<Vec<u8>> {
+    use ml_dsa::signature::SignatureEncoding;
+    let key = PQ_SIGNING_KEY.read().ok()?.as_ref()?.clone();
+    let preimage = gossip_v2_preimage(method, path, body, ts_ms);
+    let pq_signature = key
+        .0
+        .expanded_key()
+        .sign_deterministic(&preimage, GOSSIP_V2_CONTEXT)
+        .ok()?;
+    let ed_signature = secret.sign(&preimage);
+    let mut trailer = Vec::with_capacity(1 + 32 + 8 + 64 + ML_DSA44_SIGNATURE_BYTES);
+    trailer.push(GOSSIP_V2_SUITE_MLDSA44);
+    trailer.extend_from_slice(secret.public().as_bytes());
+    trailer.extend_from_slice(&ts_ms.to_be_bytes());
+    trailer.extend_from_slice(&ed_signature.to_bytes());
+    trailer.extend_from_slice(pq_signature.to_bytes().as_slice());
+    Some(trailer)
+}
+
+fn verify_gossip_v2(
+    trailer: &[u8],
+    method: u8,
+    path: &str,
+    body: &[u8],
+    remote_id: &str,
+    now_ms: u64,
+) -> Result<String, &'static str> {
+    const V2_TRAILER_BYTES: usize = 1 + 32 + 8 + 64 + ML_DSA44_SIGNATURE_BYTES;
+    if trailer.len() != V2_TRAILER_BYTES || trailer.first() != Some(&GOSSIP_V2_SUITE_MLDSA44) {
+        PQ_SIGNING_STATS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .failed
+            .fetch_add(1, Ordering::Relaxed);
+        return Err("malformed ML-DSA gossip trailer");
+    }
+    let mut public = [0u8; 32];
+    public.copy_from_slice(&trailer[1..33]);
+    let signer = iroh::PublicKey::from_bytes(&public).map_err(|_| "invalid signer key")?;
+    let mut ts_bytes = [0u8; 8];
+    ts_bytes.copy_from_slice(&trailer[33..41]);
+    let ts = u64::from_be_bytes(ts_bytes);
+    let preimage = gossip_v2_preimage(method, path, body, ts);
+    let mut ed_signature = [0u8; 64];
+    ed_signature.copy_from_slice(&trailer[41..105]);
+    if signer
+        .verify(&preimage, &iroh::Signature::from_bytes(&ed_signature))
+        .is_err()
+    {
+        PQ_SIGNING_STATS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .failed
+            .fetch_add(1, Ordering::Relaxed);
+        return Err("Ed25519 v2 signature invalid");
+    }
+    let signer_id = signer.to_string();
+    if !remote_id.is_empty() && signer_id != remote_id {
+        PQ_SIGNING_STATS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .failed
+            .fetch_add(1, Ordering::Relaxed);
+        return Err("signer does not match connection identity");
+    }
+    if now_ms.abs_diff(ts) > gossip_ts_window_ms() {
+        PQ_SIGNING_STATS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .failed
+            .fetch_add(1, Ordering::Relaxed);
+        return Err("timestamp outside freshness window");
+    }
+    let enrolled = PQ_PEERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&signer_id)
+        .cloned();
+    let Some(enrolled) = enrolled else {
+        PQ_SIGNING_STATS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .missing_enrollment
+            .fetch_add(1, Ordering::Relaxed);
+        return Err("missing verified ML-DSA enrollment");
+    };
+    let encoded = ml_dsa::EncodedVerifyingKey::<ml_dsa::MlDsa44>::try_from(enrolled.as_slice())
+        .map_err(|_| "invalid enrolled ML-DSA public key")?;
+    let verifying = ml_dsa::VerifyingKey::<ml_dsa::MlDsa44>::decode(&encoded);
+    let signature = ml_dsa::Signature::<ml_dsa::MlDsa44>::try_from(&trailer[105..])
+        .map_err(|_| "invalid ML-DSA signature")?;
+    if !verifying.verify_with_context(&preimage, GOSSIP_V2_CONTEXT, &signature) {
+        PQ_SIGNING_STATS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .failed
+            .fetch_add(1, Ordering::Relaxed);
+        return Err("ML-DSA signature invalid");
+    }
+    let mut stats = PQ_SIGNING_STATS.lock().unwrap_or_else(|p| p.into_inner());
+    stats.verified.fetch_add(1, Ordering::Relaxed);
+    stats.activated_ms.get_or_insert(now_ms);
+    stats.last_verified_ms = Some(now_ms);
+    PQ_V2_OBSERVED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(signer_id.clone());
+    Ok(signer_id)
 }
 
 /// Verify a signed-gossip trailer. `remote_id` is the QUIC connection's
@@ -2752,6 +3177,10 @@ impl PeerPool {
                     drop(state);
                     leader_guard.disarm();
                     self.opened.fetch_add(1, Ordering::Relaxed);
+                    // The only authoritative KEX evidence is the completed
+                    // rustls handshake on this trunk.  Provider selection
+                    // above is deliberately not used as status evidence.
+                    observe_connection_kex(&conn);
                     // Path observability (mandatory per the CCN-preference
                     // spec): classify which transport this trunk's SELECTED
                     // path actually landed on, from iroh's own live per-path
@@ -3293,7 +3722,33 @@ impl PeerPool {
             // stream mode as a tunnel — staged rollout is: (1) ship binary fleet-wide
             // (receivers understand both modes), (2) flip signing on everywhere,
             // (3) flip `HIVE_GOSSIP_VERIFY=enforce`. Each phase is mixed-fleet safe.
-            if gossip_sign_enabled() {
+            // V2 is selected only for a peer whose ML-DSA public key was
+            // independently cross-attested and enrolled locally. Every other
+            // peer stays on the old fixed v1 trailer, preserving mixed fleets.
+            let v2 = gossip_sign_v2_enabled()
+                && PQ_PEERS
+                    .lock()
+                    .map(|peers| peers.contains_key(&acquired.key))
+                    .unwrap_or(false);
+            if v2 {
+                let ts = now_ms();
+                let trailer = sign_gossip_v2(self.ep.secret_key(), method, path, body, ts)
+                    .ok_or_else(|| anyhow::anyhow!("ML-DSA v2 signing key unavailable"))?;
+                if trailer.len() > u32::MAX as usize {
+                    anyhow::bail!("ML-DSA gossip trailer too large");
+                }
+                send.write_all(&[STREAM_GOSSIP_SIGNED_V2, method]).await?;
+                send.write_all(&(path.len() as u32).to_be_bytes()).await?;
+                send.write_all(path.as_bytes()).await?;
+                send.write_all(&(body.len() as u32).to_be_bytes()).await?;
+                send.write_all(body).await?;
+                send.write_all(&(trailer.len() as u32).to_be_bytes())
+                    .await?;
+                send.write_all(&trailer).await?;
+                let mut stats = PQ_SIGNING_STATS.lock().unwrap_or_else(|p| p.into_inner());
+                stats.signed.fetch_add(1, Ordering::Relaxed);
+                stats.activated_ms.get_or_insert(ts);
+            } else if gossip_sign_enabled() {
                 let ts = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as u64)
@@ -3561,10 +4016,18 @@ pub async fn bind_full(
     // ever handed a mode-byte stream.
     .alpns(vec![HIVE_ALPN.to_vec(), BROWSER_ALPN.to_vec()])
     .transport_config(tc)
-    // Prefer hybrid post-quantum key exchange for every new mesh connection.
-    // Classical groups remain in the provider so pre-upgrade peers negotiate
-    // normally during a rolling deployment.
-    .crypto_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+    // `Minimal`/`N0` choose a provider from enabled iroh features (and prefer
+    // ring when both providers are present).  This final explicit override is
+    // therefore intentional and is the unification-proof security boundary.
+    .crypto_provider(pq_crypto_provider());
+    if std::env::var_os("HIVE_PQC_WITNESS_CLASSICAL_ONLY").is_some() {
+        tracing::info!(kx_offer = ?["X25519", "SECP256R1", "SECP384R1"], "configured classical-only diagnostic peer");
+    } else {
+        tracing::info!(
+            kx_offer = ?["X25519MLKEM768", "X25519", "SECP256R1", "SECP384R1"],
+            "configured AWS-LC hybrid PQ KEX preference"
+        );
+    }
     // Self-hosted relays (HIVE_RELAY_URLS): when set, NAT-traversal + relayed data
     // paths transit OUR iroh-relay infra instead of n0's — applied in BOTH branches,
     // overriding the preset's relay map. Direct hole-punching is unchanged (relays stay
@@ -3617,7 +4080,15 @@ pub async fn bind_full(
     // is what makes the DHT record's key equal to this node's `EndpointId`.
     // `None` (no key file: tests/dev, ephemeral identity) keeps iroh's own
     // generate-on-bind behaviour, exactly as before.
-    let secret = key_path.map(|path| load_or_create_secret(&path));
+    let secret = key_path.as_ref().map(|path| load_or_create_secret(path));
+    // ML-DSA is deliberately independent from the iroh Ed25519 identity:
+    // the enrollment below binds them, but iroh's transport authentication
+    // remains Ed25519. A persistent mesh endpoint always gets a persistent
+    // ML-DSA seed beside it; failure is loud rather than silently rotating.
+    if let Some(path) = key_path.as_ref() {
+        let pq_path = path.with_file_name("mldsa44_signing.seed");
+        initialize_pqc_signing_key(&pq_path)?;
+    }
     if let Some(sk) = &secret {
         builder = builder.secret_key(sk.clone());
     }
@@ -3892,6 +4363,7 @@ pub async fn dial(ep: &Endpoint, addr: impl Into<EndpointAddr>) -> Result<P2pStr
             ))
         }
     };
+    observe_connection_kex(&conn);
     let (mut send, recv) = match tokio::time::timeout(open_budget(), conn.open_bi()).await {
         Ok(Ok(p)) => p,
         Ok(Err(e)) => return Err(e.into()),
@@ -4084,6 +4556,9 @@ async fn serve_fleet_conn(
     raw_resolver: Option<RawTargetResolver>,
 ) {
     let remote_id = conn.remote_id().to_string();
+    // Inbound trunks are separate live sessions too.  Register once per QUIC
+    // connection; the observer removes the record when this connection closes.
+    observe_connection_kex(&conn);
     if let Some(trust) = &trust {
         if !peer_trusted(trust, &remote_id) && join.is_none() {
             tracing::warn!(peer = %remote_id, "rejected untrusted P2P peer (#20 peer trust)");
@@ -4117,17 +4592,9 @@ async fn serve_fleet_conn(
                 return;
             }
             match mode[0] {
-                STREAM_GOSSIP | STREAM_GOSSIP_SIGNED => {
+                STREAM_GOSSIP | STREAM_GOSSIP_SIGNED | STREAM_GOSSIP_SIGNED_V2 => {
                     if let Some(gossip) = gossip {
-                        serve_gossip(
-                            recv,
-                            send,
-                            gossip,
-                            mode[0] == STREAM_GOSSIP_SIGNED,
-                            rid,
-                            trust,
-                        )
-                        .await;
+                        serve_gossip(recv, send, gossip, mode[0], rid, trust).await;
                     }
                 }
                 STREAM_RAW => raw_splice(tokio::io::join(recv, send), &local).await,
@@ -4439,7 +4906,7 @@ pub async fn serve_silent(ep: Endpoint) {
     }
 }
 
-/// Server side of a [`STREAM_GOSSIP`]/[`STREAM_GOSSIP_SIGNED`] stream: read the
+/// Server side of a gossip stream: read the
 /// framed `(method, path, body)` request (+ signature trailer when signed), VERIFY
 /// it per the configured [`VerifyMode`], run the caller-provided handler, and frame
 /// the response back. The mode byte has already been consumed. `remote_id` is the
@@ -4448,7 +4915,7 @@ async fn serve_gossip<R, W>(
     mut recv: R,
     mut send: W,
     handler: GossipHandler,
-    signed: bool,
+    stream_mode: u8,
     remote_id: String,
     trust: Option<TrustSet>,
 ) where
@@ -4471,7 +4938,7 @@ async fn serve_gossip<R, W>(
     // Verify: a signed request must check out; an unsigned one is only admitted
     // below enforce. `verified_signer` flows to the handler for signer-based authz.
     let mut verified_signer: Option<String> = None;
-    if signed {
+    if stream_mode == STREAM_GOSSIP_SIGNED {
         let mut trailer = [0u8; 104];
         if recv.read_exact(&mut trailer).await.is_err() {
             return;
@@ -4498,7 +4965,7 @@ async fn serve_gossip<R, W>(
                     .unwrap_or(true);
                 if trusted {
                     verified_signer = Some(signer);
-                } else if mode == VerifyMode::Enforce {
+                } else if mode.enforces_signature() {
                     VERIFY_STATS.rejected.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(peer = %remote_id, %path, %signer, "REJECTED gossip (signature valid but signer is not a trusted fleet member)");
                     let _ = send.write_all(&0u32.to_be_bytes()).await;
@@ -4513,7 +4980,7 @@ async fn serve_gossip<R, W>(
                 }
             }
             Err(reason) => {
-                if mode == VerifyMode::Enforce {
+                if mode.enforces_signature() {
                     VERIFY_STATS.rejected.fetch_add(1, Ordering::Relaxed);
                     tracing::warn!(peer = %remote_id, %path, %reason, "REJECTED gossip (signature verification failed, enforce mode)");
                     // Explicit empty response: the peer sees a clean failure, not a hang.
@@ -4527,9 +4994,37 @@ async fn serve_gossip<R, W>(
                 }
             }
         }
+    } else if stream_mode == STREAM_GOSSIP_SIGNED_V2 {
+        let trailer_len = match read_u32(&mut recv).await {
+            Ok(length) if length <= 1 + 32 + 8 + 64 + ML_DSA44_SIGNATURE_BYTES => length,
+            _ => return,
+        };
+        let mut trailer = vec![0u8; trailer_len];
+        if recv.read_exact(&mut trailer).await.is_err() {
+            return;
+        }
+        let now = now_ms();
+        match verify_gossip_v2(&trailer, m[0], &path, &body, &remote_id, now) {
+            Ok(signer) => {
+                verified_signer = Some(signer);
+            }
+            Err(reason) => {
+                if mode.enforces_signature() {
+                    VERIFY_STATS.rejected.fetch_add(1, Ordering::Relaxed);
+                    tracing::warn!(peer = %remote_id, %path, %reason, "REJECTED dual-signed gossip");
+                    let _ = send.write_all(&0u32.to_be_bytes()).await;
+                    let _ = send.flush().await;
+                    let _ = send.shutdown().await;
+                    return;
+                }
+                if mode == VerifyMode::Log {
+                    tracing::warn!(peer = %remote_id, %path, %reason, "dual gossip signature invalid (log mode — serving anyway)");
+                }
+            }
+        }
     } else {
         VERIFY_STATS.unsigned.fetch_add(1, Ordering::Relaxed);
-        if mode == VerifyMode::Enforce {
+        if mode.enforces_signature() {
             VERIFY_STATS.rejected.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(peer = %remote_id, %path, "REJECTED unsigned gossip (enforce mode)");
             let _ = send.write_all(&0u32.to_be_bytes()).await;
@@ -4537,6 +5032,30 @@ async fn serve_gossip<R, W>(
             let _ = send.shutdown().await;
             return;
         }
+    }
+    // The downgrade ratchet is keyed only after this receiver has observed a
+    // valid v2 message from the authenticated identity. Enrollment alone is
+    // not enough: rollout traffic can still legitimately be v1.
+    if stream_mode == STREAM_GOSSIP_SIGNED
+        && mode == VerifyMode::EnforcePq
+        && verified_signer.as_ref().is_some_and(|signer| {
+            PQ_V2_OBSERVED
+                .lock()
+                .map(|seen| seen.contains(signer))
+                .unwrap_or(false)
+        })
+    {
+        PQ_SIGNING_STATS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .downgrade
+            .fetch_add(1, Ordering::Relaxed);
+        VERIFY_STATS.rejected.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(peer = %remote_id, %path, "REJECTED v1 gossip after verified v2 ratchet");
+        let _ = send.write_all(&0u32.to_be_bytes()).await;
+        let _ = send.flush().await;
+        let _ = send.shutdown().await;
+        return;
     }
     let resp = handler(m[0], path, body, verified_signer).await;
     let len = (resp.len() as u32).to_be_bytes();

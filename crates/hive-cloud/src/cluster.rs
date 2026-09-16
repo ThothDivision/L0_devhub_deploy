@@ -293,6 +293,9 @@ mod tests {
             backend: "mock".into(),
             provider: None,
             private_addr: None,
+            pq_mldsa44_public: None,
+            pq_ed25519_binding: None,
+            pq_mldsa_binding: None,
         }
     }
 

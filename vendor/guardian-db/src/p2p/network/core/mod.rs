@@ -2085,8 +2085,24 @@ impl IrohBackend {
         // `bind_full()` (crates/hive-p2p/src/lib.rs) — n0's DNS + Pkarr discovery stays active
         // (unaffected by `.relay_mode()`), so peer address resolution is unchanged; only the
         // relayed-data-path / hole-punch-assist fallback moves onto hive's own mesh relays.
-        let mut endpoint_builder =
-            Endpoint::builder(iroh::endpoint::presets::N0).secret_key(self.secret_key.clone());
+        // Do not rely on iroh's preset provider: feature unification can make
+        // it select ring when another dependency retains default features.
+        // Keep X25519 after the hybrid group so old Guardian peers remain
+        // interoperable while upgraded peers negotiate X25519MLKEM768.
+        let mut pq_provider = rustls::crypto::aws_lc_rs::default_provider();
+        pq_provider.kx_groups = vec![
+            rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+            rustls::crypto::aws_lc_rs::kx_group::X25519,
+            rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+            rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+        ];
+        let mut endpoint_builder = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(self.secret_key.clone())
+            .crypto_provider(std::sync::Arc::new(pq_provider));
+        tracing::info!(
+            kx_offer = ?["X25519MLKEM768", "X25519", "SECP256R1", "SECP384R1"],
+            "guardian configured AWS-LC hybrid PQ KEX preference"
+        );
         let raw_relay_env = std::env::var("HIVE_RELAY_URLS").ok();
         tracing::info!(raw_relay_env = ?raw_relay_env, "guardian init: about to bind endpoint");
         if let Some(map) = hive_relay_map_from_env() {

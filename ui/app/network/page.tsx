@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { Globe2, Server, Share2, ShieldCheck, Database, Network, Boxes } from "lucide-react";
 import { Card, Badge, Button, PageHeader, Table, Th, Td } from "@/components/ui";
-import { apiSend, usePoll, type NodeInfo, type AnycastTable, type PqcStatusResponse, type RateLimitStats } from "@/lib/api";
+import { apiSend, usePoll, type NodeInfo, type AnycastTable, type RateLimitStats, type PqcStatus } from "@/lib/api";
 import { SATELLITE_ONLINE_COLOR, SATELLITE_DEGRADED_COLOR } from "@/components/region-map";
 import type { BrowserPresence } from "@/lib/run-node-client";
 import { timeAgo } from "@/lib/utils";
@@ -45,10 +45,10 @@ export default function NetworkPage() {
   // The previous /v1/overview poll here was never read anywhere — deleted.
   const { data: nodes } = usePoll<NodeInfo[]>("/v1/nodes", 10000);
   const { data: cluster } = usePoll<ClusterStatus>("/v1/cluster", 10000);
-  // This is an authenticated, server-derived live-use report. It is separate
-  // from node configuration: absent data means an older/unreachable server and
-  // must not be presented as PQC protection.
-  const { data: pqc } = usePoll<PqcStatusResponse>("/v1/security/pqc", 10000);
+  // This response is process-observed KEX telemetry, not a frontend setting.
+  // An old backend/missing instrumentation produces no data and renders the
+  // deliberately conservative unavailable state below.
+  const { data: pqc } = usePoll<PqcStatus>("/v1/security/pqc", 10000);
   // Low-trust browser-node presence — a SEPARATE feed from `/v1/nodes`, never
   // merged into the fleet node list or capacity totals anywhere on this page
   // (same discipline as the /regions constellation satellites).
@@ -69,8 +69,6 @@ export default function NetworkPage() {
         <Stat icon={<Share2 className="h-4 w-4" />} label="Transport" value="iroh QUIC" />
         <Stat icon={<Database className="h-4 w-4" />} label="State store" value="replicated" />
       </div>
-
-      <PostQuantumSecurity status={pqc} />
 
       {/* P2P mesh map */}
       <Card className="mb-6 overflow-hidden">
@@ -103,6 +101,7 @@ export default function NetworkPage() {
       </Card>
 
       <StorageShards />
+      <PqcCard status={pqc} />
 
       {/* Architecture rows */}
       <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-3">
@@ -163,79 +162,55 @@ export default function NetworkPage() {
   );
 }
 
-function PostQuantumSecurity({ status }: { status: PqcStatusResponse | null }) {
-  const [showDetails, setShowDetails] = useState(false);
-  const pqc = status?.pqc;
-  const headline = !pqc || pqc.telemetry === "unavailable"
-    ? "Status unavailable"
-    : pqc.status === "active"
-      ? "Post-quantum cryptography active"
-      : pqc.status === "partial"
-        ? "Post-quantum cryptography partially active"
-        : "PQC is not currently in use";
-  const tone = !pqc || pqc.telemetry === "unavailable"
-    ? "amber"
-    : pqc.status === "active"
-      ? "green"
-      : pqc.status === "partial"
-        ? "blue"
-        : "default";
+function pqcTone(status?: string): "green" | "amber" | "default" {
+  if (status === "active") return "green";
+  if (status === "fallback" || status === "partial") return "amber";
+  return "default";
+}
 
+function PqcCard({ status }: { status: PqcStatus | null }) {
+  const transport = status?.transport;
+  const signing = status?.message_signing;
+  const live = transport
+    ? transport.telemetry.live_hybrid_sessions + transport.telemetry.live_classical_sessions + transport.telemetry.live_unknown_sessions
+    : 0;
   return (
-    <Card className="mb-6 border-2 border-border-strong" aria-live="polite">
-      <div className="mb-3 flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <div className="flex items-center gap-2 text-base font-semibold">
-            <ShieldCheck className="h-5 w-5" /> Post-Quantum Security
-          </div>
-          <p className="mt-1 text-sm text-secondary">Verified cryptographic use for your authenticated mesh access.</p>
-        </div>
-        <Badge tone={tone}>{headline}</Badge>
+    <Card className="mb-6">
+      <div className="mb-1 flex items-center justify-between">
+        <div className="flex items-center gap-2 text-sm font-medium"><ShieldCheck className="h-4 w-4" /> Post-quantum cryptography</div>
+        <Badge tone={pqcTone(status?.status)}>{status?.status ?? "unavailable"}</Badge>
       </div>
-
-      {!pqc || pqc.telemetry === "unavailable" ? (
-        <p className="text-sm text-secondary">
-          This server did not provide verifiable PQC telemetry. No post-quantum protection claim is shown.
-        </p>
+      {!status || !transport ? (
+        <p className="text-sm text-secondary">Status unavailable: this backend does not provide verified PQC telemetry.</p>
       ) : (
         <>
-          <p className="text-sm text-secondary">{pqc.scope}</p>
-          {pqc.reason && <p className="mt-1 text-xs text-muted">{pqc.reason}</p>}
-          <div className="mt-4 grid gap-3 md:grid-cols-2">
-            {pqc.operations.map((operation) => (
-              <div key={`${operation.operation}-${operation.applied_at}`} className="rounded-lg border border-border p-3 text-sm">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="font-medium">{operation.operation}</span>
-                  <Badge tone={operation.available ? "green" : "default"}>
-                    {operation.available ? "active" : "not in use"}
-                  </Badge>
-                </div>
-                <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
-                  <dt className="text-muted">Algorithm</dt><dd>{operation.algorithm}{operation.parameter_set ? ` · ${operation.parameter_set}` : ""}</dd>
-                  <dt className="text-muted">Applied at</dt><dd>{operation.applied_at}</dd>
-                  {operation.session_mode && <><dt className="text-muted">Session</dt><dd>{operation.session_mode}</dd></>}
-                  {operation.key_id && <><dt className="text-muted">Key ID</dt><dd className="font-mono">{operation.key_id}</dd></>}
-                  {operation.activated_at_ms && <><dt className="text-muted">Activated</dt><dd>{new Date(operation.activated_at_ms).toLocaleString()}</dd></>}
-                  {operation.last_verified_at_ms && <><dt className="text-muted">Last verified</dt><dd>{new Date(operation.last_verified_at_ms).toLocaleString()}</dd></>}
-                </dl>
-                {operation.reason && <p className="mt-2 text-xs text-muted">{operation.reason}</p>}
+          <p className="mb-3 text-sm text-secondary">{status.detail}</p>
+          <div className="grid grid-cols-1 gap-3 text-xs md:grid-cols-2">
+            <div className="rounded-md border border-border p-3">
+              <div className="mb-2 flex justify-between gap-2"><span className="font-medium text-fg">{transport.algorithm}</span><Badge tone={pqcTone(transport.status)}>{transport.mode}</Badge></div>
+              <div className="flex flex-col gap-1 text-secondary">
+                <span>Group: <span className="font-mono text-fg">{transport.hybrid_group}</span></span>
+                <span>Scope: {transport.operation_scope.join(", ") || "none"}</span>
+                <span>Live observed sessions: {live}</span>
+                <span>Activation: {transport.activated_ms ? new Date(transport.activated_ms).toLocaleString() : "—"}</span>
+                <span>Last verified: {transport.last_verified_ms ? new Date(transport.last_verified_ms).toLocaleString() : "—"}</span>
+                <span>Key/certificate ID: {transport.key_or_certificate_id ?? "not available (iroh identity remains Ed25519)"}</span>
               </div>
-            ))}
+            </div>
+            <div className="rounded-md border border-border p-3">
+              <div className="mb-2 flex justify-between gap-2"><span className="font-medium text-fg">{signing?.algorithm ?? "ML-DSA (Dilithium)"}</span><Badge tone={pqcTone(signing?.status)}>{signing?.status ?? "unavailable"}</Badge></div>
+              <div className="flex flex-col gap-1 text-secondary">
+                <span>Parameter set: <span className="font-mono text-fg">{signing?.parameter_set ?? "—"}</span></span>
+                <span>Scope: {signing?.operation_scope.join(", ") || "none"}</span>
+                <span>Activation: {signing?.activated_ms ? new Date(signing.activated_ms).toLocaleString() : "—"}</span>
+                <span>Last verified: {signing?.last_verified_ms ? new Date(signing.last_verified_ms).toLocaleString() : "—"}</span>
+                <span>{signing?.detail ?? "Status unavailable: no verified live ML-DSA signing telemetry."}</span>
+              </div>
+            </div>
           </div>
-          <button
-            type="button"
-            className="mt-4 text-xs font-medium text-secondary underline underline-offset-2"
-            onClick={() => setShowDetails((value) => !value)}
-            aria-expanded={showDetails}
-          >
-            {showDetails ? "Hide protection scope" : "What this status does and does not cover"}
-          </button>
-          {showDetails && (
-            <p className="mt-2 text-xs text-secondary">
-              PQC protection applies only to operations marked active above. It does not establish that all traffic,
-              stored data, identities, certificates, or third-party connections are post-quantum protected.
-            </p>
-          )}
+          <div className="mt-3 border-t border-border pt-3 text-xs text-secondary">
+            {status.limitations.map((limitation) => <p key={limitation} className="mb-1">{limitation}</p>)}
+          </div>
         </>
       )}
     </Card>
