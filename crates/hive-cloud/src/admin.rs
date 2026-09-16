@@ -50,6 +50,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/functions", get(functions))
         .route("/v1/tunnels", get(tunnels))
         .route("/v1/relay", get(relay_stats))
+        // Authenticated, server-derived PQC posture for the Developer Hub.
+        // It describes this node's real endpoint configuration, not an
+        // unobservable claim about every peer connection.
+        .route("/v1/security/pqc", get(pqc_status))
         .route("/v1/gpu-pools", get(gpu_pools))
         .route("/v1/inference", get(inference_endpoints))
         .route("/v1/dns/stats", get(dns_stats))
@@ -8370,6 +8374,44 @@ async fn relay_stats(
         }
         None => Json(json!({ "enabled": false })),
     })
+}
+
+/// Cryptographic posture exposed to authenticated Developer Hub users.
+///
+/// Iroh/rustls currently does not expose the negotiated KX group once a QUIC
+/// connection is established. Consequently `kem_preferred` means that this
+/// node creates new mesh connections with X25519MLKEM768 first in its offered
+/// group list; it does not overclaim that every live connection used it.
+async fn pqc_status(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_auth_read(claims.as_ref().map(|e| &e.0))?;
+    let status = hive_p2p::pqc_status();
+    Ok(Json(json!({
+        "transport": {
+            "state": if status.kem_preferred { "preferred" } else { "unavailable" },
+            "algorithm": status.kem_preferred.then_some("X25519MLKEM768"),
+            "standard_name": status.kem_preferred.then_some("ML-KEM (Kyber)"),
+            "hybrid": status.kem_preferred,
+            "detail": if status.kem_preferred {
+                "New mesh connections prefer hybrid X25519MLKEM768; classical X25519 remains available for peers that do not support ML-KEM."
+            } else {
+                "This node has no post-quantum key-exchange provider configured."
+            },
+        },
+        "signing": {
+            "state": if status.mldsa_active { "active" } else { "unavailable" },
+            "algorithm": status.mldsa_active.then_some("ML-DSA-44"),
+            "standard_name": status.mldsa_active.then_some("ML-DSA (Dilithium)"),
+            "detail": if status.mldsa_active {
+                "Mesh messages use ML-DSA signatures."
+            } else {
+                "ML-DSA (Dilithium) message signing is not enabled."
+            },
+        },
+        "negotiated_connection_telemetry": false,
+        "updated_ms": now_ms(),
+    })))
 }
 
 /// Serverless GPU pool snapshot (operator-only, same guard as `/v1/tunnels` /

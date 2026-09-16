@@ -33,6 +33,28 @@ pub use iroh::Endpoint;
 pub mod dht;
 pub mod private_path;
 
+/// The PQC posture of a newly-created mesh endpoint.
+///
+/// This is deliberately configuration-level telemetry. Iroh does not expose
+/// the negotiated TLS key-exchange group on an established connection, so it
+/// must never be presented as proof that a particular peer negotiated ML-KEM.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
+pub struct PqcStatus {
+    /// Hybrid X25519MLKEM768 is offered first, with classical groups retained
+    /// for mixed-fleet compatibility.
+    pub kem_preferred: bool,
+    /// ML-DSA/Dilithium message signatures are not implemented yet.
+    pub mldsa_active: bool,
+}
+
+/// Return the exact cryptographic posture configured by [`bind_full`].
+pub fn pqc_status() -> PqcStatus {
+    PqcStatus {
+        kem_preferred: true,
+        mldsa_active: false,
+    }
+}
+
 /// Connection-level QUIC idle timeout for trunked connections.
 ///
 /// This deliberately does NOT set a keep-alive interval. `QuicTransportConfig`'s
@@ -3457,7 +3479,11 @@ pub async fn bind_full(
     // OWN connection budget (see `max_browser_conns`) before either one is
     // ever handed a mode-byte stream.
     .alpns(vec![HIVE_ALPN.to_vec(), BROWSER_ALPN.to_vec()])
-    .transport_config(tc);
+    .transport_config(tc)
+    // Prefer hybrid post-quantum key exchange for every new mesh connection.
+    // Classical groups remain in the provider so pre-upgrade peers negotiate
+    // normally during a rolling deployment.
+    .crypto_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
     // Self-hosted relays (HIVE_RELAY_URLS): when set, NAT-traversal + relayed data
     // paths transit OUR iroh-relay infra instead of n0's — applied in BOTH branches,
     // overriding the preset's relay map. Direct hole-punching is unchanged (relays stay

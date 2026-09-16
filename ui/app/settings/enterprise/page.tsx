@@ -5,6 +5,7 @@ import {
   ShieldBan,
   ScrollText,
   KeyRound,
+  ShieldCheck,
   Users,
   Boxes,
   ClipboardCheck,
@@ -74,12 +75,90 @@ export default function EnterprisePage() {
       />
       <div className="flex flex-col gap-5">
         <IpBlocking />
+        <PostQuantumSecurity />
         <SamlSso />
         <ScimSync />
         <SiemStreaming />
         <Microfrontends />
         <Conformance />
       </div>
+    </div>
+  );
+}
+
+/* ======================= Post-quantum security ======================= */
+
+interface PqcOperation {
+  state: "active" | "preferred" | "unavailable";
+  algorithm: string | null;
+  standard_name: string | null;
+  hybrid?: boolean;
+  detail: string;
+}
+
+interface PqcStatus {
+  transport: PqcOperation;
+  signing: PqcOperation;
+  negotiated_connection_telemetry: boolean;
+  updated_ms: number;
+}
+
+function PostQuantumSecurity() {
+  const [status, setStatus] = useState<PqcStatus | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setStatus(await apiGet<PqcStatus>("/v1/security/pqc"));
+      setErr(null);
+    } catch (e) {
+      setErr(String(e));
+    }
+  }, []);
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    load();
+  }, [load]);
+
+  const kemActive = status?.transport.state === "active" || status?.transport.state === "preferred";
+  return (
+    <Section
+      icon={<ShieldCheck className="h-4 w-4" />}
+      title="Post-Quantum Security"
+      desc="Server-derived cryptographic posture for this Dev Hub connection. ML-KEM is the current NIST name for Kyber; ML-DSA is the current NIST name for Dilithium."
+      badge={kemActive ? "ML-KEM preferred" : "Status unavailable"}
+    >
+      {!status ? (
+        <p className="text-sm text-muted">{err ? "Status unavailable. Retry when the control plane is reachable." : "Loading cryptographic status…"}</p>
+      ) : (
+        <div className="flex flex-col gap-3">
+          <PqcOperationRow label="Key exchange" operation={status.transport} activeTone="green" />
+          <PqcOperationRow label="Message signing" operation={status.signing} activeTone="blue" />
+          {!status.negotiated_connection_telemetry ? (
+            <p className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-secondary">
+              ML-KEM is preferred for new mesh connections and falls back to classical X25519 for older peers. Per-connection negotiation telemetry is not available, so this page does not claim that every currently open connection used ML-KEM.
+            </p>
+          ) : null}
+          <p className="text-xs text-muted">
+            Updated {new Date(status.updated_ms).toLocaleString()}. Protection applies only to the operations listed above.
+          </p>
+        </div>
+      )}
+    </Section>
+  );
+}
+
+function PqcOperationRow({ label, operation, activeTone }: { label: string; operation: PqcOperation; activeTone: "green" | "blue" }) {
+  const active = operation.state === "active" || operation.state === "preferred";
+  return (
+    <div className="rounded-lg border border-border p-3 text-sm">
+      <div className="flex items-center justify-between gap-3">
+        <span className="font-medium">{label}</span>
+        <Badge tone={active ? activeTone : "default"}>{active ? operation.state : "unavailable"}</Badge>
+      </div>
+      <p className="mt-1 text-secondary">{operation.standard_name ?? "Not enabled"}</p>
+      {operation.algorithm ? <code className="mt-1 block font-mono text-xs text-muted">{operation.algorithm}{operation.hybrid ? " · hybrid with X25519" : ""}</code> : null}
+      <p className="mt-2 text-xs text-muted">{operation.detail}</p>
     </div>
   );
 }
