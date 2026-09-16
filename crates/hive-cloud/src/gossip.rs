@@ -2011,6 +2011,17 @@ pub fn handler(cloud: Arc<CloudState>) -> hive_p2p::GossipHandler {
         Box::pin(async move {
             if let Some(s) = &signer {
                 tracing::trace!(signer = %s, %path, "verified signed gossip");
+                // Enrollment is accepted only from the node's OWN announcement
+                // carried by a message whose signer is channel-bound to this
+                // QUIC remote. Roster copies from another peer may inform
+                // routing, but cannot establish or replace this binding.
+                if method == hive_p2p::GOSSIP_POST
+                    && path.split('?').next() == Some("/v1/nodes/announce")
+                {
+                    if let Ok(node) = serde_json::from_slice::<hive_edge::NodeInfo>(&body) {
+                        crate::admin::enroll_node_pqc_from_authenticated(&node, s);
+                    }
+                }
             }
             let trust_configured = cloud
                 .trusted_peer_ids
@@ -2123,7 +2134,13 @@ pub async fn fetch(
     // (issue() returns Err, so no header is added -- matching dev/single-node
     // behavior exactly as before).
     if method == hive_p2p::GOSSIP_POST {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", "mesh", "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+        if let Ok(tok) = crate::auth::issue(
+            "mesh-internal",
+            "mesh",
+            "service",
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
             req = req.header("authorization", format!("Bearer {tok}"));
         }
     }

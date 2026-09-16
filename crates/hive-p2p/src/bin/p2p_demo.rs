@@ -11,6 +11,37 @@ use fluid_tunnel::TunnelClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+/// Send one real gossip stream with caller-controlled bytes.  This is kept in
+/// the executable witness so production callers still use `PeerPool`.
+async fn witness_gossip(
+    ep: &hive_p2p::Endpoint,
+    addr: iroh::EndpointAddr,
+    mode: u8,
+    method: u8,
+    path: &[u8],
+    body: &[u8],
+    trailer: &[u8],
+) -> Result<Vec<u8>> {
+    let conn = ep.connect(addr, hive_p2p::HIVE_ALPN).await?;
+    let (mut send, mut recv) = conn.open_bi().await?;
+    send.write_all(&[mode, method]).await?;
+    send.write_all(&(path.len() as u32).to_be_bytes()).await?;
+    send.write_all(path).await?;
+    send.write_all(&(body.len() as u32).to_be_bytes()).await?;
+    send.write_all(body).await?;
+    if mode == 0x06 {
+        send.write_all(&(trailer.len() as u32).to_be_bytes())
+            .await?;
+    }
+    send.write_all(trailer).await?;
+    send.finish()?;
+    let mut len = [0u8; 4];
+    recv.read_exact(&mut len).await?;
+    let mut response = vec![0; u32::from_be_bytes(len) as usize];
+    recv.read_exact(&mut response).await?;
+    Ok(response)
+}
+
 /// Minimal HTTP echo server (the "function").
 async fn spawn_function() -> Result<String> {
     let l = TcpListener::bind("127.0.0.1:0").await?;
@@ -50,6 +81,13 @@ async fn spawn_function() -> Result<String> {
         }
     });
     Ok(addr)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[tokio::main]
@@ -172,6 +210,102 @@ async fn main() -> Result<()> {
             "ML-DSA telemetry: {}",
             serde_json::to_string(&hive_p2p::pqc_signing_telemetry())?
         );
+        std::env::set_var("HIVE_GOSSIP_VERIFY", "enforce-pq");
+        let now = now_ms();
+        let signed = hive_p2p::sign_gossip_v2(
+            ep_a.secret_key(),
+            hive_p2p::GOSSIP_POST,
+            "/pqc-witness",
+            b"dual signature",
+            now,
+        )
+        .expect("ML-DSA signing key");
+        let tampered_body = witness_gossip(
+            &ep_a,
+            addr_b.clone(),
+            0x06,
+            hive_p2p::GOSSIP_POST,
+            b"/pqc-witness",
+            b"tampered body",
+            &signed,
+        )
+        .await?;
+        assert!(tampered_body.is_empty());
+        let mut bad_signature = signed.clone();
+        *bad_signature.last_mut().expect("signature bytes") ^= 1;
+        let tampered_signature = witness_gossip(
+            &ep_a,
+            addr_b.clone(),
+            0x06,
+            hive_p2p::GOSSIP_POST,
+            b"/pqc-witness",
+            b"dual signature",
+            &bad_signature,
+        )
+        .await?;
+        assert!(tampered_signature.is_empty());
+        let old = hive_p2p::sign_gossip_v2(
+            ep_a.secret_key(),
+            hive_p2p::GOSSIP_POST,
+            "/pqc-witness",
+            b"dual signature",
+            now.saturating_sub(301_000),
+        )
+        .expect("ML-DSA signing key");
+        let replay = witness_gossip(
+            &ep_a,
+            addr_b.clone(),
+            0x06,
+            hive_p2p::GOSSIP_POST,
+            b"/pqc-witness",
+            b"dual signature",
+            &old,
+        )
+        .await?;
+        assert!(replay.is_empty());
+        let v1 = hive_p2p::sign_gossip(
+            ep_a.secret_key(),
+            hive_p2p::GOSSIP_POST,
+            "/pqc-witness",
+            b"dual signature",
+            now_ms(),
+        );
+        let downgrade = witness_gossip(
+            &ep_a,
+            addr_b.clone(),
+            0x03,
+            hive_p2p::GOSSIP_POST,
+            b"/pqc-witness",
+            b"dual signature",
+            &v1,
+        )
+        .await?;
+        assert!(downgrade.is_empty());
+        let ep_c = hive_p2p::bind_full(Some(key_root.join("c-iroh.key")), &[], &[], true).await?;
+        let mut invalid = hive_p2p::pqc_enrollment(ep_c.secret_key()).expect("C enrollment");
+        invalid.mldsa_binding_hex.replace_range(..2, "00");
+        assert!(hive_p2p::enroll_pqc_peer(&ep_c.id().to_string(), &invalid).is_err());
+        let missing = hive_p2p::sign_gossip_v2(
+            ep_c.secret_key(),
+            hive_p2p::GOSSIP_POST,
+            "/pqc-witness",
+            b"dual signature",
+            now_ms(),
+        )
+        .expect("ML-DSA signing key");
+        let missing_enrollment = witness_gossip(
+            &ep_c,
+            addr_b.clone(),
+            0x06,
+            hive_p2p::GOSSIP_POST,
+            b"/pqc-witness",
+            b"dual signature",
+            &missing,
+        )
+        .await?;
+        assert!(missing_enrollment.is_empty());
+        std::env::remove_var("HIVE_GOSSIP_VERIFY");
+        println!("ML-DSA witness: rejected tampered body/signature, replay, invalid or missing enrollment, and v1 downgrade after v2.");
         let _ = std::fs::remove_dir_all(&key_root);
     }
     println!(

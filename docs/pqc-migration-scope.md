@@ -1,6 +1,7 @@
 # RFC: Post-Quantum Cryptography Migration Scope for the Hive Mesh
 
-- **Status**: Draft for review (implementation architecture clarified; ML-DSA enrollment and dual-signed gossip are reported active only after real signing and verification)
+- **Status**: Hybrid KEM preference and application-level ML-DSA gossip v2 are
+  implemented; iroh transport identity migration remains out of scope.
 - **Date**: 2026-07-20
 - **Scope**: every iroh-anchored cryptographic identity, signature, MAC, and key file in `/Users/dylanwong/fluid/hive`; PQC readiness of the locked dependency stack; a phased, mixed-fleet-safe migration plan
 - **Inputs**: three research passes — (1) crypto-surface inventory of the codebase, (2) dependency-side PQC readiness analysis (verified against in-lock crate sources), (3) migration-strategy design (threat model, dual-sign wire design, size/perf math). Cross-report factual conflicts were re-verified against source and resolved in Appendix C.
@@ -20,7 +21,11 @@ The quantum risk decomposes into three buckets with very different urgency:
 
 3. **Transport identity — structurally unfixable locally.** iroh's NodeId is definitionally a 32-byte ed25519 key, hardwired through TLS RPK verification, relay handshake frames, tickets, discovery, and pkarr's 1000-byte/fixed-offset wire format. A local fork is a 2-4 engineer-month initial effort with permanent divergence cost, racing an upstream (n0) team that has explicitly scoped the same migration and is waiting on industry consensus. **Phase 2 recommendation: do not fork.** Phase 1's cross-attested ed25519↔ML-DSA binding converts "CRQC impersonates any node" into "CRQC must also break ML-DSA" for the control plane, which contains the blast radius until upstream ships PQ identity.
 
-Recommended sequencing: **Phase 0 now** (primary + secondary TLS legs), **Phase 1a (enrollment) on the next binary train**, Phase 1b-1d behind per-peer capability gating, **Phase 2 tracked upstream**. Symmetric surfaces (STREAM_JOIN HMAC, artifact HMACs, webhook MACs, ChaCha20-Poly1305 at-rest sealing) are already quantum-resistant and need no PQ work — only two classical caveats (secret entropy, deterministic join proof) folded into Phase 1.
+Current implementation: iroh keeps the stable 32-byte Ed25519-derived
+EndpointId and all transport identity. Hybrid ML-KEM preference is reported
+only from completed handshake metadata. ML-DSA-44 covers only dual-signed
+gossip v2 requests with a validated enrollment; it does not protect responses,
+raw/tunnel streams, relay handshakes, tickets, or iroh transport identity.
 
 ---
 
@@ -147,7 +152,12 @@ Consolidated from the file:line-level inventory (report 1), re-verified where re
 | `$HIVE_DATA/secret.key` | 32 B ChaCha20-Poly1305 at-rest key | 0600 | `secrets.rs:61-77` |
 | `$HIVE_DATA/peer_iroh.json`, `peer_guardian_addr.json`, `bootstrap_peers` | identity-bearing routing caches / seed anchors (not secret) | — | `persist.rs:117, 146`; `main.rs:239-240` |
 
-Phase 1 adds one file: the ML-DSA seed, written with the same 0600 `load_or_create_secret` pattern.
+The implementation persists `mldsa44_signing.seed` and
+`mldsa44_gossip_ratchet.json` beside `iroh_secret.key`, mode 0600 on Unix.
+Malformed or unreadable existing ML-DSA key/ratchet material fails endpoint
+initialization rather than rotating a binding or claiming enrollment. It uses
+RustCrypto `ml-dsa` 0.1.1 for FIPS 204 ML-DSA-44, deliberately avoiding
+AWS-LC's unstable, FIPS-incompatible ML-DSA API.
 
 ---
 
@@ -197,15 +207,21 @@ Risk: near-zero. No wire-protocol change, no new key material, no env staging. T
 
 ### Phase 1 — PQ enrollment + dual-signed gossip (control-plane PQ authenticity). Effort: ~4-6 engineer-weeks code + 2-4 weeks staged observation.
 
-**1a. PQ key enrollment (the piece with the invisible deadline) — ~1 week.**
+**1a. PQ key enrollment (implemented).**
 Extend `NodeInfo` (already gossiped every 5 s roster round and upserted at STREAM_JOIN admission) with:
 - `pq_pub`: ML-DSA-44 pk (1,312 B raw ≈ 1,750 B base64 — noise vs roster JSON);
 - `pq_attest_ed = Ed25519.sign(id_key, "hive-pq-bind-v1" ‖ eid ‖ mldsa_pk)`;
 - `pq_attest_pq = ML-DSA.sign(mldsa_sk, ctx="hive-pq-bind-v1", eid ‖ ed_pk)`.
 
-Both directions are required: ed→pq stops a rogue PQ key being bound to your identity; pq→ed stops your PQ key being adopted under another identity. Seed persists beside the iroh seed (0600, same `load_or_create_secret` pattern). Verifiers pin first-seen bindings (TOFU + ratchet) — sound because rosters already flow over enforce-mode signed gossip. STREAM_JOIN is the enrollment ceremony for new nodes.
+Both directions are required: ed→pq stops a rogue PQ key being bound to an
+identity; pq→ed stops a PQ key being adopted under another identity. A binding
+is first-seen pinned only from that endpoint's own signed announcement
+(signer bound to its authenticated QUIC remote id), or its authenticated join
+stream. Relayed roster copies cannot establish or replace it. Absent or invalid
+material is not PQ capability. STREAM_JOIN is the enrollment ceremony for new
+nodes.
 
-**1b. Dual-sign v2 wire + capability-gated send — ~1.5 weeks.**
+**1b. Dual-sign v2 wire + capability-gated send (implemented).**
 The 104-byte `read_exact` (`lib.rs:1762`) means v1 receivers cannot tolerate a longer trailer, and an old binary routes unknown mode bytes to the tunnel arm — so v2 is a **new stream mode `STREAM_GOSSIP_SIGNED_V2 = 0x06`** with a length-prefixed, suite-agile trailer:
 
 ```
@@ -213,13 +229,18 @@ The 104-byte `read_exact` (`lib.rs:1762`) means v1 receivers cannot tolerate a l
 [32B ed25519 pk][8B ts_ms][64B ed25519 sig][2420B ML-DSA-44 sig]   = 2,529 B
 ```
 
-Both signatures cover the **v2 domain** preimage `"hive-gossip-v2" ‖ suite_id ‖ method ‖ len(path) ‖ path ‖ len(body) ‖ body ‖ ts_ms` (ML-DSA additionally uses FIPS 204 ctx). The ed25519 sig using the v2 domain is the anti-downgrade combiner: a v2 message cannot be stripped to a valid v1, and a captured v1 sig cannot be promoted into v2 (standard "AND" hybrid; unforgeable if *either* scheme holds once enforce-pq requires both). ML-DSA pk is **not** carried per-message — roster enrollment (1a) is the lookup, which is what makes the ratchet possible. Replay window and signer==QUIC-remote binding carry over unchanged. Sender emits 0x06 **iff the peer's freshest NodeInfo advertises `pq_pub`** (capability learned within one 5 s round), else 0x03 — no flag-day; `HIVE_GOSSIP_SIGN_V2=off` exists only as an abort valve. New `VerifyStats` counters: `v2_ok / v2_bad_mldsa / v2_missing_enrollment / v1_from_v2_capable`.
+Both signatures cover the **v2 domain** preimage `"hive-gossip-v2" ‖ suite_id ‖ method ‖ len(path) ‖ path ‖ len(body) ‖ body ‖ ts_ms` (ML-DSA additionally uses FIPS 204 ctx). The ed25519 sig using the v2 domain is the anti-downgrade combiner: a v2 message cannot be stripped to a valid v1, and a captured v1 sig cannot be promoted into v2. ML-DSA pk is **not** carried per-message — a direct, validated enrollment is the lookup. Replay window and signer==QUIC-remote binding carry over unchanged. Sender emits 0x06 only when `HIVE_GOSSIP_SIGN_V2=1` and it has a direct, validated v2 enrollment for the peer; otherwise it retains the v1 path. The length prefix is rejected unless it exactly matches the suite-1 bounded trailer before allocation. Responses are not signed.
 
 **1c. JOIN v2 + secret hygiene — ~1-2 days, batched into the same binary.**
 Add `ts_ms` to the join-proof HMAC preimage (reusing the 300 s window) to close the CRQC proof-replay path (today's proof is a per-endpoint constant, replay-safe only via the *classical* channel binding); enroll `pq_pub` at admission. Audit/rotate `HIVE_JWT_SECRET` to ≥32 CSPRNG bytes (the HMAC's 2^128 quantum floor holds only at full key entropy — this is a *classical* exposure today). Fix the non-constant-time proof compare (`main.rs:521`) while in the file.
 
-**1d. Ratchet + `enforce-pq` — ~3-5 days code, armed but dormant.**
-Persist a per-peer v2-seen bit beside the trust set: once a receiver verifies any v2 message from endpoint X, it permanently refuses v1 from X (TLS fallback-SCSV logic; converges one gossip round after each peer's upgrade). Add `HIVE_GOSSIP_VERIFY=enforce-pq` as a 4th mode (parser at `lib.rs:227-233` extends cleanly): reject v1 from ratcheted peers, then from everyone. This closes the residual migration-window downgrade (a CRQC-armed attacker forging *fresh* v1 to not-yet-ratcheted receivers).
+**1d. Ratchet + `enforce-pq` (implemented, dormant by default).**
+Once a receiver verifies a v2 request it atomically persists that endpoint in a
+local ratchet before counting verification success. With
+`HIVE_GOSSIP_VERIFY=enforce-pq`, v1 from a ratcheted peer is refused. Before
+that policy is selected, mixed fleets retain v1 compatibility; rollout is
+therefore ship/enroll, observe live v2 verification, then enforce. A corrupt
+ratchet fails closed at startup rather than forgetting downgrade history.
 
 **Phase 1 budget check** (fleet N≈8-10; 7 signed endpoints × (N−1)/5 s ≈ 12.6 msg/s; cap-worst N=64 → 89.6 msg/s):
 - Bytes: 2,529 B trailer = **0.015 %** of the 16 MiB `GOSSIP_MAX_FRAME`; ≈32 KB/s baseline (≈227 KB/s worst) — noise vs the 5 s roster JSON.

@@ -1031,6 +1031,7 @@ async fn async_main() -> anyhow::Result<()> {
             .as_ref()
             .map(|e| e.ed25519_binding_hex.clone()),
         pq_mldsa_binding: pq_enrollment.as_ref().map(|e| e.mldsa_binding_hex.clone()),
+        pq_gossip_protocol_version: pq_enrollment.as_ref().map(|e| e.gossip_protocol_version),
         gpu_count: gpus.0,
         wasm_runtime: wasm_rt,
         bun_runtime: bun_rt,
@@ -1491,6 +1492,11 @@ async fn async_main() -> anyhow::Result<()> {
                             tracing::warn!(peer = %remote_id, announced = ?announced_eid, "REJECTED mesh join: NodeInfo iroh identity mismatch");
                             return Vec::new();
                         }
+                        // The join stream is authenticated as `remote_id`; it
+                        // is therefore the second direct enrollment boundary
+                        // alongside a node's signed self-announcement. Relayed
+                        // roster entries are never accepted here.
+                        crate::admin::enroll_node_pqc_from_authenticated(&node, &remote_id);
                         if let Ok(mut t) = cloud.trusted_peer_ids.write() {
                             t.insert(remote_id.clone());
                         }
@@ -1498,7 +1504,6 @@ async fn async_main() -> anyhow::Result<()> {
                             cloud.peer_iroh.write().insert(remote_id.clone(), (remote_id.clone(), addr));
                         }
                         let name = node.name.clone();
-                        crate::admin::enroll_node_pqc(&node);
                         cloud.registry.upsert_peer_self_report(node);
                         cloud.audit.record("_global", "mesh", "join", "node", &name, &format!("endpoint {remote_id} admitted via join proof"));
                         tracing::info!(peer = %remote_id, node = %name, "mesh join ADMITTED (hot-join, key-addressed)");
@@ -3799,10 +3804,8 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                     // upsert_peer_self_report); everything after it is a
                     // relayed third-party copy that must never rename.
                     if peer_self_id.as_deref() == Some(n.id.as_str()) {
-                        crate::admin::enroll_node_pqc(&n);
                         cloud.registry.upsert_peer_self_report(n);
                     } else {
-                        crate::admin::enroll_node_pqc(&n);
                         cloud.registry.upsert_peer(n);
                     }
                 }

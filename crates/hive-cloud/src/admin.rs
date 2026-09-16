@@ -7938,7 +7938,6 @@ pub(crate) async fn node_announce(
     c.cluster.adopt_epoch(node.cp_epoch);
     // The announcing node is describing ITSELF — the authoritative copy that
     // may rename it past a stale registry entry (upsert_peer_self_report).
-    enroll_node_pqc(&node);
     c.registry.upsert_peer_self_report(node);
     Json(json!(c.registry.nodes()))
 }
@@ -7946,7 +7945,10 @@ pub(crate) async fn node_announce(
 /// Enroll only self-consistent, dual-attested public ML-DSA material. This
 /// accepts no caller-provided trust decision: the existing Ed25519 endpoint
 /// itself and the ML-DSA key both verify the same domain-separated binding.
-pub(crate) fn enroll_node_pqc(node: &hive_edge::NodeInfo) {
+pub(crate) fn enroll_node_pqc_from_authenticated(
+    node: &hive_edge::NodeInfo,
+    authenticated_endpoint: &str,
+) {
     let (Some(endpoint), Some(public_key_hex), Some(ed25519_binding_hex), Some(mldsa_binding_hex)) = (
         node.peer_id.as_deref(),
         node.pq_mldsa44_public.as_deref(),
@@ -7955,10 +7957,20 @@ pub(crate) fn enroll_node_pqc(node: &hive_edge::NodeInfo) {
     ) else {
         return;
     };
+    if endpoint != authenticated_endpoint {
+        tracing::warn!(
+            node = %node.id,
+            announced = %endpoint,
+            authenticated = %authenticated_endpoint,
+            "ignored ML-DSA enrollment from a non-owning mesh peer"
+        );
+        return;
+    }
     let enrollment = hive_p2p::PqcEnrollment {
         public_key_hex: public_key_hex.to_string(),
         ed25519_binding_hex: ed25519_binding_hex.to_string(),
         mldsa_binding_hex: mldsa_binding_hex.to_string(),
+        gossip_protocol_version: node.pq_gossip_protocol_version.unwrap_or_default(),
     };
     if let Err(error) = hive_p2p::enroll_pqc_peer(endpoint, &enrollment) {
         tracing::warn!(node = %node.id, peer = %endpoint, error = %error, "ignored invalid ML-DSA enrollment");

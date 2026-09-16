@@ -312,6 +312,11 @@ pub struct NodeInfo {
     /// a roster entry from substituting either identity independently.
     #[serde(default)]
     pub pq_mldsa_binding: Option<String>,
+    /// Highest application-level gossip signature protocol this node has
+    /// advertised together with a validated ML-DSA enrollment. `None` is not
+    /// PQ capable; it never implies v2 support.
+    #[serde(default)]
+    pub pq_gossip_protocol_version: Option<u16>,
 }
 
 /// Great-circle distance (km) between two lat/lon points — for "nearest node".
@@ -1061,6 +1066,22 @@ impl NodeRegistry {
             if peer.artifact_transfer_protocol.is_none() {
                 peer.artifact_transfer_protocol = existing.artifact_transfer_protocol;
             }
+            // ML-DSA enrollment is a first-seen binding, not mutable roster
+            // metadata. A relayed copy can fill an absent value, but can never
+            // replace a direct peer's established binding or capability.
+            if existing.pq_mldsa44_public.is_some()
+                && peer.pq_mldsa44_public.as_deref() != existing.pq_mldsa44_public.as_deref()
+            {
+                peer.pq_mldsa44_public = existing.pq_mldsa44_public.clone();
+                peer.pq_ed25519_binding = existing.pq_ed25519_binding.clone();
+                peer.pq_mldsa_binding = existing.pq_mldsa_binding.clone();
+                peer.pq_gossip_protocol_version = existing.pq_gossip_protocol_version;
+            } else if peer.pq_mldsa44_public.is_none() {
+                peer.pq_mldsa44_public = existing.pq_mldsa44_public.clone();
+                peer.pq_ed25519_binding = existing.pq_ed25519_binding.clone();
+                peer.pq_mldsa_binding = existing.pq_mldsa_binding.clone();
+                peer.pq_gossip_protocol_version = existing.pq_gossip_protocol_version;
+            }
         }
         if peer.healthy && peer.latency_ms == u64::MAX {
             peer.latency_ms = Self::RESTORED_LATENCY_MS;
@@ -1159,6 +1180,7 @@ mod tests {
             pq_mldsa44_public: None,
             pq_ed25519_binding: None,
             pq_mldsa_binding: None,
+            pq_gossip_protocol_version: None,
         }
     }
 

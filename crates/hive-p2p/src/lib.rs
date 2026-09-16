@@ -32,6 +32,27 @@ const ML_DSA44_SIGNATURE_BYTES: usize = 2420;
 const PQ_BIND_DOMAIN: &[u8] = b"hive-pq-bind-v1\0";
 const GOSSIP_V2_DOMAIN: &[u8] = b"hive-gossip-v2\0";
 const GOSSIP_V2_CONTEXT: &[u8] = b"hive-gossip-v2";
+const PQ_RATCHET_VERSION: u8 = 1;
+
+/// The stable mesh identity is the iroh Ed25519-derived endpoint id.  ML-DSA
+/// supplements application-level signed gossip only; it never replaces an iroh
+/// key, ticket, relay handshake, or transport identity.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct MeshIdentity {
+    pub endpoint_id: String,
+    pub transport_identity: String,
+    pub pqc: Option<PqcIdentity>,
+}
+
+/// Public ML-DSA enrollment material. It is valid only when both binding
+/// signatures verify for the authenticated endpoint id.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct PqcIdentity {
+    pub mldsa44_public_key_hex: String,
+    pub ed25519_binding_hex: String,
+    pub mldsa_binding_hex: String,
+    pub gossip_protocol_version: u16,
+}
 
 /// A public, cross-signed ML-DSA enrollment bound to the existing iroh
 /// Ed25519 identity. The private ML-DSA seed never leaves this process.
@@ -40,16 +61,30 @@ pub struct PqcEnrollment {
     pub public_key_hex: String,
     pub ed25519_binding_hex: String,
     pub mldsa_binding_hex: String,
+    pub gossip_protocol_version: u16,
 }
 
 struct PqcSigningKey(ml_dsa::SigningKey<ml_dsa::MlDsa44>);
 
 static PQ_SIGNING_KEY: std::sync::LazyLock<std::sync::RwLock<Option<Arc<PqcSigningKey>>>> =
     std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
-static PQ_PEERS: std::sync::LazyLock<StdMutex<HashMap<String, Vec<u8>>>> =
+#[derive(Clone)]
+struct EnrolledPqcPeer {
+    public_key: Vec<u8>,
+    gossip_protocol_version: u16,
+}
+static PQ_PEERS: std::sync::LazyLock<StdMutex<HashMap<String, EnrolledPqcPeer>>> =
     std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
 static PQ_V2_OBSERVED: std::sync::LazyLock<StdMutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| StdMutex::new(HashSet::new()));
+static PQ_RATCHET_PATH: std::sync::LazyLock<std::sync::RwLock<Option<std::path::PathBuf>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PqcRatchetFile {
+    version: u8,
+    verified_v2_endpoints: Vec<String>,
+}
 
 /// Counters are incremented only at the signing and dual-verification
 /// boundaries, never merely when a key exists or an enrollment is received.
@@ -207,6 +242,79 @@ fn initialize_pqc_signing_key(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+fn initialize_pqc_ratchet(path: &std::path::Path) -> Result<()> {
+    let observed = match std::fs::read(path) {
+        Ok(bytes) => {
+            let state: PqcRatchetFile = serde_json::from_slice(&bytes).map_err(|_| {
+                anyhow::anyhow!("ML-DSA ratchet at {} is malformed", path.display())
+            })?;
+            if state.version != PQ_RATCHET_VERSION {
+                anyhow::bail!(
+                    "ML-DSA ratchet at {} has an unsupported version",
+                    path.display()
+                );
+            }
+            state.verified_v2_endpoints.into_iter().collect()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HashSet::new(),
+        Err(error) => return Err(error.into()),
+    };
+    *PQ_V2_OBSERVED
+        .lock()
+        .map_err(|_| anyhow::anyhow!("ML-DSA ratchet lock poisoned"))? = observed;
+    *PQ_RATCHET_PATH
+        .write()
+        .map_err(|_| anyhow::anyhow!("ML-DSA ratchet path lock poisoned"))? =
+        Some(path.to_path_buf());
+    Ok(())
+}
+
+fn persist_pqc_ratchet() -> Result<()> {
+    let path = PQ_RATCHET_PATH
+        .read()
+        .map_err(|_| anyhow::anyhow!("ML-DSA ratchet path lock poisoned"))?
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("ML-DSA ratchet persistence is unavailable"))?;
+    let endpoints = PQ_V2_OBSERVED
+        .lock()
+        .map_err(|_| anyhow::anyhow!("ML-DSA ratchet lock poisoned"))?
+        .iter()
+        .cloned()
+        .collect();
+    let bytes = serde_json::to_vec(&PqcRatchetFile {
+        version: PQ_RATCHET_VERSION,
+        verified_v2_endpoints: endpoints,
+    })?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn ratchet_verified_v2(endpoint_id: String) -> Result<()> {
+    let inserted = {
+        let mut observed = PQ_V2_OBSERVED
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ML-DSA ratchet lock poisoned"))?;
+        observed.insert(endpoint_id.clone())
+    };
+    if inserted {
+        if let Err(error) = persist_pqc_ratchet() {
+            PQ_V2_OBSERVED
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&endpoint_id);
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 /// Return a dual attestation binding this process's ML-DSA-44 public key to its
 /// existing Ed25519 iroh identity. This is enrollment material, not proof that
 /// ML-DSA has protected a live message.
@@ -226,12 +334,16 @@ pub fn pqc_enrollment(secret: &iroh::SecretKey) -> Option<PqcEnrollment> {
         public_key_hex: hex_encode(public),
         ed25519_binding_hex: hex_encode(&ed.to_bytes()),
         mldsa_binding_hex: hex_encode(pq.to_bytes().as_slice()),
+        gossip_protocol_version: 2,
     })
 }
 
 /// Validate and retain a peer enrollment. Callers must supply the endpoint id
 /// authenticated by the enclosing gossip connection, never a body assertion.
 pub fn enroll_pqc_peer(endpoint_id: &str, enrollment: &PqcEnrollment) -> Result<()> {
+    if enrollment.gossip_protocol_version < 2 {
+        anyhow::bail!("peer does not advertise dual-signed gossip v2");
+    }
     let public = hex_decode(&enrollment.public_key_hex)
         .ok_or_else(|| anyhow::anyhow!("invalid ML-DSA public key encoding"))?;
     if public.len() != ML_DSA44_PUBLIC_BYTES {
@@ -259,10 +371,20 @@ pub fn enroll_pqc_peer(endpoint_id: &str, enrollment: &PqcEnrollment) -> Result<
     if !verifying.verify_with_context(&binding, PQ_BIND_DOMAIN, &pq_sig) {
         anyhow::bail!("invalid ML-DSA enrollment binding");
     }
-    PQ_PEERS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(endpoint_id.to_string(), public);
+    let mut peers = PQ_PEERS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(existing) = peers.get(endpoint_id) {
+        if existing.public_key != public {
+            anyhow::bail!("refusing to replace an established ML-DSA enrollment");
+        }
+        return Ok(());
+    }
+    peers.insert(
+        endpoint_id.to_string(),
+        EnrolledPqcPeer {
+            public_key: public,
+            gossip_protocol_version: enrollment.gossip_protocol_version,
+        },
+    );
     Ok(())
 }
 
@@ -1012,7 +1134,11 @@ fn gossip_v2_preimage(method: u8, path: &str, body: &[u8], ts_ms: u64) -> Vec<u8
 
 /// Build the variable-length v2 trailer:
 /// `[u8 suite][32 ed25519 pk][8 timestamp][64 ed25519 sig][2420 ML-DSA-44 sig]`.
-fn sign_gossip_v2(
+/// Produce the bounded suite-1 v2 trailer for a gossip request. This is used by
+/// the normal pooled sender; it deliberately contains no ML-DSA public key or
+/// private material because the receiver resolves the enrolled key by its
+/// authenticated Ed25519 endpoint identity.
+pub fn sign_gossip_v2(
     secret: &iroh::SecretKey,
     method: u8,
     path: &str,
@@ -1104,8 +1230,9 @@ fn verify_gossip_v2(
             .fetch_add(1, Ordering::Relaxed);
         return Err("missing verified ML-DSA enrollment");
     };
-    let encoded = ml_dsa::EncodedVerifyingKey::<ml_dsa::MlDsa44>::try_from(enrolled.as_slice())
-        .map_err(|_| "invalid enrolled ML-DSA public key")?;
+    let encoded =
+        ml_dsa::EncodedVerifyingKey::<ml_dsa::MlDsa44>::try_from(enrolled.public_key.as_slice())
+            .map_err(|_| "invalid enrolled ML-DSA public key")?;
     let verifying = ml_dsa::VerifyingKey::<ml_dsa::MlDsa44>::decode(&encoded);
     let signature = ml_dsa::Signature::<ml_dsa::MlDsa44>::try_from(&trailer[105..])
         .map_err(|_| "invalid ML-DSA signature")?;
@@ -1117,14 +1244,12 @@ fn verify_gossip_v2(
             .fetch_add(1, Ordering::Relaxed);
         return Err("ML-DSA signature invalid");
     }
+    ratchet_verified_v2(signer_id.clone())
+        .map_err(|_| "could not persist ML-DSA downgrade ratchet")?;
     let mut stats = PQ_SIGNING_STATS.lock().unwrap_or_else(|p| p.into_inner());
     stats.verified.fetch_add(1, Ordering::Relaxed);
     stats.activated_ms.get_or_insert(now_ms);
     stats.last_verified_ms = Some(now_ms);
-    PQ_V2_OBSERVED
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(signer_id.clone());
     Ok(signer_id)
 }
 
@@ -3728,8 +3853,9 @@ impl PeerPool {
             let v2 = gossip_sign_v2_enabled()
                 && PQ_PEERS
                     .lock()
-                    .map(|peers| peers.contains_key(&acquired.key))
-                    .unwrap_or(false);
+                    .ok()
+                    .and_then(|peers| peers.get(&acquired.key).cloned())
+                    .is_some_and(|peer| peer.gossip_protocol_version >= 2);
             if v2 {
                 let ts = now_ms();
                 let trailer = sign_gossip_v2(self.ep.secret_key(), method, path, body, ts)
@@ -4088,6 +4214,8 @@ pub async fn bind_full(
     if let Some(path) = key_path.as_ref() {
         let pq_path = path.with_file_name("mldsa44_signing.seed");
         initialize_pqc_signing_key(&pq_path)?;
+        let ratchet_path = path.with_file_name("mldsa44_gossip_ratchet.json");
+        initialize_pqc_ratchet(&ratchet_path)?;
     }
     if let Some(sk) = &secret {
         builder = builder.secret_key(sk.clone());
