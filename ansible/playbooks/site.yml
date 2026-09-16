@@ -68,6 +68,14 @@
     - role: hive_ui
       tags: [hive_ui, ui]
 
+- name: Autheo Dev Hub (Next.js on loopback :3001)
+  hosts: platform
+  become: true
+  roles:
+    - role: autheo_devhub
+      when: autheo_devhub_enabled | bool
+      tags: [autheo_devhub]
+
 - name: Mesh trust configuration
   hosts: platform
   become: true

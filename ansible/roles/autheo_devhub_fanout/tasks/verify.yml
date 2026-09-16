@@ -1,0 +1,70 @@
+---
+- name: Require a canonical Dev Hub bundle from this deployment
+  ansible.builtin.assert:
+    that:
+      - hostvars[autheo_devhub_build_host].autheo_devhub_canonical_build_id is defined
+      - (hostvars[autheo_devhub_build_host].autheo_devhub_canonical_build_id | length) > 0
+    fail_msg: >-
+      NO AUTHEO DEV HUB BUNDLE was built by {{ autheo_devhub_build_host }} in
+      this run. {{ hive_name }} cannot be verified against unknown content.
+
+- name: Read Dev Hub runtime, service, and listener evidence
+  ansible.builtin.shell: |
+    set -euo pipefail
+    bid="$(cat '{{ autheo_devhub_runtime_dir }}/current/.next/BUILD_ID')"
+    state="$(systemctl is-active autheo-devhub)"
+    pid="$(systemctl show -p MainPID --value autheo-devhub)"
+    ts="$(systemctl show -p ExecMainStartTimestamp --value autheo-devhub)"
+    listen="$(ss -ltnH "sport = :{{ autheo_devhub_port }}" | awk '{print $4}')"
+    [ "$state" = active ] || { echo "ERR autheo-devhub state=$state" >&2; exit 3; }
+    [ -n "$pid" ] && [ "$pid" != 0 ] || { echo "ERR autheo-devhub has no MainPID" >&2; exit 4; }
+    [ -n "$ts" ] || { echo "ERR autheo-devhub has no start timestamp" >&2; exit 5; }
+    [ "$listen" = "{{ autheo_devhub_bind }}:{{ autheo_devhub_port }}" ] || {
+      echo "ERR Dev Hub listener is '$listen', expected {{ autheo_devhub_bind }}:{{ autheo_devhub_port }}" >&2
+      exit 6
+    }
+    printf '%s %s %s %s\n' "$bid" "$pid" "$(date -d "$ts" +%s)" "$listen"
+  args:
+    executable: /bin/bash
+  register: _autheo_devhub_verify
+  changed_when: false
+
+- name: Record Dev Hub verification facts
+  ansible.builtin.set_fact:
+    autheo_devhub_verify:
+      host: "{{ hive_name }}"
+      build_id: "{{ _autheo_devhub_verify.stdout.split()[0] }}"
+      main_pid: "{{ _autheo_devhub_verify.stdout.split()[1] | int }}"
+      started_epoch: "{{ _autheo_devhub_verify.stdout.split()[2] | int }}"
+      listener: "{{ _autheo_devhub_verify.stdout.split()[3] }}"
+
+- name: Assert Dev Hub serves the canonical bundle and current process
+  ansible.builtin.assert:
+    that:
+      - autheo_devhub_verify.build_id == hostvars[autheo_devhub_build_host].autheo_devhub_canonical_build_id
+      - autheo_devhub_verify.main_pid > 0
+      - autheo_devhub_verify.started_epoch >= (hive_deploy_epoch | int)
+    fail_msg: >-
+      {{ hive_name }} is not serving the canonical current Dev Hub release:
+      build={{ autheo_devhub_verify.build_id }}, pid={{ autheo_devhub_verify.main_pid }},
+      started={{ autheo_devhub_verify.started_epoch }}.
+
+- name: Confirm the Dev Hub home page answers on loopback
+  ansible.builtin.uri:
+    url: "http://{{ autheo_devhub_bind }}:{{ autheo_devhub_port }}/"
+    method: GET
+    status_code: [200, 307, 308]
+  register: _autheo_devhub_verify_home
+  retries: 6
+  delay: 5
+  until: _autheo_devhub_verify_home.status in [200, 307, 308]
+
+- name: Confirm the Dev Hub Network page answers on loopback
+  ansible.builtin.uri:
+    url: "http://{{ autheo_devhub_bind }}:{{ autheo_devhub_port }}/network"
+    method: GET
+    status_code: [200, 307, 308]
+  register: _autheo_devhub_verify_network
+  retries: 6
+  delay: 5
+  until: _autheo_devhub_verify_network.status in [200, 307, 308]

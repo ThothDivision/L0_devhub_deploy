@@ -1,0 +1,120 @@
+---
+- name: Require a canonical Dev Hub build before activation
+  ansible.builtin.assert:
+    that:
+      - hostvars[autheo_devhub_build_host].autheo_devhub_canonical_build_id is defined
+      - (hostvars[autheo_devhub_build_host].autheo_devhub_canonical_build_id | length) > 0
+    fail_msg: >-
+      No canonical Dev Hub BUILD_ID is available from {{ autheo_devhub_build_host }};
+      refusing to restart {{ hive_name }} against an unspecified runtime.
+
+- name: Locate the node binary for the Dev Hub unit
+  ansible.builtin.shell: |
+    set -u
+    p="$(command -v node 2>/dev/null || true)"
+    if [ -z "$p" ]; then
+      for c in /usr/local/bin/node /usr/bin/node /opt/node/bin/node; do
+        [ -x "$c" ] && { p="$c"; break; }
+      done
+    fi
+    printf '%s' "$p"
+  args:
+    executable: /bin/bash
+  register: _autheo_devhub_node
+  changed_when: false
+  failed_when: false
+
+- name: Require node for the Dev Hub
+  ansible.builtin.assert:
+    that: (_autheo_devhub_node.stdout | trim) | length > 0
+    fail_msg: >-
+      node was not found on {{ inventory_hostname }}, so autheo-devhub cannot
+      start. Install the fleet Node.js runtime, then retry.
+
+- name: Record node's directory for the Dev Hub unit PATH
+  ansible.builtin.set_fact:
+    autheo_devhub_node_dir: "{{ (_autheo_devhub_node.stdout | trim) | dirname }}"
+
+- name: Install the Dev Hub runtime environment on the build host
+  ansible.builtin.template:
+    src: "{{ role_path }}/../autheo_devhub/templates/autheo-devhub.env.j2"
+    dest: "{{ autheo_devhub_env_file }}"
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  when: inventory_hostname == autheo_devhub_build_host
+
+- name: Extract the canonical Dev Hub build on followers
+  ansible.builtin.shell:
+    cmd: |
+      set -euo pipefail
+      rm -rf .next.new
+      mkdir .next.new
+      tar -C .next.new -xzf "{{ autheo_devhub_source_dir }}/autheo-devhub-next.tar.gz"
+      rm -f "{{ autheo_devhub_source_dir }}/autheo-devhub-next.tar.gz"
+      rm -rf .next
+      mv .next.new .next
+    chdir: "{{ autheo_devhub_app_dir }}"
+    executable: /bin/bash
+  when: inventory_hostname != autheo_devhub_build_host
+
+- name: Atomically activate the complete Dev Hub runtime tree
+  ansible.builtin.shell: |
+    set -euo pipefail
+    runtime="{{ autheo_devhub_runtime_dir }}"
+    releases="$runtime/releases"
+    mkdir -p "$releases"
+    release="$releases/$(date +%s%N)-$(git -C '{{ autheo_devhub_source_dir }}' rev-parse --short=12 HEAD)"
+    stage="$(mktemp -d "$releases/.staging.XXXXXX")"
+    trap 'rm -rf "$stage"' EXIT
+    rsync -a --delete --exclude='.git' --exclude='.env.local' \
+      "{{ autheo_devhub_app_dir }}/" "$stage/"
+    mv "$stage" "$release"
+    old="$(readlink -f "$runtime/current" 2>/dev/null || true)"
+    ln -s "$release" "$runtime/.current.new"
+    mv -Tf "$runtime/.current.new" "$runtime/current"
+    if [ -n "$old" ] && [ -d "$old" ]; then
+      ln -sfn "$old" "$runtime/previous"
+    fi
+  args:
+    executable: /bin/bash
+
+- name: Template the Autheo Dev Hub systemd unit
+  ansible.builtin.template:
+    src: "{{ role_path }}/../autheo_devhub/templates/autheo-devhub.service.j2"
+    dest: /etc/systemd/system/autheo-devhub.service
+    mode: "0644"
+  register: _autheo_devhub_unit
+
+- name: Reload systemd when the Dev Hub unit changes
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: _autheo_devhub_unit.changed
+
+- name: Restart Autheo Dev Hub
+  ansible.builtin.systemd:
+    name: autheo-devhub
+    state: restarted
+    enabled: true
+    daemon_reload: true
+
+- name: Verify the Dev Hub home page on loopback
+  ansible.builtin.uri:
+    url: "http://{{ autheo_devhub_bind }}:{{ autheo_devhub_port }}/"
+    method: GET
+    status_code: [200, 307, 308]
+  register: _autheo_devhub_home
+  retries: 12
+  delay: 5
+  until: _autheo_devhub_home.status in [200, 307, 308]
+
+- name: Verify the Dev Hub Network page on loopback
+  ansible.builtin.uri:
+    url: "http://{{ autheo_devhub_bind }}:{{ autheo_devhub_port }}/network"
+    method: GET
+    status_code: [200, 307, 308]
+  register: _autheo_devhub_network
+  retries: 12
+  delay: 5
+  until: _autheo_devhub_network.status in [200, 307, 308]

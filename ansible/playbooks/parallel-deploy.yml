@@ -405,6 +405,60 @@
       delegate_to: localhost
       become: false
 
+- name: Autheo Dev Hub build (once, on the control-plane leader)
+  hosts: ui_builder
+  become: true
+  strategy: free
+  tags: [autheo_devhub]
+  tasks:
+    - name: Build the canonical Autheo Dev Hub bundle
+      ansible.builtin.include_role:
+        name: autheo_devhub_fanout
+        tasks_from: build
+      when: autheo_devhub_enabled | bool
+
+- name: Autheo Dev Hub push (parallel, all platform hosts)
+  hosts: platform
+  become: true
+  strategy: free
+  tags: [autheo_devhub]
+  vars:
+    autheo_devhub_build_host: "{{ groups['ui_builder'][0] }}"
+  tasks:
+    - name: Prepare Autheo Dev Hub sources and canonical bundle
+      ansible.builtin.include_role:
+        name: autheo_devhub_fanout
+        tasks_from: push
+      when: autheo_devhub_enabled | bool
+
+- name: Autheo Dev Hub restart (serial -- dashboard availability)
+  hosts: platform
+  become: true
+  serial: "{{ deploy_serial_autheo_devhub | default(deploy_serial_ui | default(deploy_serial | default(3))) }}"
+  tags: [autheo_devhub]
+  vars:
+    autheo_devhub_build_host: "{{ groups['ui_builder'][0] }}"
+  tasks:
+    - name: Atomically activate and verify Autheo Dev Hub
+      ansible.builtin.include_role:
+        name: autheo_devhub_fanout
+        tasks_from: restart
+      when: autheo_devhub_enabled | bool
+
+- name: Autheo Dev Hub verification (bundle and service, every host)
+  hosts: platform
+  become: true
+  any_errors_fatal: true
+  tags: [autheo_devhub]
+  vars:
+    autheo_devhub_build_host: "{{ groups['ui_builder'][0] }}"
+  tasks:
+    - name: Verify canonical Autheo Dev Hub deployment
+      ansible.builtin.include_role:
+        name: autheo_devhub_fanout
+        tasks_from: verify
+      when: autheo_devhub_enabled | bool
+
 - name: Clean up the control host's scratch artifact directory
   hosts: localhost
   connection: local

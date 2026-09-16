@@ -59,7 +59,63 @@ Run only part of it:
 ansible-playbook playbooks/site.yml --tags prerequisites
 ansible-playbook playbooks/site.yml --tags hive_platform      # code only, see also platform-only.yml
 ansible-playbook playbooks/site.yml --limit fc_pvm --tags pvm_firecracker
+ansible-playbook playbooks/site.yml --limit genesis --tags autheo_devhub -e autheo_devhub_enabled=true
 ```
+
+## Autheo Dev Hub
+
+`autheo_devhub` is independent of the SHADW/Hive dashboard: Hive Admin remains
+on `127.0.0.1:8786`, Autheo Dev Hub runs on `127.0.0.1:3001`, and
+`hive-ui.service` remains on `127.0.0.1:3002`. It clones the configured
+`autheo_devhub_repo` at `autheo_devhub_version`, builds
+`/root/autheo-devhub-src/ui` with `npm ci && npm run build`, and atomically
+switches `/opt/autheo-devhub/current` to a complete release.
+
+The role is opt-in (`autheo_devhub_enabled: false` by default):
+
+```bash
+ansible-playbook playbooks/site.yml --limit genesis --tags autheo_devhub -e autheo_devhub_enabled=true
+ansible-playbook playbooks/parallel-deploy.yml --tags autheo_devhub -e autheo_devhub_enabled=true
+```
+
+The parallel deploy uses one canonical Next.js build, fan-outs its `.next`
+artifact, and serially restarts/health-checks each host. A private repository
+must use an SSH repository URL and a vault/inventory-provided,
+root-readable `autheo_devhub_deploy_key_path`; credentials are never embedded
+in playbooks.
+
+The service environment uses `HIVE_ADMIN=http://127.0.0.1:8786`, so
+`/cloud/v1/security/pqc` is proxied to the real Hive backend. It does not
+invent fallback telemetry: the Network and Enterprise pages retain the
+application's unavailable state when the backend supplies no live evidence.
+`MARKETPLACE_URL` defaults to `http://127.0.0.1:3000`, and
+`HIVE_AUTH_BYPASS` remains configurable through `autheo_devhub_auth_bypass`.
+
+Operations on a target:
+
+```bash
+systemctl status autheo-devhub
+systemctl restart autheo-devhub
+journalctl -u autheo-devhub -f
+curl -fsS http://127.0.0.1:3001/
+curl -fsS http://127.0.0.1:3001/network
+systemctl is-active hive-ui && curl -fsS http://127.0.0.1:3002/
+```
+
+Rollback switches back to the last complete release; inspect `previous` first,
+then restart and re-run both loopback checks:
+
+```bash
+readlink -f /opt/autheo-devhub/previous
+ln -sfn "$(readlink -f /opt/autheo-devhub/previous)" /opt/autheo-devhub/current
+systemctl restart autheo-devhub
+curl -fsS http://127.0.0.1:3001/
+curl -fsS http://127.0.0.1:3001/network
+```
+
+There is deliberately no public proxy configuration in this role. The unit
+binds only to loopback; exposing Dev Hub requires a separately reviewed
+platform-ingress routing design and must not change `HIVE_DASHBOARD_UPSTREAM`.
 
 ## Redeploy just the platform code (fast path)
 
@@ -214,6 +270,8 @@ resolve from the encrypted `vault.yml`.
 | `hive_ui` | builds + installs the `ui/` dashboard (Next.js) and its systemd unit -- used by `site.yml`'s from-scratch path |
 | `hive_platform_fanout` | build/push/restart task files backing `parallel-deploy.yml`'s backend phases (one build per glibc group, parallel push, bounded-serial restart) |
 | `hive_ui_fanout` | build/push/restart task files backing `parallel-deploy.yml`'s UI phases (one canonical build, parallel push, bounded-serial restart) |
+| `autheo_devhub` | independently clones, builds, atomically publishes, and runs the Autheo Dev Hub on loopback `:3001` |
+| `autheo_devhub_fanout` | canonical Dev Hub build, parallel artifact distribution, and serial service verification for `parallel-deploy.yml --tags autheo_devhub` |
 | `mesh_bootstrap` | mesh trust config (join-proof self-admit by default, or the opt-in static `HIVE_TRUSTED_NODE_IDS` allowlist) |
 | `dns_vercel` | DNS/TLS ingress systemd drop-in (Vercel DNS + ACME DNS-01), matching `RUNBOOK.md` |
 | `hive_browser_node` | one capped headless browser node per host on the five `[browser_nodes]` hosts: headless Chromium + a loopback session broker that mints the short-lived tenant JWT the admission requires (see its own README for the auth decision and every cap value) |
