@@ -1,6 +1,6 @@
 # RFC: Post-Quantum Cryptography Migration Scope for the Hive Mesh
 
-- **Status**: Draft for review (research deliverable; no code changes made)
+- **Status**: Draft for review (implementation architecture clarified; ML-DSA enrollment and dual-signed gossip are reported active only after real signing and verification)
 - **Date**: 2026-07-20
 - **Scope**: every iroh-anchored cryptographic identity, signature, MAC, and key file in `/Users/dylanwong/fluid/hive`; PQC readiness of the locked dependency stack; a phased, mixed-fleet-safe migration plan
 - **Inputs**: three research passes — (1) crypto-surface inventory of the codebase, (2) dependency-side PQC readiness analysis (verified against in-lock crate sources), (3) migration-strategy design (threat model, dual-sign wire design, size/perf math). Cross-report factual conflicts were re-verified against source and resolved in Appendix C.
@@ -23,6 +23,43 @@ The quantum risk decomposes into three buckets with very different urgency:
 Recommended sequencing: **Phase 0 now** (primary + secondary TLS legs), **Phase 1a (enrollment) on the next binary train**, Phase 1b-1d behind per-peer capability gating, **Phase 2 tracked upstream**. Symmetric surfaces (STREAM_JOIN HMAC, artifact HMACs, webhook MACs, ChaCha20-Poly1305 at-rest sealing) are already quantum-resistant and need no PQ work — only two classical caveats (secret entropy, deterministic join proof) folded into Phase 1.
 
 ---
+
+## ML-KEM vs ML-DSA
+
+ML-KEM and ML-DSA solve different problems and are intentionally separate in
+the mesh architecture:
+
+```text
+stable Endpoint Identity (32-byte Ed25519-derived iroh EndpointId)
+  |- Authentication -> ML-DSA enrollment / signature verification
+  `- Key Agreement -> X25519 + ML-KEM
+       `- TLS 1.3 -> encrypted QUIC
+```
+
+- **ML-KEM is for confidentiality and key establishment.** It participates in
+  the TLS 1.3 `key_share`, establishes shared secret material, and protects
+  TLS/QUIC encryption. The hybrid preference is `X25519MLKEM768`, with
+  classical X25519 retained for old peers.
+- **ML-DSA is for authentication and signatures.** Once implemented, it
+  verifies control of enrolled ML-DSA-44 authentication key material and
+  signs application-level dual-signed mesh gossip messages. It does not
+  establish TLS session secrets.
+- Larger ML-KEM public values and ciphertexts are expected in TLS
+  `key_share`; they are not constrained by the endpoint identifier
+  representation.
+- Iroh's current endpoint identity is a stable 32-byte Ed25519-derived
+  identifier. ML-DSA public keys and signatures cannot be substituted into
+  that representation. Current iroh transport identity therefore remains
+  Ed25519 unless and until upstream supports a separate authentication-key
+  abstraction.
+
+The current implementation records actual negotiated TLS/QUIC key-agreement
+outcomes where iroh exposes them: `X25519MLKEM768` is hybrid ML-KEM use and
+`X25519` is an old-peer fallback. It must not infer either outcome from an
+environment flag or configuration alone. ML-DSA enrollment and dual-signed
+gossip are application-level work: their status is active only after a real
+message has been signed and verified, and they never become transport
+protection.
 
 ## 2. Threat model (condensed)
 
