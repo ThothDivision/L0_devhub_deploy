@@ -35,23 +35,39 @@ ML-KEM and ML-DSA solve different problems and are intentionally separate in
 the mesh architecture:
 
 ```text
-stable Endpoint Identity (32-byte Ed25519-derived iroh EndpointId)
-  |- Authentication -> ML-DSA enrollment / signature verification
-  `- Key Agreement -> X25519 + ML-KEM
-       `- TLS 1.3 -> encrypted QUIC
+                         Autheo Mesh
+
+                  stable Endpoint Identity
+             (32-byte Ed25519-derived iroh EndpointId)
+                              |
+                 +------------+------------+
+                 |                         |
+          Authentication              Key agreement
+                 |                         |
+       ML-DSA-44 enrollment       X25519 + ML-KEM-768
+       + gossip-v2 signatures              |
+                 |                         |
+                 +------------+------------+
+                              |
+                            TLS 1.3
+                              |
+                        encrypted QUIC
 ```
 
 - **ML-KEM is for confidentiality and key establishment.** It participates in
-  the TLS 1.3 `key_share`, establishes shared secret material, and protects
-  TLS/QUIC encryption. The hybrid preference is `X25519MLKEM768`, with
-  classical X25519 retained for old peers.
-- **ML-DSA is for authentication and signatures.** Once implemented, it
-  verifies control of enrolled ML-DSA-44 authentication key material and
-  signs application-level dual-signed mesh gossip messages. It does not
-  establish TLS session secrets.
-- Larger ML-KEM public values and ciphertexts are expected in TLS
-  `key_share`; they are not constrained by the endpoint identifier
-  representation.
+  the TLS 1.3 `key_share` (whose wire format supports its larger key-exchange
+  values), establishes shared secret material, and protects TLS/QUIC
+  encryption. The hybrid preference is `X25519MLKEM768`, with classical
+  X25519 retained for old peers.
+- **ML-DSA is for application-level authentication and signatures.** The
+  current enrollment binds an ML-DSA-44 public key to the existing endpoint
+  identity in both directions. A successful v2 verification proves the peer
+  controlling that enrolled key signed that particular gossip request; it
+  does not replace or universally authenticate iroh's Ed25519 transport
+  identity. ML-DSA does not establish TLS session secrets.
+- Larger ML-KEM public values and ciphertexts are carried by TLS's
+  extensible `key_share`; their size is not an endpoint-identifier
+  limitation.
 - Iroh's current endpoint identity is a stable 32-byte Ed25519-derived
   identifier. ML-DSA public keys and signatures cannot be substituted into
   that representation. Current iroh transport identity therefore remains
