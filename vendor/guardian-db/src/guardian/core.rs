@@ -1054,40 +1054,26 @@ impl GuardianDB {
         let _entered = self.span.enter();
         tracing::debug!("Starting GuardianDB shutdown");
 
-        // Close all stores first (async operation) - with error handling.
-        tracing::debug!("Closing all stores");
         self.close_all_stores().await;
-
-        // Close direct connections (async operation) - with error handling.
-        tracing::debug!("Closing direct connections");
         self.close_direct_connections().await;
-
-        // Close cache (synchronous operation)
-        tracing::debug!("Closing cache");
-        self.close_cache();
-
-        // Close keystore (synchronous operation) - with error handling.
-        tracing::debug!("Closing keystore");
-        self.close_key_store();
-
-        // Close emitters using the EventBus.
-        // Note: our emitters do not need an explicit close since they use Tokio broadcast channels,
-        // which are automatically cleaned up when the EventBus is dropped.
-        tracing::debug!("Emitters will be closed automatically with the EventBus");
-
-        // Signal all background tasks (such as `monitor_direct_channel`) to shut down.
-        tracing::debug!("Cancelling background tasks");
         self.cancellation_token.cancel();
-
-        // Explicitly abort the monitor task to avoid hangs during shutdown.
-        tracing::debug!("Aborting the direct channel monitor task");
         self._monitor_handle.abort();
 
-        // Small delay to allow the abort to propagate.
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        let client_result = self.client.shutdown().await;
 
-        tracing::debug!("GuardianDB closed successfully");
-        Ok(())
+        self.close_cache();
+        self.close_key_store();
+
+        match client_result {
+            Ok(()) => {
+                tracing::debug!("GuardianDB closed successfully");
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(%error, "GuardianDB backend shutdown failed after local cleanup");
+                Err(error)
+            }
+        }
     }
 
     /// Creates a new database (store), determines its address, saves it locally and opens it.

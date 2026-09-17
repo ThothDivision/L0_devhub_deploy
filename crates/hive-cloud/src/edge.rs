@@ -518,9 +518,8 @@ async fn edge_pipeline_inner(
     // local candidate by the same `(production, created_at_ms)` ordering
     // `set_alias_if_newer` uses locally, so a preview can never pre-empt a
     // production deploy this node DOES hold correctly.
-    let local_is_stale = serve_local
-        && matches!(local_state, Some(fluid_core::DeployState::Ready))
-        && {
+    let local_is_stale =
+        serve_local && matches!(local_state, Some(fluid_core::DeployState::Ready)) && {
             let local_rank = cloud
                 .gw
                 .deployment_for_host(&host)
@@ -535,7 +534,10 @@ async fn edge_pipeline_inner(
                     .filter(|d| {
                         [&d.alias, &d.commit_alias, &d.branch_alias, &d.id_alias]
                             .iter()
-                            .any(|a| a.eq_ignore_ascii_case(&host) || a.split('.').next() == Some(sub.as_str()))
+                            .any(|a| {
+                                a.eq_ignore_ascii_case(&host)
+                                    || a.split('.').next() == Some(sub.as_str())
+                            })
                     })
                     .any(|d| (d.production, d.created_at_ms) > local_rank)
             })

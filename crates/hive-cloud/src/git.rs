@@ -2256,7 +2256,8 @@ async fn run_build(
             // `run_build`), collapsing the deploy to the primary region only —
             // while a STATELESS multi-region fanout proceeds on every target
             // exactly as before.
-            let mut ok = fanout_remote(cloud, bid, &req, &project, incarnation, &remote, true).await;
+            let mut ok =
+                fanout_remote(cloud, bid, &req, &project, incarnation, &remote, true).await;
             // DISPATCH FALLBACK. `nothing_ran` means every placed target was
             // UNREACHABLE — the request never arrived anywhere, so nothing is
             // known about the app and no node holds a half-finished build.
@@ -3876,8 +3877,7 @@ async fn run_build(
     {
         let ingested_early = find_workflow_manifest(&build_dir).is_some();
         let py_wdk = crate::world_queue::vercel_json_declares_workflow_worker(&build_dir);
-        let opted_out =
-            crate::world_queue::workflow_world_opted_out(cloud, &project, &build_dir);
+        let opted_out = crate::world_queue::workflow_world_opted_out(cloud, &project, &build_dir);
         tracing::info!(
             %project,
             ingested_early,
@@ -3962,16 +3962,17 @@ async fn run_build(
                 // `manifest.functions[].env` earlier in the pipeline, well
                 // before this block runs.
                 if let Ok(fresh) = cloud.projects.get_exact(&project, incarnation) {
-                    let queue_env: Vec<(String, String)> = ["HIVE_QUEUE_ENDPOINT", "HIVE_QUEUE_TOKEN"]
-                        .into_iter()
-                        .filter_map(|key| {
-                            fresh
-                                .env
-                                .iter()
-                                .find(|e| e.key == key)
-                                .map(|value| (key.to_string(), value.value.clone()))
-                        })
-                        .collect();
+                    let queue_env: Vec<(String, String)> =
+                        ["HIVE_QUEUE_ENDPOINT", "HIVE_QUEUE_TOKEN"]
+                            .into_iter()
+                            .filter_map(|key| {
+                                fresh
+                                    .env
+                                    .iter()
+                                    .find(|e| e.key == key)
+                                    .map(|value| (key.to_string(), value.value.clone()))
+                            })
+                            .collect();
                     for f in manifest.functions.iter_mut() {
                         for (k, v) in &queue_env {
                             f.env.insert(k.clone(), v.clone());
@@ -5868,21 +5869,21 @@ async fn mirror_remote_build(
     let started = now_ms();
     let mut deadline = started + idle_window_ms;
     // AUTH FOR THE POLL, not just the dispatch. `/v1/builds/:id` is
-                                              // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
-                                              // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
-                                              // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
-                                              // anonymous tenant, `build_owned_by` never matched the build's real
-                                              // team, and every poll 404'd — INCLUDING every poll against a target
-                                              // build that had already finished. Verified live: 400/400 polls failed
-                                              // for a target build that reached `ready` in under 3 seconds, on a
-                                              // reachable node, every single time. This is not a mesh-health symptom;
-                                              // it silently broke remote-build status mirroring for every
-                                              // fanout-placed deployment on the whole fleet, always burning the full
-                                              // 10-minute deadline regardless of how fast the actual remote build was.
-                                              // `mesh_team_qs` is the SAME delegation-token minting already used for
-                                              // every other mesh-internal proxied read (`fetch_from_host` and
-                                              // friends) — the coordinator knows the real owning team from its own
-                                              // local build record, so it can assert it the same way.
+    // team-scoped (`admin::build_owned_by`) and this poll carried NEITHER
+    // `?team=` nor `?tok=`, so on the RECEIVING node `team_claims`/
+    // `team_headers` (gossip.rs) derived nothing, `build_get` computed the
+    // anonymous tenant, `build_owned_by` never matched the build's real
+    // team, and every poll 404'd — INCLUDING every poll against a target
+    // build that had already finished. Verified live: 400/400 polls failed
+    // for a target build that reached `ready` in under 3 seconds, on a
+    // reachable node, every single time. This is not a mesh-health symptom;
+    // it silently broke remote-build status mirroring for every
+    // fanout-placed deployment on the whole fleet, always burning the full
+    // 10-minute deadline regardless of how fast the actual remote build was.
+    // `mesh_team_qs` is the SAME delegation-token minting already used for
+    // every other mesh-internal proxied read (`fetch_from_host` and
+    // friends) — the coordinator knows the real owning team from its own
+    // local build record, so it can assert it the same way.
     let team = cloud
         .builds
         .get(bid)
@@ -6632,7 +6633,9 @@ fn direct_launch_entry(start_cmd: &[String]) -> Option<String> {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
-        && path.components().any(|component| matches!(component, Component::Normal(_)));
+        && path
+            .components()
+            .any(|component| matches!(component, Component::Normal(_)));
     plain_relative.then(|| candidate.clone())
 }
 
@@ -6708,7 +6711,12 @@ async fn preflight_direct_entries(
                 let mut names = Vec::new();
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let mut name = entry.file_name().to_string_lossy().into_owned();
-                    if entry.file_type().await.map(|kind| kind.is_dir()).unwrap_or(false) {
+                    if entry
+                        .file_type()
+                        .await
+                        .map(|kind| kind.is_dir())
+                        .unwrap_or(false)
+                    {
                         name.push('/');
                     }
                     names.push(name);

@@ -299,7 +299,14 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
         .and_then(|meta| serde_json::from_slice::<ReqMeta>(meta).ok())
         .map(|meta| matches!(meta.method.as_str(), "GET" | "HEAD"))
         .unwrap_or(false);
-    const MAX_ATTEMPTS: u32 = 3;
+    // Witnessed live on fc-sanjose (2026-09-16 02:10-02:24 UTC): a 14-minute
+    // burst against one litebox-backed deployment exhausted all 3 attempts
+    // (total backoff budget 60ms) on every one of 49 requests — the guest's
+    // single-listener re-arm did not recover within that window under
+    // sustained load, even serialized behind `connect_gate`'s 1-permit
+    // semaphore. 5 attempts with a longer tail gives a burst materially more
+    // room to drain before the caller sees an honest 502.
+    const MAX_ATTEMPTS: u32 = 5;
     let mut last_error = None;
     for attempt in 0..MAX_ATTEMPTS {
         let mut head_sent = false;

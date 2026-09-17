@@ -1102,9 +1102,11 @@ async fn async_main() -> anyhow::Result<()> {
     // therefore before deployment_ledger, the integrity chain's backing
     // store) existed, so the observer is wired in here instead of at
     // `Fluid::start`.
-    cloud.fluid.set_execution_observer(
-        crate::deployment_ledger::LedgerExecutionObserver::new(cloud.deployment_ledger.clone()),
-    );
+    cloud
+        .fluid
+        .set_execution_observer(crate::deployment_ledger::LedgerExecutionObserver::new(
+            cloud.deployment_ledger.clone(),
+        ));
     // Advertise the sealed-artifact transfer receiver only after CloudState
     // construction PROVED it initialized (durable store opened, worker
     // spawned, interrupted transactions recovered). A receiver that failed
@@ -5200,11 +5202,14 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
                         tracing::warn!(tenant, error = %e, "ledger checkpoint prune: relational delete failed, retrying next tick");
                         continue;
                     }
-                    let removed =
-                        cloud
-                            .billing
-                            .prune_ledger_range(tenant, cp.period_start_ms, cp.period_end_ms);
-                    cloud.billing.mark_checkpoint_pruned(tenant, cp.period_start_ms);
+                    let removed = cloud.billing.prune_ledger_range(
+                        tenant,
+                        cp.period_start_ms,
+                        cp.period_end_ms,
+                    );
+                    cloud
+                        .billing
+                        .mark_checkpoint_pruned(tenant, cp.period_start_ms);
                     tracing::info!(
                         tenant,
                         removed,

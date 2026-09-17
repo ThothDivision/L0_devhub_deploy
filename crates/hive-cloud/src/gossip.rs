@@ -2123,7 +2123,13 @@ pub async fn fetch(
     // (issue() returns Err, so no header is added -- matching dev/single-node
     // behavior exactly as before).
     if method == hive_p2p::GOSSIP_POST {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", "mesh", "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+        if let Ok(tok) = crate::auth::issue(
+            "mesh-internal",
+            "mesh",
+            "service",
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
             req = req.header("authorization", format!("Bearer {tok}"));
         }
     }

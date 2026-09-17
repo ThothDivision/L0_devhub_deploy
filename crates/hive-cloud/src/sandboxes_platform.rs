@@ -424,10 +424,9 @@ impl PlatformSandboxProvider {
                     "sandbox id {id} already exists under a different project"
                 )));
             }
-            if r
-                .iter()
-                .any(|s| s.project_id == project_id && s.name == input.name && s.deleted_at.is_none())
-            {
+            if r.iter().any(|s| {
+                s.project_id == project_id && s.name == input.name && s.deleted_at.is_none()
+            }) {
                 return Err(SandboxError::AlreadyExists(format!(
                     "sandbox '{}' already exists in this project",
                     input.name

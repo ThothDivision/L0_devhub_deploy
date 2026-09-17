@@ -3,6 +3,18 @@
 Base: `iroh` 1.0.2 verbatim from crates.io (checksum
 `5fca9b4b462c343ff88fc0af4096c186f939b602a0bc08723536ef2c31c93971`).
 
+## Patch: atomic address-lookup provider registration
+
+**File:** `src/address_lookup.rs`, inside `AddressLookupServices::add_boxed`.
+
+**Problem.** A provider replayed `last_data` before acquiring the services lock.
+A concurrent endpoint publication could therefore finish between replay and
+insertion, leaving the new provider permanently one publication behind.
+
+**Fix.** Hold the services write lock while replaying `last_data` and inserting
+the provider. Publication already takes the locks in `services -> last_data`
+order, so every update is now either included in replay or observed live.
+
 ## Patch: bound `pending_open_paths` (upstream #4390)
 
 **File:** `src/socket/remote_map/remote_state.rs`, inside

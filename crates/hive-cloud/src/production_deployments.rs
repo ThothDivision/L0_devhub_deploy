@@ -225,7 +225,8 @@ pub fn spawn_node_death_reconcile(cloud: Arc<crate::state::CloudState>) {
             // needing relocation. Mirrors `spawn_git_poll_reconcile`'s own
             // 45s settle sleep.
             tokio::time::sleep(std::time::Duration::from_secs(45)).await;
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(RECONCILE_TICK_SECS));
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(RECONCILE_TICK_SECS));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;

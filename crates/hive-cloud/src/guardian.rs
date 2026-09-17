@@ -24,7 +24,7 @@ use guardian_db::guardian::core::NewGuardianDBOptions;
 use guardian_db::guardian::error::GuardianError;
 use guardian_db::guardian::GuardianDB;
 use guardian_db::p2p::network::client::IrohClient;
-use guardian_db::p2p::network::config::ClientConfig;
+use guardian_db::p2p::network::config::{ClientConfig, MdnsDiscoveryAuth};
 use guardian_db::traits::KeyValueStore;
 use tokio::sync::OnceCell;
 
@@ -323,6 +323,10 @@ async fn init_handle() -> anyhow::Result<Handle> {
     let cfg = ClientConfig {
         data_store_path: Some(dir.join("iroh")),
         enable_discovery_n0: true,
+        enable_discovery_mdns: true,
+        mdns_discovery_auth: Some(MdnsDiscoveryAuth::from_key_material(
+            crate::secrets::key_material(),
+        )),
         port: 0,
         ..ClientConfig::default()
     };
@@ -402,9 +406,9 @@ async fn init_handle() -> anyhow::Result<Handle> {
     })
 }
 
-/// Register a peer's iroh address AND mark it known, against a specific
+/// Register a peer's iroh address AND explicitly admit it, against a specific
 /// `IrohClient`. `add_node_addr` registers a static `MemoryLookup` entry
-/// (address resolution only). `note_known_peer` is the SEPARATE set that
+/// (address resolution only). `note_explicit_peer` is the SEPARATE admission that
 /// `IrohBackend::resolve_shared_ticket`'s automatic DocTicket exchange
 /// actually consults — `add_node_addr` alone never touches it. CALLERS MUST
 /// PASS THIS NODE'S GUARDIANDB-SPECIFIC ADDRESS, never its hive-p2p mesh
@@ -426,7 +430,7 @@ async fn seed_peer(client: &IrohClient, addr_json: &str) -> bool {
                 tracing::debug!(error = %e, "guardian seed_peer: add_node_addr failed");
                 return false;
             }
-            client.backend().note_known_peer(peer_id).await;
+            client.backend().note_explicit_peer(peer_id).await;
             true
         }
         Err(e) => {

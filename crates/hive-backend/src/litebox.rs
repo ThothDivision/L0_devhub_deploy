@@ -3787,6 +3787,7 @@ fn append_litebox_runtime_augmentation_blocking(
     _deps: &[PathBuf],
     _identity: Option<&RuntimeArtifactIdentity>,
     _runtime_bin: Option<&Path>,
+    _extra_entries: &[(PathBuf, Vec<u8>)],
 ) -> anyhow::Result<()> {
     anyhow::bail!("descriptor-relative tar augmentation requires Linux openat2")
 }

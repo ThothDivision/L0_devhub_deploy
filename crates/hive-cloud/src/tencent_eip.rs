@@ -111,7 +111,9 @@ pub async fn leader_preflight(cloud: &Arc<CloudState>) -> Option<Result<(), Stri
             Err(_) => continue,
         };
         let addon = body.get("addons").and_then(|a| a.get(0));
-        let Some(available) = addon.and_then(|a| a.get("available")).and_then(|v| v.as_bool())
+        let Some(available) = addon
+            .and_then(|a| a.get("available"))
+            .and_then(|v| v.as_bool())
         else {
             continue;
         };

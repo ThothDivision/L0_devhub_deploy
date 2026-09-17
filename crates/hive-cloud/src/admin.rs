@@ -1980,7 +1980,13 @@ pub(crate) async fn post_to_host_json(
             }
         }
         if crate::auth::enforced() {
-            if let Ok(token) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+            if let Ok(token) = crate::auth::issue(
+                "mesh-internal",
+                team,
+                "service",
+                false,
+                crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+            ) {
                 request = request.bearer_auth(token);
             }
         }
@@ -3475,8 +3481,7 @@ pub(crate) async fn deployment_integrity(
         if !team_ok {
             return Err(StatusCode::NOT_FOUND);
         }
-        let chain_head_sha256 =
-            hive_core::fold_integrity_chain(&id, &acceptance.integrity_chain);
+        let chain_head_sha256 = hive_core::fold_integrity_chain(&id, &acceptance.integrity_chain);
         let signature = c.integrity_signer.sign_chain_head(&chain_head_sha256);
         let sep_public_keys: Vec<&hive_core::IntegrityEntryKind> = acceptance
             .integrity_chain
@@ -5978,9 +5983,13 @@ pub(crate) async fn dispatch_project_delete_with(
                     }
                 }
                 if crate::auth::enforced() {
-                    if let Ok(token) =
-                        crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS)
-                    {
+                    if let Ok(token) = crate::auth::issue(
+                        "mesh-internal",
+                        team,
+                        "service",
+                        false,
+                        crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+                    ) {
                         request = request.bearer_auth(token);
                     }
                 }
@@ -6797,7 +6806,13 @@ pub(crate) async fn fetch_bytes_from_host(
         .header("x-hive-team", team)
         .timeout(std::time::Duration::from_secs(15));
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+        if let Ok(tok) = crate::auth::issue(
+            "mesh-internal",
+            team,
+            "service",
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
             rb = rb.bearer_auth(tok);
         }
     }
@@ -6819,7 +6834,13 @@ async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str
     // proxied here silently 403'd. Attach the same short-lived signed service
     // delegation `fanout_remote` uses so this node-to-node read authenticates.
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+        if let Ok(tok) = crate::auth::issue(
+            "mesh-internal",
+            team,
+            "service",
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
             rb = rb.bearer_auth(tok);
         }
     }
@@ -6927,7 +6948,13 @@ pub(crate) fn mesh_team_qs(team: &str) -> String {
         return String::new();
     }
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+        if let Ok(tok) = crate::auth::issue(
+            "mesh-internal",
+            team,
+            "service",
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
             return format!("team={team}&tok={tok}");
         }
     }
