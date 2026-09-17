@@ -86,20 +86,42 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* Very faint large-square grid canvas behind the whole dashboard. Uses the
-   foreground channel at a tiny alpha so it adapts to light & dark automatically. */
+/* Dev Hub's persistent canvas: a quiet paper-like grid with a green network
+   glow and dotted mesh. This deliberately lives below application content, so
+   it restores the product skin without competing with deployment data. */
 body {
   background-image:
-    linear-gradient(to right, hsl(var(--foreground) / 0.01) 1px, transparent 1px),
-    linear-gradient(to bottom, hsl(var(--foreground) / 0.01) 1px, transparent 1px);
-  background-size: 140px 140px;
-  background-position: -1px -1px;
+    radial-gradient(ellipse 68% 52% at 100% 14%, hsl(153 57% 42% / 0.11), transparent 68%),
+    radial-gradient(circle at 5% 84%, hsl(174 62% 44% / 0.06), transparent 38%),
+    linear-gradient(to right, hsl(153 35% 30% / 0.035) 1px, transparent 1px),
+    linear-gradient(to bottom, hsl(153 35% 30% / 0.035) 1px, transparent 1px);
+  background-size: auto, auto, 136px 136px, 136px 136px;
+  background-position: center, center, -1px -1px, -1px -1px;
   background-attachment: fixed;
 }
 .dark body {
   background-image:
-    linear-gradient(to right, hsl(var(--foreground) / 0.015) 1px, transparent 1px),
-    linear-gradient(to bottom, hsl(var(--foreground) / 0.015) 1px, transparent 1px);
+    radial-gradient(ellipse 68% 52% at 100% 14%, hsl(153 66% 42% / 0.16), transparent 68%),
+    radial-gradient(circle at 5% 84%, hsl(174 62% 44% / 0.08), transparent 38%),
+    linear-gradient(to right, hsl(153 45% 65% / 0.05) 1px, transparent 1px),
+    linear-gradient(to bottom, hsl(153 45% 65% / 0.05) 1px, transparent 1px);
+}
+
+/* Fine dotted paths add the Dev Hub's visual identity while preserving a
+   completely passive, readable background for every dashboard route. */
+.dev-hub-shell {
+  background-image:
+    radial-gradient(circle at 82% 3%, hsl(153 63% 40% / 0.34) 0 1px, transparent 1.5px),
+    radial-gradient(circle at 95% 18%, hsl(153 63% 40% / 0.24) 0 1px, transparent 1.5px),
+    radial-gradient(circle at 76% 25%, hsl(153 63% 40% / 0.18) 0 1px, transparent 1.5px);
+  background-size: 220px 220px, 290px 290px, 350px 350px;
+  background-position: right top, right 56px top 82px, right 160px top 190px;
+}
+.dark .dev-hub-shell {
+  background-image:
+    radial-gradient(circle at 82% 3%, hsl(153 70% 58% / 0.42) 0 1px, transparent 1.5px),
+    radial-gradient(circle at 95% 18%, hsl(153 70% 58% / 0.3) 0 1px, transparent 1.5px),
+    radial-gradient(circle at 76% 25%, hsl(153 70% 58% / 0.24) 0 1px, transparent 1.5px);
 }
 
 * {

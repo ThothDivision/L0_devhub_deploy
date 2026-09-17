@@ -5,12 +5,12 @@ import {
   Github, Search, GitBranch, CheckCheck, LayoutGrid, List,
   ChevronDown, ShieldCheck, CircleCheck, EyeOff, Star, Activity, X,
 } from "lucide-react";
-import { Card, Button, Input } from "@/components/ui";
+import { Card, Button, Input, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
 import { FrameworkLogo } from "@/components/framework-logo";
 import { ProjectMenu } from "@/components/project-menu";
 import {
-  usePoll, type Deployment, type BillingInfo, type LedgerEntry, type NotificationFeed,
+  usePoll, type Deployment, type BillingInfo, type LedgerEntry, type NotificationFeed, type PqcStatus,
 } from "@/lib/api";
 import { timeAgo } from "@/lib/utils";
 import { deploymentHost, deploymentSelfAlias } from "@/lib/deploy-url";
@@ -114,6 +114,10 @@ function Dashboard() {
   const { data: billing } = usePoll<BillingInfo>("/v1/billing", 8000);
   const { data: ledger } = usePoll<LedgerEntry[]>("/v1/billing/ledger", 8000);
   const { data: notifications } = usePoll<NotificationFeed>("/v1/notifications", 8000);
+  // The status is server-observed cryptographic telemetry, not a client-side
+  // preference. Keep it on the landing dashboard so the security posture is
+  // visible without having to know that it also lives under Constellation.
+  const { data: pqc } = usePoll<PqcStatus>("/v1/security/pqc", 10000);
   const [q, setQ] = useState("");
   const [page, setPage] = useState(0);
   // Lazy initializer: reads the saved card/list preference synchronously on
@@ -204,6 +208,8 @@ function Dashboard() {
         <AddNewMenu />
       </div>
 
+      <PqcPosture status={pqc} />
+
       {/* Left column slimmed ~15% (340 → 290). */}
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[290px_1fr]">
         {/* LEFT: Vercel-style dashboard boxes */}
@@ -275,6 +281,48 @@ function Dashboard() {
         </div>
       </div>
     </div>
+  );
+}
+
+function PqcPosture({ status }: { status: PqcStatus | null }) {
+  const transport = status?.transport;
+  const sessions = transport
+    ? transport.telemetry.live_hybrid_sessions + transport.telemetry.live_classical_sessions + transport.telemetry.live_unknown_sessions
+    : 0;
+  const tone = status?.status === "active" ? "green" : status?.status === "fallback" ? "amber" : "default";
+  const label = status?.status === "active" ? "PQC active" : status?.status === "fallback" ? "PQC fallback" : "PQC unavailable";
+
+  return (
+    <Link
+      href="/network"
+      aria-label="View post-quantum cryptography status in Constellation"
+      className="mb-6 block rounded-xl focus:outline-none focus:ring-2 focus:ring-emerald-500/60"
+    >
+      <Card className="group relative overflow-hidden border-emerald-500/20 bg-card/90 p-4 backdrop-blur-sm transition-shadow hover:shadow-pop">
+        <div className="absolute inset-y-0 left-0 w-1 bg-emerald-500" aria-hidden />
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex items-center gap-3">
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-600 dark:text-emerald-400">
+              <ShieldCheck className="h-5 w-5" />
+            </span>
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-semibold">Post-quantum cryptography</span>
+                <Badge tone={tone}>{label}</Badge>
+              </div>
+              <p className="mt-0.5 text-sm text-secondary">
+                {transport
+                  ? `${transport.algorithm} · ${transport.mode} transport · ${sessions} live observed session${sessions === 1 ? "" : "s"}`
+                  : "Verified transport telemetry is unavailable on this backend."}
+              </p>
+            </div>
+          </div>
+          <span className="shrink-0 text-sm font-medium text-emerald-700 group-hover:underline dark:text-emerald-300">
+            View security posture →
+          </span>
+        </div>
+      </Card>
+    </Link>
   );
 }
 

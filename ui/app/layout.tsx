@@ -166,7 +166,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <Suspense fallback={null}>
             <ChromeTop />
           </Suspense>
-          <main className="mx-auto w-full max-w-[1400px] flex-1 px-4 py-8 sm:px-6">{children}</main>
+          <main className="dev-hub-shell mx-auto w-full max-w-[1400px] flex-1 px-4 py-8 sm:px-6">{children}</main>
           <Suspense fallback={null}>
             <ChromeBottom />
           </Suspense>
