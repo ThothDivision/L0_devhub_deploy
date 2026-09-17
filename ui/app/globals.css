@@ -86,21 +86,20 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* Dev Hub's persistent canvas: the local workshop/network illustration is a
-   fixed, passive layer behind every route. Keep it closer and visible enough
-   to retain the stronger stencil treatment used by the new-project page. */
+/* Dev Hub's persistent canvas: crop the illustration past every viewport edge
+   so the low-detail margins in the source never show through. */
 body {
   background-image:
-    linear-gradient(hsl(var(--background) / 0.64), hsl(var(--background) / 0.64)),
+    linear-gradient(hsl(var(--background) / 0.48), hsl(var(--background) / 0.48)),
     url("/dev-hub-background.png");
-  background-size: cover, min(1680px, 120vw) auto;
-  background-position: center, center top;
-  background-repeat: no-repeat, repeat-y;
+  background-size: cover, max(1500px, 155vw) auto;
+  background-position: center, center 42%;
+  background-repeat: no-repeat, no-repeat;
   background-attachment: fixed;
 }
 .dark body {
   background-image:
-    linear-gradient(hsl(var(--background) / 0.82), hsl(var(--background) / 0.82)),
+    linear-gradient(hsl(var(--background) / 0.7), hsl(var(--background) / 0.7)),
     url("/dev-hub-background.png");
 }
 
