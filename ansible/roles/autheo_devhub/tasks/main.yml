@@ -85,6 +85,9 @@
   environment:
     PATH: "/usr/local/bin:/usr/bin:/bin:{{ ansible_env.PATH }}"
     NODE_ENV: production
+    # Browser-visible Next.js variables are inlined during this build, not read
+    # from the systemd EnvironmentFile at runtime.
+    NEXT_PUBLIC_MARKETPLACE_URL: "{{ autheo_devhub_marketplace_url }}"
   async: 900
   poll: 15
 

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useRef, useState } from "react";
-import { ChevronsUpDown, ShieldHalf, Check, Plus, User, Settings, Building2, Workflow } from "lucide-react";
+import { ChevronsUpDown, ShieldHalf, Check, Plus, User, Settings, Building2, Workflow, Store } from "lucide-react";
 import { useOrganization, useOrganizationList, useClerk } from "@clerk/nextjs";
 import { cn } from "@/lib/utils";
 import { Triangle } from "@/components/ui";
@@ -16,6 +16,7 @@ import { usePoll, switchTeam, mintSessionToken, type Team } from "@/lib/api";
 import { useIsPlatformOwner } from "@/lib/owner";
 
 const clerkOn = !!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
+const marketplaceUrl = process.env.NEXT_PUBLIC_MARKETPLACE_URL || "http://localhost:3000";
 
 // Team/account-level tabs — shown when NO project/deployment is selected.
 const teamTabs = [
@@ -172,6 +173,13 @@ export function TopNav() {
           )}
         </div>
         <div className="flex items-center gap-2">
+          <Link
+            href={marketplaceUrl}
+            className="flex items-center gap-1.5 rounded-md border border-border-strong px-2.5 py-1 text-xs font-medium text-secondary hover:bg-subtle hover:text-fg"
+            title="Open Marketplace"
+          >
+            <Store className="h-3.5 w-3.5" /> Marketplace
+          </Link>
           {/* Ops entry — platform owner only (middleware enforces; this just hides the link). */}
           {isOwner && (
             <Link

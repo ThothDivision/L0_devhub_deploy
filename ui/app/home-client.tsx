@@ -3,7 +3,7 @@
 import Link from "next/link";
 import {
   Github, Search, GitBranch, CheckCheck, LayoutGrid, List,
-  ChevronDown, ShieldCheck, CircleCheck, EyeOff, Star, Activity, X,
+  ChevronDown, ShieldCheck, CircleCheck, EyeOff, Star, Activity, X, RefreshCw,
 } from "lucide-react";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
@@ -110,7 +110,7 @@ function AuthDegraded() {
 }
 
 function Dashboard() {
-  const { data: deps, refresh } = usePoll<Deployment[]>("/deployments", 3000);
+  const { data: deps, error: deploymentsError, refresh } = usePoll<Deployment[]>("/deployments", 3000);
   const { data: billing } = usePoll<BillingInfo>("/v1/billing", 8000);
   const { data: ledger } = usePoll<LedgerEntry[]>("/v1/billing/ledger", 8000);
   const { data: notifications } = usePoll<NotificationFeed>("/v1/notifications", 8000);
@@ -239,7 +239,9 @@ function Dashboard() {
             )
           )}
 
-          {deps === null ? (
+          {deps === null && deploymentsError ? (
+            <DeploymentLoadError error={deploymentsError} onRetry={refresh} />
+          ) : deps === null ? (
             // Data not loaded yet (initial mount OR a team/account switch that
             // cleared the previous tenant's data). Show a skeleton, NOT the empty
             // state — otherwise "Deploy your first project" flashes for a frame
@@ -281,6 +283,23 @@ function Dashboard() {
         </div>
       </div>
     </div>
+  );
+}
+
+function DeploymentLoadError({ error, onRetry }: { error: string; onRetry: () => void }) {
+  return (
+    <Card className="overflow-hidden p-8 text-center">
+      <GlobeEmptyState
+        title="We couldn’t load your deployments"
+        desc="Your projects are still safe. Check your connection and try loading them again."
+      />
+      <Button className="relative z-10 mt-2" onClick={onRetry}>
+        <RefreshCw className="h-4 w-4" /> Retry deployments
+      </Button>
+      <p className="relative z-10 mt-3 text-xs text-muted" role="status">
+        {error}
+      </p>
+    </Card>
   );
 }
 
