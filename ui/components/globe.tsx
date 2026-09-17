@@ -1,29 +1,21 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useTheme } from "next-themes";
-import Image from "next/image";
+import { AnimatedGlobe } from "@/components/animated-globe";
 
-/** Vercel-style globe-outline empty state. Shows the dark globe in dark mode and
- *  the light globe in light mode. The SVG is a half-globe wireframe anchored to
- *  the bottom of its container. */
+/** Dashboard empty state with an animated, location-pinned mesh globe. */
 export function GlobeEmptyState({ title, desc }: { title: string; desc?: string }) {
-  const { resolvedTheme } = useTheme();
-  const [mounted, setMounted] = useState(false);
-  // eslint-disable-next-line react-hooks/set-state-in-effect -- hydration-mismatch-avoidance mount flag: render neutral state until client mount, then reveal theme-dependent image
-  useEffect(() => setMounted(true), []);
-  const src = mounted && resolvedTheme === "dark" ? "/globe-dark.svg" : "/globe-light.svg";
-
   return (
-    <div className="relative overflow-hidden">
+    <div className="relative w-full overflow-hidden">
       {(title || desc) && (
         <div className="relative z-10 pt-2">
           {title ? <h2 className="text-2xl font-semibold tracking-tight text-fg">{title}</h2> : null}
           {desc ? <p className="mt-1.5 text-sm text-secondary">{desc}</p> : null}
         </div>
       )}
-      <div className="pointer-events-none mt-6 flex justify-center">
-        <Image src={src} alt="" width={688} height={256} unoptimized className="h-auto w-full select-none opacity-90" />
+      <div className="pointer-events-none relative mt-5 h-52 overflow-hidden sm:h-60">
+        <div className="absolute inset-x-0 bottom-0 h-2/3 bg-[radial-gradient(ellipse_at_center_bottom,rgba(14,165,233,0.13),transparent_65%)]" />
+        <AnimatedGlobe className="absolute inset-0 h-full w-full select-none" />
+        <div className="absolute inset-x-[12%] bottom-0 h-px bg-gradient-to-r from-transparent via-cyan-400/30 to-transparent" />
       </div>
     </div>
   );
