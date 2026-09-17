@@ -87,20 +87,20 @@ body {
 }
 
 /* Dev Hub's persistent canvas: the local workshop/network illustration is a
-   fixed, passive layer behind every route. The white overlay preserves card
-   contrast while letting the line art remain visible across the application. */
+   fixed, passive layer behind every route. Keep it closer and visible enough
+   to retain the stronger stencil treatment used by the new-project page. */
 body {
   background-image:
-    linear-gradient(hsl(var(--background) / 0.78), hsl(var(--background) / 0.78)),
+    linear-gradient(hsl(var(--background) / 0.64), hsl(var(--background) / 0.64)),
     url("/dev-hub-background.png");
-  background-size: cover, min(1440px, 100vw) auto;
+  background-size: cover, min(1680px, 120vw) auto;
   background-position: center, center top;
   background-repeat: no-repeat, repeat-y;
   background-attachment: fixed;
 }
 .dark body {
   background-image:
-    linear-gradient(hsl(var(--background) / 0.9), hsl(var(--background) / 0.9)),
+    linear-gradient(hsl(var(--background) / 0.82), hsl(var(--background) / 0.82)),
     url("/dev-hub-background.png");
 }
 
