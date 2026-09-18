@@ -1,4 +1,4 @@
-import { Skeleton } from "@/components/ui";
+import { DevHubLoading } from "@/components/dev-hub-loading";
 
 // The ROOT loading boundary — Next.js uses this as the fallback for EVERY route
 // under app/ (marketing pages, docs, sign-in, the dashboard…) that doesn't define
@@ -11,11 +11,5 @@ import { Skeleton } from "@/components/ui";
 // network, storage, observability) get their own accurately-shaped
 // `loading.tsx` alongside their `page.tsx`, which takes precedence here.
 export default function Loading() {
-  return (
-    <div className="flex flex-col gap-4 pb-24">
-      <Skeleton className="h-7 w-56" />
-      <Skeleton className="h-4 w-80 max-w-full" />
-      <Skeleton className="mt-2 h-40 w-full" />
-    </div>
-  );
+  return <DevHubLoading compact />;
 }

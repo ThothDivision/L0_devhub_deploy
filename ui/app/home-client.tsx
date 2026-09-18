@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { Card, Button, Input, Badge } from "@/components/ui";
 import { GlobeEmptyState } from "@/components/globe";
+import { DevHubLoading } from "@/components/dev-hub-loading";
 import { FrameworkLogo } from "@/components/framework-logo";
 import { ProjectMenu } from "@/components/project-menu";
 import {
@@ -65,9 +66,7 @@ function GuardedHome() {
  *  and is time-bounded by the guard (RESOLVE_TIMEOUT_MS → signed-out). */
 function AuthResolving() {
   return (
-    <div aria-busy="true" className="flex min-h-[70vh] items-center justify-center">
-      <span className="h-8 w-8 animate-pulse rounded-full border border-border bg-subtle" />
-    </div>
+    <DevHubLoading className="min-h-[70vh]" />
   );
 }
 

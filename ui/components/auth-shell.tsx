@@ -5,6 +5,7 @@ import { useTheme } from "next-themes";
 import { ThemeToggle } from "@/components/theme-toggle";
 import { clerkAppearance } from "@/lib/clerk-appearance";
 import { Logo } from "@/components/logo";
+import { DevHubLoading } from "@/components/dev-hub-loading";
 
 const FEATURES = [
   "Global edge network across every region",
@@ -71,7 +72,7 @@ export function AuthShell({
           <Logo className="h-6 w-auto" />
         </div>
         <div className="w-full max-w-[400px]">
-          {mounted && render(clerkAppearance(dark))}
+          {mounted ? render(clerkAppearance(dark)) : <DevHubLoading compact />}
         </div>
         <div className="mt-6 text-center text-xs text-muted">{footer}</div>
       </div>

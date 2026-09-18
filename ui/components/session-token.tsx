@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { mintSessionToken, ensureSessionMinted } from "@/lib/api";
+import { DevHubLoading } from "@/components/dev-hub-loading";
 
 /**
  * Keeps a fresh httpOnly `hive_jwt` cookie (minted by `/api/token`) so the
@@ -20,16 +21,28 @@ import { mintSessionToken, ensureSessionMinted } from "@/lib/api";
  * mint rather than racing to fire two separate ones.
  */
 export function SessionToken() {
+  const [minting, setMinting] = useState(false);
+
   useEffect(() => {
     let cancelled = false;
-    void ensureSessionMinted();
+    const mint = (operation: () => Promise<unknown>) => {
+      setMinting(true);
+      void operation().finally(() => {
+        if (!cancelled) setMinting(false);
+      });
+    };
+    mint(ensureSessionMinted);
     const id = setInterval(() => {
-      if (!cancelled) mintSessionToken();
+      if (!cancelled) mint(mintSessionToken);
     }, 50 * 60_000);
     return () => {
       cancelled = true;
       clearInterval(id);
     };
   }, []);
-  return null;
+  return minting ? (
+    <div className="fixed inset-0 z-[150] bg-bg/80 backdrop-blur-sm">
+      <DevHubLoading compact className="h-full min-h-0" />
+    </div>
+  ) : null;
 }
