@@ -19,12 +19,18 @@ global “secure” assertion.
 
 ## What operators can observe
 
-`GET /v1/security/posture` is node-local. Its `auth_mode` explicitly reports
-whether authentication is enforced and whether platform-operator authorization
-is required; development mode intentionally disables enforcement. Through the
-Dev Hub `/ops` proxy, its direct response describes the control-plane leader,
-while its separate fleet section is leader-observed gossiped evidence. Missing
-support on old nodes is unavailable/unknown, never a healthy default.
+`GET /v1/security/posture` is operator-only and node-local. Through the Dev
+Hub `/ops` proxy, its direct response describes the control-plane leader only.
+Missing support on old nodes is unavailable/unknown, never a healthy default.
+
+`GET /v1/security/posture/fleet` is also operator-only. It is a
+**leader-observed aggregate** of compact, self-reported gossip summaries, not
+a direct fleet-wide cryptographic measurement or cryptographic attestation.
+It contains only aggregate counts and provider/backend states: no endpoint or
+peer IDs, addresses, certificates, handshake bytes, keys, secrets, or
+per-peer topology. Nodes without the summary capability are counted as
+unknown/mixed-version. Missing KEM telemetry is unknown, never evidence of
+classical or hybrid operation.
 
 For mesh KEM, the source of truth is completed rustls handshake metadata:
 
@@ -40,6 +46,34 @@ Public HTTPS, database TLS, relay-client TLS, and other HTTP service TLS do
 not inherit that iroh endpoint provider policy; they must not be represented
 as universally ML-KEM protected without independent negotiated-session
 telemetry and a compatible provider migration.
+
+## Diagram and architecture mapping
+
+The following is the implementation-aligned mapping for architecture/security
+diagrams:
+
+| Diagram layer | Actual implementation boundary |
+|---|---|
+| Identity | Endpoint identity is Ed25519. ML-DSA-44 is limited to dual-signed gossip and does not replace endpoint identity elsewhere. |
+| Key establishment | `X25519MLKEM768` is claimed only for completed sessions with negotiated-KEM telemetry. Missing telemetry is unknown. |
+| Data protection | iroh QUIC provides transport/session encryption for its established sessions. |
+| Discovery | Relay, configured bootstrap peers, pkarr, n0, and Mainline DHT are additive recovery/discovery paths, not availability guarantees. |
+| Synchronization | CRDT reconciliation is lane-specific. Other platform stores use leader-driven wholesale replacement; there is no platform-wide automatic CRDT conflict resolution. |
+| Execution | Firecracker/KVM is the strong microVM boundary. Litebox provides syscall mediation plus seccomp only. Containers are host containers, not microVMs. |
+
+The following claims are unsupported by the current implementation or not
+implemented and must not appear as active architecture capabilities:
+
+- SLH-DSA is active — unsupported by the current implementation.
+- Bluetooth discovery is active — not implemented.
+- mDNS discovery is active — not implemented.
+- ZK hybrid TLS exists — not implemented.
+- Litebox is a trusted or confidential execution environment — unsupported by
+  the current implementation.
+- Litebox is equivalent to Firecracker or gVisor — unsupported by the current
+  implementation.
+- The platform provides universal automatic CRDT conflict resolution —
+  unsupported by the current implementation.
 
 ## Deliberate non-claims
 
@@ -82,24 +116,21 @@ evidence that it has negotiated or protected traffic.
 | Discovery | Additional recovery paths from bootstrap, pkarr/Seer, n0, and Mainline DHT. | Availability guarantees or membership authority. | Provider state is `configured`; resolve hits/errors show observed utility. |
 | Synchronization | Defined conflict handling in GuardianDB document and browser cr-sqlite CRR lanes. | Platform-wide CRDT behavior. | Leader-driven wholesale replacement is not CRDT. |
 
-Bluetooth, mDNS, ZK, and SLH-DSA are unsupported or future work. There is no
-defined ZK protocol or threat model. mDNS is not enabled by default; a future
-trusted-LAN capability would need explicit interface and privacy controls.
+Bluetooth, mDNS, ZK, and SLH-DSA are unsupported by the current
+implementation. There is no defined ZK protocol or threat model.
 
 ## Endpoint scope, fleet reports, and mixed fleets
 
-`GET /v1/security/posture` remains node-local and returns an `auth_mode`
-object that says whether authentication is enforced and whether platform
-operator authorization is required. In development, auth enforcement is
-intentionally disabled; describing this endpoint as simply “operator-only” is
-incorrect. The Dev Hub reads it through `/ops`, so its direct data is
-leader-observed; its fleet panel is ordinary gossiped/replicated `NodeInfo`
-evidence observed by that leader.
+`GET /v1/security/posture` remains operator-only and node-local. The Dev Hub
+reads it through `/ops`, so its direct data is node-local evidence from the
+current leader. The separately requested
+`/v1/security/posture/fleet` aggregate is ordinary gossiped `NodeInfo`
+evidence observed by that leader, not a direct measurement.
 
-Node reports contain aggregate counters and selected state only: no peer
+Posture summaries contain aggregate counters and selected state only: no peer
 addresses, identities, keys, certificates, tickets, or connection metadata.
 They are refreshed in the background, never by expensive request-path work.
-Nodes that predate the report remain `unavailable`, not healthy.
+Nodes that predate the summary remain `unavailable`, not healthy.
 
 Hybrid KEX is first in the offer. A live classical X25519 result is an
 actionable mixed-fleet fallback, not a green result. Genuine hybrid/PQ

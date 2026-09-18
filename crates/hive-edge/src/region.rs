@@ -9,66 +9,49 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Compact, non-sensitive security evidence reported by a node through the
-/// ordinary signed node gossip record. A missing value means this binary
-/// predates the report (or has not produced it), never a healthy default.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct NodeSecurityPosture {
+/// Privacy-preserving, process-local security evidence that rides with a
+/// node's self-announcement. It intentionally excludes endpoint identities,
+/// addresses, keys, certificates, handshake material, and per-peer detail.
+///
+/// `None` on [`NodeInfo::security_posture`] means the peer predates this
+/// capability or did not report it. Consumers must treat that as unknown.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SecurityPostureSummary {
+    /// Version of this compact summary, not a claim about any security
+    /// protocol. Its presence distinguishes a reporting peer from an old one.
+    pub api_version: u16,
     pub observed_at_ms: u64,
-    pub kex: SecurityKexEvidence,
-    pub trust: SecurityTrustEvidence,
-    pub discovery: SecurityDiscoveryEvidence,
-    pub execution: SecurityExecutionEvidence,
+    pub selected_backend: String,
+    pub kem: KemPostureSummary,
+    pub mldsa_gossip: MldsaGossipPostureSummary,
+    pub discovery: DiscoveryPostureSummary,
 }
 
-/// All values are aggregate counters or selected local state. No peer address,
-/// endpoint id, key, ticket, certificate, or connection metadata is gossiped.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SecurityKexEvidence {
-    pub evidence: String,
-    pub live_hybrid_sessions: u64,
-    pub live_classical_sessions: u64,
-    pub live_unknown_sessions: u64,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KemPostureSummary {
+    pub telemetry_available: bool,
+    pub status: String,
     pub hybrid_connections_total: u64,
     pub classical_connections_total: u64,
     pub unknown_connections_total: u64,
-    pub first_hybrid_observed_ms: Option<u64>,
-    pub last_observed_ms: Option<u64>,
+    pub last_verified_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SecurityTrustEvidence {
-    pub evidence: String,
-    pub configured_trusted_peers: u64,
-    pub reachable_healthy_trusted_peers: u64,
-    pub mldsa_verified_total: u64,
-    pub mldsa_verification_failures: u64,
-    pub missing_enrollment: u64,
-    pub downgrade_events: u64,
-    pub first_mldsa_observed_ms: Option<u64>,
-    pub last_mldsa_verified_ms: Option<u64>,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MldsaGossipPostureSummary {
+    pub status: String,
+    pub verified_total: u64,
+    pub verification_failures: u64,
+    pub last_verified_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SecurityDiscoveryEvidence {
-    pub evidence: String,
-    pub seed_providers: u64,
-    pub pkarr_providers: u64,
-    pub n0_registered: bool,
-    pub dht_registered: bool,
-    pub dht_error: Option<String>,
-    pub resolves: u64,
-    pub resolve_hits: u64,
-    pub resolve_misses: u64,
-    pub resolve_errors: u64,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct SecurityExecutionEvidence {
-    pub evidence: String,
-    pub selected_backend: String,
-    pub container_runtime: String,
-    pub container_hardening_evidence: String,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DiscoveryPostureSummary {
+    pub relay: String,
+    pub bootstrap: String,
+    pub pkarr: String,
+    pub n0: String,
+    pub mainline_dht: String,
 }
 
 /// A node in the cloud (this machine or a peer MacBook).
@@ -379,10 +362,11 @@ pub struct NodeInfo {
     /// PQ capable; it never implies v2 support.
     #[serde(default)]
     pub pq_gossip_protocol_version: Option<u16>,
-    /// Aggregate-only posture evidence. This deliberately rides established
-    /// NodeInfo gossip instead of introducing a second replicated state path.
+    /// Compact security posture evidence self-reported by this node. This is
+    /// aggregate-only and intentionally has no per-peer or identifying
+    /// security material. Missing means unknown/mixed-version, never healthy.
     #[serde(default)]
-    pub security_posture: Option<NodeSecurityPosture>,
+    pub security_posture: Option<SecurityPostureSummary>,
 }
 
 /// Great-circle distance (km) between two lat/lon points — for "nearest node".
@@ -701,6 +685,13 @@ impl NodeRegistry {
         self.me.write().artifact_transfer_protocol = protocol;
     }
 
+    /// Refresh this node's compact, privacy-preserving posture evidence. It
+    /// rides the existing self-announcement gossip path; peers that do not
+    /// understand or report it remain explicitly unknown to aggregators.
+    pub fn set_self_security_posture(&self, posture: SecurityPostureSummary) {
+        self.me.write().security_posture = Some(posture);
+    }
+
     /// Refresh this node's restart-audit counters (see `hive-cloud`'s
     /// `restart_audit`). Refreshed on a timer, not only at boot, because the
     /// 24h window slides: a node that OOMed 25 hours ago must stop advertising
@@ -715,12 +706,6 @@ impl NodeRegistry {
         me.started_ms = started_ms;
         me.oom_restarts_24h = oom_restarts_24h;
         me.last_oom_ms = last_oom_ms;
-    }
-
-    /// Atomically replace this node's compact security evidence. The caller
-    /// gathers only local counters/configuration; no probing occurs here.
-    pub fn set_self_security_posture(&self, posture: NodeSecurityPosture) {
-        self.me.write().security_posture = Some(posture);
     }
 
     fn peer_name_for(peers: &HashMap<String, NodeInfo>, id: &str) -> Option<String> {

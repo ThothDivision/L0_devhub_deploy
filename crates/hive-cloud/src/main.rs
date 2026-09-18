@@ -1032,6 +1032,8 @@ async fn async_main() -> anyhow::Result<()> {
             .map(|e| e.ed25519_binding_hex.clone()),
         pq_mldsa_binding: pq_enrollment.as_ref().map(|e| e.mldsa_binding_hex.clone()),
         pq_gossip_protocol_version: pq_enrollment.as_ref().map(|e| e.gossip_protocol_version),
+        // Filled immediately after CloudState is constructed, then refreshed
+        // before every existing self-announcement gossip round.
         security_posture: None,
         gpu_count: gpus.0,
         wasm_runtime: wasm_rt,
@@ -1104,6 +1106,9 @@ async fn async_main() -> anyhow::Result<()> {
         sandbox_firecracker,
         sandbox_backend,
     );
+    cloud
+        .registry
+        .set_self_security_posture(crate::admin::security_posture_summary(&cloud));
     // Fill the embedded relay's deferred AccessControl cell now that
     // CloudState finally exists (it was constructed and wired into the relay
     // config well before this point — see the relay-spawn block above).
@@ -1559,11 +1564,6 @@ async fn async_main() -> anyhow::Result<()> {
     // gossiped fencing epoch.
     let _ = cloud.control_plane_leader();
     cloud.registry.set_self_cp_epoch(cloud.cluster.epoch());
-    // Security posture is compact aggregate-only evidence and follows the
-    // established NodeInfo gossip path. This never probes or dials: it reads
-    // completed-handshake counters and selected local state on a background
-    // cadence, so HTTP reads remain cheap.
-    spawn_security_posture_refresh(cloud.clone());
 
     // Background loops: cron scheduler + peer gossip.
     spawn_cron_loop(cloud.clone());
@@ -3251,21 +3251,6 @@ fn spawn_disk_refresh(
     });
 }
 
-fn spawn_security_posture_refresh(cloud: Arc<CloudState>) {
-    crate::supervise::spawn_supervised("security-posture-refresh", move || {
-        let cloud = cloud.clone();
-        async move {
-            loop {
-                cloud
-                    .registry
-                    .set_self_security_posture(crate::admin::node_security_posture(&cloud));
-                crate::supervise::beat("security-posture-refresh");
-                tokio::time::sleep(Duration::from_secs(15)).await;
-            }
-        }
-    });
-}
-
 fn spawn_geo_refresh(registry: Arc<hive_edge::NodeRegistry>) {
     // `--region` pinned explicitly (not "auto") means the operator already
     // decided the identity; still worth refreshing lat/lon for DNS-nearest
@@ -4146,6 +4131,12 @@ fn spawn_gossip_loop(
             // all go through internally-synchronized stores, so they're race-free across
             // tasks; only the loop-local maps are merged from the returned partials. This
             // overlaps the network waits so one slow peer no longer serializes the rest.
+            // Security evidence is process-local and changes as sessions are
+            // negotiated. Publish only its compact aggregate with the existing
+            // self-announcement; no new gossip channel carries peer material.
+            cloud
+                .registry
+                .set_self_security_posture(crate::admin::security_posture_summary(&cloud));
             let me = cloud.registry.me();
             let me_bytes = serde_json::to_vec(&me).unwrap_or_default();
             let partials = futures::future::join_all(

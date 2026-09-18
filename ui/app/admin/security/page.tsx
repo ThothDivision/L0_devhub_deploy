@@ -1,7 +1,7 @@
 import { Suspense } from "react";
 import { PageSkeleton } from "@/components/page-skeleton";
 import { fetchOpsServer } from "@/lib/ops-data";
-import type { SecurityPosture } from "@/lib/api";
+import type { FleetSecurityPosture, SecurityPosture } from "@/lib/api";
 import { SecurityPostureClient } from "./security-posture-client";
 
 export default function SecurityPosturePage() {
@@ -13,6 +13,9 @@ export default function SecurityPosturePage() {
 }
 
 async function SecurityPostureData() {
-  const initial = await fetchOpsServer<SecurityPosture>("/v1/security/posture").catch(() => null);
-  return <SecurityPostureClient initial={initial} />;
+  const [initial, initialFleet] = await Promise.all([
+    fetchOpsServer<SecurityPosture>("/v1/security/posture").catch(() => null),
+    fetchOpsServer<FleetSecurityPosture>("/v1/security/posture/fleet").catch(() => null),
+  ]);
+  return <SecurityPostureClient initial={initial} initialFleet={initialFleet} />;
 }

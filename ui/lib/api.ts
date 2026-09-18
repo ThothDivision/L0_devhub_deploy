@@ -940,100 +940,21 @@ export interface PqcStatus {
 export type SecurityLayerStatus =
   | "active"
   | "partial"
+  | "unknown"
   | "classical fallback"
   | "not configured"
   | "unsupported"
   | "degraded"
   | "not applicable";
 
-export type SecurityEvidenceClass =
-  | "negotiated"
-  | "configured"
-  | "selected"
-  | "unavailable"
-  | "unsupported";
-
-export interface NodeSecurityEvidence {
-  observed_at_ms: number;
-  kex: {
-    evidence: SecurityEvidenceClass;
-    live_hybrid_sessions: number;
-    live_classical_sessions: number;
-    live_unknown_sessions: number;
-    hybrid_connections_total: number;
-    classical_connections_total: number;
-    unknown_connections_total: number;
-    first_hybrid_observed_ms?: number | null;
-    last_observed_ms?: number | null;
-  };
-  trust: {
-    evidence: SecurityEvidenceClass;
-    configured_trusted_peers: number;
-    reachable_healthy_trusted_peers: number;
-    mldsa_verified_total: number;
-    mldsa_verification_failures: number;
-    missing_enrollment: number;
-    downgrade_events: number;
-    last_mldsa_verified_ms?: number | null;
-  };
-  discovery: {
-    evidence: SecurityEvidenceClass;
-    seed_providers: number;
-    pkarr_providers: number;
-    n0_registered: boolean;
-    dht_registered: boolean;
-    dht_error?: string | null;
-    resolves: number;
-    resolve_hits: number;
-    resolve_misses: number;
-    resolve_errors: number;
-  };
-  execution: {
-    evidence: SecurityEvidenceClass;
-    selected_backend: string;
-    container_runtime: string;
-    container_hardening_evidence: string;
-  };
-}
-
 export interface SecurityPosture {
-  scope: "node" | "node-local" | "leader-observed" | "fleet-replicated";
+  scope: "node" | "leader-observed" | "fleet-replicated";
   node: string;
   observed_at_ms: number;
-  auth_mode?: {
-    authentication_enforced: boolean;
-    operator_authorization_required: boolean;
-    caller_authorized: boolean;
-    detail: string;
-  };
-  /** Local process evidence. Optional while the fleet is rolling forward. */
-  local_evidence?: NodeSecurityEvidence;
-  fleet?: {
-    scope: "fleet-replicated";
-    observer: string;
-    reported_nodes: number;
-    unavailable_nodes: number;
-    summary: {
-      evidence: SecurityEvidenceClass;
-      hybrid_connections_total: number;
-      classical_connections_total: number;
-      unknown_connections_total: number;
-      mldsa_verified_total: number;
-      discovery_resolve_hits: number;
-    };
-    nodes: Array<{
-      node: string;
-      region: string;
-      healthy_from_observer: boolean;
-      report_state: "gossiped" | "unavailable";
-      evidence?: NodeSecurityEvidence | null;
-    }>;
-  };
   layers: {
-    application: SecurityLayer & { evidence?: SecurityEvidenceClass };
-    identity: SecurityLayer & { evidence?: SecurityEvidenceClass; trusted_peer_count: number; reachable_healthy_trusted_peer_count?: number; gossip_v2_verified: number };
+    application: SecurityLayer;
+    identity: SecurityLayer & { trusted_peer_count: number; gossip_v2_verified: number };
     cryptography: SecurityLayer & {
-      evidence?: SecurityEvidenceClass;
       hybrid_group: string;
       live_hybrid_sessions: number;
       live_classical_sessions: number;
@@ -1042,11 +963,35 @@ export interface SecurityPosture {
       first_hybrid_activation_ms: number | null;
       last_verified_ms: number | null;
     };
-    transport: SecurityLayer & { evidence?: SecurityEvidenceClass };
-    discovery: SecurityLayer & { evidence?: SecurityEvidenceClass; providers: Record<string, { status: SecurityLayerStatus; evidence?: SecurityEvidenceClass; detail?: string; count?: number; error?: string | null; resolve_hits?: number; resolve_errors?: number }> };
-    synchronization: SecurityLayer & { evidence?: SecurityEvidenceClass; crdt_lanes: string; snapshot_lanes: string };
+    transport: SecurityLayer;
+    discovery: SecurityLayer & { providers: Record<string, { status: SecurityLayerStatus; detail?: string; count?: number; error?: string | null; resolve_hits?: number; resolve_errors?: number }> };
+    synchronization: SecurityLayer & { crdt_lanes: string; snapshot_lanes: string };
     workload_isolation: SecurityLayer & { selected_backend: string };
   };
+}
+
+export interface FleetSecurityPosture {
+  scope: "leader-observed-fleet";
+  reporting_node: string;
+  aggregate_observed_at_ms: number;
+  total_known_nodes: number;
+  reporting_nodes: number;
+  unknown_or_mixed_version_nodes: number;
+  unsupported_posture_api_version_nodes: number;
+  backend_distribution: Record<string, number>;
+  kem_evidence: {
+    hybrid_connections_total: number;
+    classical_connections_total: number;
+    unknown_connections_total: number;
+    nodes_with_unavailable_telemetry: number;
+  };
+  mldsa_gossip_evidence: {
+    verified_total: number;
+    verification_failures: number;
+  };
+  discovery_provider_distribution: Record<string, Record<string, number>>;
+  layers: Record<string, { status: "partial" | "unknown" }>;
+  limitations: string[];
 }
 
 export interface SecurityLayer {

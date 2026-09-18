@@ -52,6 +52,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/relay", get(relay_stats))
         .route("/v1/security/pqc", get(pqc_status))
         .route("/v1/security/posture", get(security_posture))
+        .route("/v1/security/posture/fleet", get(security_posture_fleet))
         .route("/v1/gpu-pools", get(gpu_pools))
         .route("/v1/inference", get(inference_endpoints))
         .route("/v1/dns/stats", get(dns_stats))
@@ -8518,105 +8519,28 @@ async fn pqc_status(
     })))
 }
 
-/// Build the compact local evidence that rides the established `NodeInfo`
-/// gossip record. This reads counters and selected state only; it never dials,
-/// probes, or walks a catalog on a request path.
-pub(crate) fn node_security_posture(c: &CloudState) -> hive_edge::NodeSecurityPosture {
-    let kex = hive_p2p::pqc_telemetry();
-    let signing = hive_p2p::pqc_signing_telemetry();
-    let discovery = hive_p2p::dht::stats();
-    let trusted = c
-        .trusted_peer_ids
-        .read()
-        .map(|p| p.clone())
-        .unwrap_or_default();
-    let reachable_healthy = c
-        .registry
-        .nodes()
-        .into_iter()
-        .filter(|node| {
-            node.healthy
-                && node
-                    .peer_id
-                    .as_deref()
-                    .is_some_and(|id| trusted.contains(id))
-        })
-        .count() as u64;
-    let backend = c.gw.backend_name().to_string();
-    hive_edge::NodeSecurityPosture {
-        observed_at_ms: now_ms(),
-        kex: hive_edge::SecurityKexEvidence {
-            evidence: "negotiated".into(),
-            live_hybrid_sessions: kex.live_hybrid_sessions,
-            live_classical_sessions: kex.live_classical_sessions,
-            live_unknown_sessions: kex.live_unknown_sessions,
-            hybrid_connections_total: kex.hybrid_connections_total,
-            classical_connections_total: kex.classical_connections_total,
-            unknown_connections_total: kex.unknown_connections_total,
-            first_hybrid_observed_ms: kex.activated_ms,
-            last_observed_ms: kex.last_verified_ms,
-        },
-        trust: hive_edge::SecurityTrustEvidence {
-            evidence: if trusted.is_empty() { "unavailable" } else { "configured" }.into(),
-            configured_trusted_peers: trusted.len() as u64,
-            reachable_healthy_trusted_peers: reachable_healthy,
-            mldsa_verified_total: signing.verified_total,
-            mldsa_verification_failures: signing.verification_failures,
-            missing_enrollment: signing.missing_enrollment,
-            downgrade_events: signing.downgrade_events,
-            first_mldsa_observed_ms: signing.activated_ms,
-            last_mldsa_verified_ms: signing.last_verified_ms,
-        },
-        discovery: hive_edge::SecurityDiscoveryEvidence {
-            evidence: "configured".into(),
-            seed_providers: discovery.seed_providers as u64,
-            pkarr_providers: discovery.pkarr_providers as u64,
-            n0_registered: discovery.n0_enabled,
-            dht_registered: discovery.dht_registered,
-            dht_error: discovery.dht_skip_reason,
-            resolves: discovery.resolves,
-            resolve_hits: discovery.resolve_hits,
-            resolve_misses: discovery.resolve_misses,
-            resolve_errors: discovery.resolve_errors,
-        },
-        execution: hive_edge::SecurityExecutionEvidence {
-            evidence: "selected".into(),
-            selected_backend: backend,
-            container_runtime: "unavailable".into(),
-            container_hardening_evidence: "Container runtime configuration is not measured by this node report; no container isolation claim is made.".into(),
-        },
-    }
-}
-
-/// Operator-facing node-local posture plus gossiped fleet evidence.
+/// Operator-facing security posture for this process.
+///
+/// This is deliberately a *node-local* operational view. The dashboard's
+/// `/ops` proxy intentionally reaches the control-plane leader, so this is
+/// normally evidence from that leader's process. It must not be read as a
+/// fleet-wide cryptographic attestation. Values come from completed handshakes
+/// and selected runtime backends, not from an "enabled" environment flag.
 async fn security_posture(
     State(c): State<Arc<CloudState>>,
     claims: Option<axum::Extension<crate::auth::Claims>>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_operator(claims.as_ref().map(|e| &e.0))?;
     let observed_at_ms = now_ms();
-    let local = node_security_posture(&c);
-    let kex = &local.kex;
-    let signing = &local.trust;
-    let discovery = &local.discovery;
-    let backend = local.execution.selected_backend.as_str();
-    let nodes = c.registry.nodes();
-    let reports: Vec<Value> = nodes
-        .iter()
-        .map(|node| json!({
-            "node": node.name,
-            "region": node.region,
-            "healthy_from_observer": node.healthy,
-            "evidence": node.security_posture,
-            "report_state": if node.security_posture.is_some() { "gossiped" } else { "unavailable" }
-        }))
-        .collect();
-    let known: Vec<&hive_edge::NodeSecurityPosture> = nodes
-        .iter()
-        .filter_map(|n| n.security_posture.as_ref())
-        .collect();
-    let sum =
-        |f: fn(&hive_edge::NodeSecurityPosture) -> u64| known.iter().map(|r| f(r)).sum::<u64>();
+    let kex = hive_p2p::pqc_telemetry();
+    let signing = hive_p2p::pqc_signing_telemetry();
+    let discovery = hive_p2p::dht::stats();
+    let trusted_peers = c
+        .trusted_peer_ids
+        .read()
+        .map(|peers| peers.len())
+        .unwrap_or(0);
+    let backend = c.gw.backend_name();
     let isolation = match backend {
         "firecracker" => json!({
             "status": "active",
@@ -8645,31 +8569,9 @@ async fn security_posture(
         "not configured"
     };
     Ok(Json(json!({
-        "scope": "node-local",
+        "scope": "node",
         "node": c.node_name,
         "observed_at_ms": observed_at_ms,
-        "auth_mode": {
-            "authentication_enforced": crate::auth::enforced(),
-            "operator_authorization_required": crate::auth::enforced(),
-            "caller_authorized": !crate::auth::enforced() || claims.as_ref().is_some_and(|c| c.0.platform_admin),
-            "detail": if crate::auth::enforced() { "Authentication is enforced and this endpoint requires a platform operator." } else { "Development mode: authentication enforcement is disabled, so operator authorization is not required." }
-        },
-        "local_evidence": local,
-        "fleet": {
-            "scope": "fleet-replicated",
-            "observer": c.node_name,
-            "reported_nodes": known.len(),
-            "unavailable_nodes": nodes.len().saturating_sub(known.len()),
-            "summary": {
-                "evidence": "negotiated",
-                "hybrid_connections_total": sum(|r| r.kex.hybrid_connections_total),
-                "classical_connections_total": sum(|r| r.kex.classical_connections_total),
-                "unknown_connections_total": sum(|r| r.kex.unknown_connections_total),
-                "mldsa_verified_total": sum(|r| r.trust.mldsa_verified_total),
-                "discovery_resolve_hits": sum(|r| r.discovery.resolve_hits)
-            },
-            "nodes": reports
-        },
         "layers": {
             "application": {
                 "status": "partial",
@@ -8677,42 +8579,37 @@ async fn security_posture(
                 "does_not_protect": "This aggregate cannot prove every application route or tenant workload is free of defects."
             },
             "identity": {
-                "status": if signing.configured_trusted_peers > 0 { "active" } else { "not configured" },
-                "evidence": signing.evidence,
-                "trusted_peer_count": signing.configured_trusted_peers,
-                "reachable_healthy_trusted_peer_count": signing.reachable_healthy_trusted_peers,
-                "gossip_v2_verified": signing.mldsa_verified_total,
+                "status": if trusted_peers > 0 { "active" } else { "not configured" },
+                "trusted_peer_count": trusted_peers,
+                "gossip_v2_verified": signing.verified_total,
                 "protects": "Ed25519 iroh endpoint admission and, when observed, ML-DSA-44 dual-signed gossip requests.",
                 "does_not_protect": "ML-DSA enrollment does not replace Ed25519 transport identity or authenticate raw streams, relays, tickets, or responses."
             },
             "cryptography": {
                 "status": kex_status,
-                "evidence": "negotiated",
                 "hybrid_group": "X25519MLKEM768",
                 "live_hybrid_sessions": kex.live_hybrid_sessions,
                 "live_classical_sessions": kex.live_classical_sessions,
                 "live_unknown_sessions": kex.live_unknown_sessions,
                 "total_observed_connections": kex.hybrid_connections_total + kex.classical_connections_total + kex.unknown_connections_total,
-                "first_hybrid_activation_ms": kex.first_hybrid_observed_ms,
-                "last_verified_ms": kex.last_observed_ms,
+                "first_hybrid_activation_ms": kex.activated_ms,
+                "last_verified_ms": kex.last_verified_ms,
                 "protects": "A negotiated hybrid KEM protects the confidentiality of that mesh session.",
                 "does_not_protect": "Iroh transport identity remains Ed25519; ML-KEM does not make identity post-quantum."
             },
             "transport": {
                 "status": if c.mesh.read().is_some() { "active" } else { "not configured" },
-                "evidence": if c.mesh.read().is_some() { "selected" } else { "unavailable" },
                 "protects": "Iroh QUIC encrypts authenticated mesh connections.",
                 "does_not_protect": "Connection encryption does not turn every application-level authorization decision into a transport property."
             },
             "discovery": {
-                "status": if discovery.dht_registered || discovery.seed_providers > 0 || discovery.pkarr_providers > 0 || discovery.n0_registered { "active" } else { "degraded" },
-                "evidence": discovery.evidence,
+                "status": if discovery.dht_registered || discovery.seed_providers > 0 || discovery.pkarr_providers > 0 || discovery.n0_enabled { "active" } else { "degraded" },
                 "providers": {
                     "relay": { "status": "active", "detail": "Relay fallback is part of the iroh transport path; availability still depends on reachable relay infrastructure." },
-                    "pkarr_seer": { "status": if discovery.pkarr_providers > 0 { "active" } else { "not configured" }, "evidence": "configured", "count": discovery.pkarr_providers },
-                    "n0": { "status": if discovery.n0_registered { "active" } else { "not configured" }, "evidence": "configured" },
-                    "mainline_dht": { "status": if discovery.dht_registered { "active" } else { "not configured" }, "evidence": if discovery.dht_registered { "configured" } else { "unavailable" }, "error": discovery.dht_error, "resolve_hits": discovery.resolve_hits, "resolve_errors": discovery.resolve_errors },
-                    "bootstrap_peers": { "status": if discovery.seed_providers > 0 { "active" } else { "not configured" }, "evidence": "configured", "count": discovery.seed_providers },
+                    "pkarr_seer": { "status": if discovery.pkarr_providers > 0 { "active" } else { "not configured" }, "count": discovery.pkarr_providers },
+                    "n0": { "status": if discovery.n0_enabled { "active" } else { "not configured" } },
+                    "mainline_dht": { "status": if discovery.dht_registered { "active" } else { "not configured" }, "error": discovery.dht_skip_reason, "resolve_hits": discovery.resolve_hits, "resolve_errors": discovery.resolve_errors },
+                    "bootstrap_peers": { "status": if discovery.seed_providers > 0 { "active" } else { "not configured" }, "count": discovery.seed_providers },
                     "bluetooth": { "status": "unsupported", "detail": "Not implemented: no supported operational use case or threat model." },
                     "mdns": { "status": "unsupported", "detail": "Not implemented: no supported operational use case or threat model." }
                 },
@@ -8721,7 +8618,6 @@ async fn security_posture(
             },
             "synchronization": {
                 "status": "partial",
-                "evidence": "configured",
                 "crdt_lanes": "GuardianDB document lanes and browser cr-sqlite CRR are conflict-aware lanes.",
                 "snapshot_lanes": "Several platform stores use leader-driven wholesale replacement.",
                 "protects": "The listed CRDT lanes resolve their own defined conflicts.",
@@ -8729,6 +8625,182 @@ async fn security_posture(
             },
             "workload_isolation": isolation
         }
+    })))
+}
+
+/// Build the compact summary that a node includes in its existing `NodeInfo`
+/// self-announcement. This is intentionally aggregate-only: identity and
+/// addressing data already present elsewhere in a node record is never copied
+/// into this posture field.
+pub(crate) fn security_posture_summary(c: &CloudState) -> hive_edge::SecurityPostureSummary {
+    let kex = hive_p2p::pqc_telemetry();
+    let signing = hive_p2p::pqc_signing_telemetry();
+    let discovery = hive_p2p::dht::stats();
+    let kem_status = if !kex.telemetry_available {
+        "unknown"
+    } else if kex.live_hybrid_sessions > 0 {
+        "hybrid"
+    } else if kex.live_classical_sessions > 0 {
+        "classical"
+    } else {
+        "unknown"
+    };
+    let mldsa_status = if signing.verified_total > 0 {
+        "verified"
+    } else {
+        "unknown"
+    };
+    let configured = |enabled: bool| {
+        if enabled {
+            "available".to_string()
+        } else {
+            "not_configured".to_string()
+        }
+    };
+    hive_edge::SecurityPostureSummary {
+        api_version: 1,
+        observed_at_ms: now_ms(),
+        selected_backend: c.gw.backend_name().to_string(),
+        kem: hive_edge::KemPostureSummary {
+            telemetry_available: kex.telemetry_available,
+            status: kem_status.to_string(),
+            hybrid_connections_total: kex.hybrid_connections_total,
+            classical_connections_total: kex.classical_connections_total,
+            unknown_connections_total: kex.unknown_connections_total,
+            last_verified_ms: kex.last_verified_ms,
+        },
+        mldsa_gossip: hive_edge::MldsaGossipPostureSummary {
+            status: mldsa_status.to_string(),
+            verified_total: signing.verified_total,
+            verification_failures: signing.verification_failures,
+            last_verified_ms: signing.last_verified_ms,
+        },
+        discovery: hive_edge::DiscoveryPostureSummary {
+            relay: configured(c.mesh.read().is_some()),
+            bootstrap: configured(discovery.seed_providers > 0),
+            pkarr: configured(discovery.pkarr_providers > 0),
+            n0: configured(discovery.n0_enabled),
+            mainline_dht: configured(discovery.dht_registered),
+        },
+    }
+}
+
+/// Operator-only leader-observed aggregation of compact peer posture reports.
+///
+/// This reads this leader's local registry, which is gossip state rather than
+/// a cryptographic fleet measurement. A missing summary is deliberately
+/// counted as unknown, including for mixed-version peers.
+async fn security_posture_fleet(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    use std::collections::BTreeMap;
+
+    let nodes = c.registry.nodes();
+    let total_known_nodes = nodes.len();
+    let mut reporting_nodes = 0_u64;
+    let mut unsupported_posture_api_version_nodes = 0_u64;
+    let mut backend_distribution: BTreeMap<String, u64> = BTreeMap::new();
+    let mut kem_hybrid = 0_u64;
+    let mut kem_classical = 0_u64;
+    let mut kem_unknown_sessions = 0_u64;
+    let mut kem_telemetry_unavailable_nodes = 0_u64;
+    let mut mldsa_verified = 0_u64;
+    let mut mldsa_verification_failures = 0_u64;
+    let mut discovery: BTreeMap<&str, BTreeMap<String, u64>> =
+        ["relay", "bootstrap", "pkarr", "n0", "mainline_dht"]
+            .into_iter()
+            .map(|provider| (provider, BTreeMap::new()))
+            .collect();
+
+    for node in &nodes {
+        let Some(posture) = &node.security_posture else {
+            continue;
+        };
+        // A peer may have a future summary shape we do not understand. Preserve
+        // its distinguishability, but do not aggregate evidence with unknown
+        // semantics as if it were compatible.
+        if posture.api_version != 1 {
+            unsupported_posture_api_version_nodes += 1;
+            continue;
+        }
+        reporting_nodes += 1;
+        *backend_distribution
+            .entry(posture.selected_backend.clone())
+            .or_default() += 1;
+        kem_hybrid += posture.kem.hybrid_connections_total;
+        kem_classical += posture.kem.classical_connections_total;
+        kem_unknown_sessions += posture.kem.unknown_connections_total;
+        if !posture.kem.telemetry_available {
+            kem_telemetry_unavailable_nodes += 1;
+        }
+        mldsa_verified += posture.mldsa_gossip.verified_total;
+        mldsa_verification_failures += posture.mldsa_gossip.verification_failures;
+        for (name, status) in [
+            ("relay", &posture.discovery.relay),
+            ("bootstrap", &posture.discovery.bootstrap),
+            ("pkarr", &posture.discovery.pkarr),
+            ("n0", &posture.discovery.n0),
+            ("mainline_dht", &posture.discovery.mainline_dht),
+        ] {
+            *discovery
+                .get_mut(name)
+                .expect("fixed discovery provider set")
+                .entry(status.clone())
+                .or_default() += 1;
+        }
+    }
+
+    let unknown_nodes = total_known_nodes.saturating_sub(reporting_nodes as usize) as u64;
+    let fleet_status = if reporting_nodes == 0 {
+        "unknown"
+    } else {
+        // Even complete reporting only establishes the narrow evidence below;
+        // no layer becomes a fleet-wide healthy/security assertion.
+        "partial"
+    };
+    let kem_status = if reporting_nodes == 0
+        || (kem_hybrid == 0 && kem_classical == 0 && kem_unknown_sessions == 0)
+    {
+        "unknown"
+    } else {
+        fleet_status
+    };
+    Ok(Json(json!({
+        "scope": "leader-observed-fleet",
+        "reporting_node": c.node_name,
+        "aggregate_observed_at_ms": now_ms(),
+        "total_known_nodes": total_known_nodes,
+        "reporting_nodes": reporting_nodes,
+        "unknown_or_mixed_version_nodes": unknown_nodes,
+        "unsupported_posture_api_version_nodes": unsupported_posture_api_version_nodes,
+        "backend_distribution": backend_distribution,
+        "kem_evidence": {
+            "hybrid_connections_total": kem_hybrid,
+            "classical_connections_total": kem_classical,
+            "unknown_connections_total": kem_unknown_sessions,
+            "nodes_with_unavailable_telemetry": kem_telemetry_unavailable_nodes,
+        },
+        "mldsa_gossip_evidence": {
+            "verified_total": mldsa_verified,
+            "verification_failures": mldsa_verification_failures,
+        },
+        "discovery_provider_distribution": discovery,
+        "layers": {
+            "application": { "status": fleet_status },
+            "identity": { "status": fleet_status },
+            "cryptography": { "status": kem_status },
+            "transport": { "status": fleet_status },
+            "discovery": { "status": fleet_status },
+            "synchronization": { "status": fleet_status },
+            "workload_isolation": { "status": fleet_status },
+        },
+        "limitations": [
+            "Leader-observed aggregate of self-reported gossip summaries; it is not a direct fleet-wide cryptographic measurement.",
+            "Missing posture is unknown/mixed-version evidence, never evidence of support, activity, classical fallback, or hybrid operation.",
+            "The aggregate contains no endpoint or peer identifiers, addresses, certificates, keys, handshake payloads, or per-peer security material."
+        ]
     })))
 }
 
