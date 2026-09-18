@@ -758,7 +758,9 @@ impl DatabaseStore {
     /// Rules, in order:
     ///   * tombstones union, keeping the LATEST deletion time for an id;
     ///   * records union by id, the remote copy winning a collision (the leader is
-    ///     authoritative for field updates such as status transitions);
+    ///     authoritative for field updates such as status transitions) — except
+    ///     that a `simulated` copy never overwrites a local `live` one of the same
+    ///     record (see the guard below);
     ///   * any record whose id carries a tombstone at-or-after its `created_ms` is
     ///     dropped — so a delete propagates, while a database RE-created under a
     ///     fresh id (or later timestamp) survives;
@@ -804,6 +806,21 @@ impl DatabaseStore {
         for r in remote_dbs {
             match dbs.iter_mut().find(|d| d.id == r.id) {
                 Some(local) => {
+                    // A live backing is never demoted by a simulated copy of the
+                    // same record: `spawn_db_reconcile` promotes a stuck record
+                    // only on its host node, and nothing carries that promotion
+                    // back to the leader, so the leader's stale `simulated` copy
+                    // arrived on every sync, overwrote the promotion, and the
+                    // next reconcile tick treated the running database as an
+                    // orphan (`podman rm -f -v`) and provisioned an empty one
+                    // over it — every ~70 s (surveybot-db on fc-virginia-3: 283
+                    // container recreations in 6 h).
+                    if local.mode == "live"
+                        && r.mode == "simulated"
+                        && local.created_ms == r.created_ms
+                    {
+                        continue;
+                    }
                     let mut remote = r;
                     merge_studio_replay_state(local, &mut remote);
                     *local = remote;

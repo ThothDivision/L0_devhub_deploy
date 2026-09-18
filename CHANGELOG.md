@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-09-18 — a managed Postgres was wiped and re-created every ~70 s because the leader's stale `simulated` copy overwrote the host's promotion
+
+`surveybot-db` (project `survey-bot-real-2`, host fc-virginia-3, created
+2026-09-09) sat at `provisioning`/`simulated` on the leader and every node.
+`spawn_db_reconcile` retries such a record ON ITS HOST: it scrubs the same-name
+container as an orphan (`podman rm -f -v`), provisions a fresh one, and promotes
+the LOCAL record to `ready`/`live`. Nothing carries that promotion back to the
+leader, and `DatabaseStore::merge_synced` lets the remote copy win every
+collision, so the next `store=databases` sync (≤60 s) put `simulated` back and
+the next reconcile tick destroyed the running database and started an empty one
+over it: 283 container create/died/remove cycles in 6 h on fc-virginia-3. Each
+cycle is also a host network-change event (see the iroh rebind finding in the
+PRD), and the leader's `connection` map stayed empty, so no `DATABASE_URL` could
+ever have been injected for it.
+
+Fixed the loop: `merge_synced` never lets a `simulated` copy overwrite a local
+`live` record with the same `created_ms` (the reconcile loop already assumed "no
+code path demotes live→simulated"; this enforces it). Verified on fc-virginia-3:
+after one last re-provision at restart the container stayed `Up 8 minutes` and
+the record stayed `ready live` with 14 connection keys through repeated syncs;
+before, a new container appeared every ~70 s (9 in 10 min). NOT fixed: the host
+still does not report its promotion to the leader, so the leader, the UI and
+env injection continue to see `provisioning` for this database.
+
 ## 2026-09-18 — GuardianDB could latch itself wedged when a caller awaiting a slow init was cancelled
 
 Landed in `6ea49d7` alongside the ledger fix below (the commit tooling ignored
