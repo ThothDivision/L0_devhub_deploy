@@ -937,6 +937,44 @@ export interface PqcStatus {
   limitations: string[];
 }
 
+export type SecurityLayerStatus =
+  | "active"
+  | "partial"
+  | "classical fallback"
+  | "not configured"
+  | "unsupported"
+  | "degraded"
+  | "not applicable";
+
+export interface SecurityPosture {
+  scope: "node" | "leader-observed" | "fleet-replicated";
+  node: string;
+  observed_at_ms: number;
+  layers: {
+    application: SecurityLayer;
+    identity: SecurityLayer & { trusted_peer_count: number; gossip_v2_verified: number };
+    cryptography: SecurityLayer & {
+      hybrid_group: string;
+      live_hybrid_sessions: number;
+      live_classical_sessions: number;
+      live_unknown_sessions: number;
+      total_observed_connections: number;
+      first_hybrid_activation_ms: number | null;
+      last_verified_ms: number | null;
+    };
+    transport: SecurityLayer;
+    discovery: SecurityLayer & { providers: Record<string, { status: SecurityLayerStatus; detail?: string; count?: number; error?: string | null; resolve_hits?: number; resolve_errors?: number }> };
+    synchronization: SecurityLayer & { crdt_lanes: string; snapshot_lanes: string };
+    workload_isolation: SecurityLayer & { selected_backend: string };
+  };
+}
+
+export interface SecurityLayer {
+  status: SecurityLayerStatus;
+  protects: string;
+  does_not_protect: string;
+}
+
 export interface Event {
   ts_ms: number;
   region: string;

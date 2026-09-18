@@ -51,6 +51,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/tunnels", get(tunnels))
         .route("/v1/relay", get(relay_stats))
         .route("/v1/security/pqc", get(pqc_status))
+        .route("/v1/security/posture", get(security_posture))
         .route("/v1/gpu-pools", get(gpu_pools))
         .route("/v1/inference", get(inference_endpoints))
         .route("/v1/dns/stats", get(dns_stats))
@@ -8514,6 +8515,115 @@ async fn pqc_status(
             "This status applies only to the listed operations, not all traffic, stored data, identities, or certificates.",
             "Iroh transport identity and peer admission remain Ed25519; ML-KEM protects key exchange confidentiality, not transport identity."
         ]
+    })))
+}
+
+/// Operator-facing security posture for this process.
+///
+/// This is deliberately a *node-local* operational view. The dashboard's
+/// `/ops` proxy intentionally reaches the control-plane leader, so its scope
+/// says `leader-observed`; it must not be read as a fleet-wide cryptographic
+/// attestation. Values come from completed handshakes and selected runtime
+/// backends, not from an "enabled" environment flag.
+async fn security_posture(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    let observed_at_ms = now_ms();
+    let kex = hive_p2p::pqc_telemetry();
+    let signing = hive_p2p::pqc_signing_telemetry();
+    let discovery = hive_p2p::dht::stats();
+    let trusted_peers = c
+        .trusted_peer_ids
+        .read()
+        .map(|peers| peers.len())
+        .unwrap_or(0);
+    let backend = c.gw.backend_name();
+    let isolation = match backend {
+        "firecracker" => json!({
+            "status": "active",
+            "selected_backend": "firecracker",
+            "protects": "Function workloads run in KVM-backed Firecracker microVMs.",
+            "does_not_protect": "Host-container workloads do not run in Firecracker microVMs."
+        }),
+        "litebox" => json!({
+            "status": "partial",
+            "selected_backend": "litebox",
+            "protects": "Function workloads receive Litebox syscall mediation and a seccomp-bpf backstop.",
+            "does_not_protect": "Litebox is not confidential computing, hardware isolation, Firecracker, or gVisor."
+        }),
+        _ => json!({
+            "status": "not configured",
+            "selected_backend": backend,
+            "protects": "No production microVM isolation claim is available from this node's selected backend.",
+            "does_not_protect": "Mock workloads are host processes; host containers are separately isolated, if at all, by their runtime configuration."
+        }),
+    };
+    let kex_status = if kex.live_hybrid_sessions > 0 {
+        "active"
+    } else if kex.live_classical_sessions > 0 {
+        "classical fallback"
+    } else {
+        "not configured"
+    };
+    Ok(Json(json!({
+        "scope": "node",
+        "node": c.node_name,
+        "observed_at_ms": observed_at_ms,
+        "layers": {
+            "application": {
+                "status": "partial",
+                "protects": "Tenant-scoped application APIs and authenticated operator controls.",
+                "does_not_protect": "This aggregate cannot prove every application route or tenant workload is free of defects."
+            },
+            "identity": {
+                "status": if trusted_peers > 0 { "active" } else { "not configured" },
+                "trusted_peer_count": trusted_peers,
+                "gossip_v2_verified": signing.verified_total,
+                "protects": "Ed25519 iroh endpoint admission and, when observed, ML-DSA-44 dual-signed gossip requests.",
+                "does_not_protect": "ML-DSA enrollment does not replace Ed25519 transport identity or authenticate raw streams, relays, tickets, or responses."
+            },
+            "cryptography": {
+                "status": kex_status,
+                "hybrid_group": "X25519MLKEM768",
+                "live_hybrid_sessions": kex.live_hybrid_sessions,
+                "live_classical_sessions": kex.live_classical_sessions,
+                "live_unknown_sessions": kex.live_unknown_sessions,
+                "total_observed_connections": kex.hybrid_connections_total + kex.classical_connections_total + kex.unknown_connections_total,
+                "first_hybrid_activation_ms": kex.activated_ms,
+                "last_verified_ms": kex.last_verified_ms,
+                "protects": "A negotiated hybrid KEM protects the confidentiality of that mesh session.",
+                "does_not_protect": "Iroh transport identity remains Ed25519; ML-KEM does not make identity post-quantum."
+            },
+            "transport": {
+                "status": if c.mesh.read().is_some() { "active" } else { "not configured" },
+                "protects": "Iroh QUIC encrypts authenticated mesh connections.",
+                "does_not_protect": "Connection encryption does not turn every application-level authorization decision into a transport property."
+            },
+            "discovery": {
+                "status": if discovery.dht_registered || discovery.seed_providers > 0 || discovery.pkarr_providers > 0 || discovery.n0_enabled { "active" } else { "degraded" },
+                "providers": {
+                    "relay": { "status": "active", "detail": "Relay fallback is part of the iroh transport path; availability still depends on reachable relay infrastructure." },
+                    "pkarr_seer": { "status": if discovery.pkarr_providers > 0 { "active" } else { "not configured" }, "count": discovery.pkarr_providers },
+                    "n0": { "status": if discovery.n0_enabled { "active" } else { "not configured" } },
+                    "mainline_dht": { "status": if discovery.dht_registered { "active" } else { "not configured" }, "error": discovery.dht_skip_reason, "resolve_hits": discovery.resolve_hits, "resolve_errors": discovery.resolve_errors },
+                    "bootstrap_peers": { "status": if discovery.seed_providers > 0 { "active" } else { "not configured" }, "count": discovery.seed_providers },
+                    "bluetooth": { "status": "unsupported", "detail": "Not implemented: no supported operational use case or threat model." },
+                    "mdns": { "status": "unsupported", "detail": "Not implemented: no supported operational use case or threat model." }
+                },
+                "protects": "Multiple additive address sources improve recovery options.",
+                "does_not_protect": "Discovery and relays are resilience mechanisms, not cryptographic availability guarantees."
+            },
+            "synchronization": {
+                "status": "partial",
+                "crdt_lanes": "GuardianDB document lanes and browser cr-sqlite CRR are conflict-aware lanes.",
+                "snapshot_lanes": "Several platform stores use leader-driven wholesale replacement.",
+                "protects": "The listed CRDT lanes resolve their own defined conflicts.",
+                "does_not_protect": "The platform as a whole is not automatically conflict-resolving CRDT replication."
+            },
+            "workload_isolation": isolation
+        }
     })))
 }
 

@@ -9,6 +9,7 @@ import {
   Users,
   Database,
   Server,
+  ShieldCheck,
   ScrollText,
   ArrowLeft,
   Table2,
@@ -25,6 +26,7 @@ const nav = [
   { href: "/admin/databases", label: "Databases", icon: Database },
   { href: "/admin/data", label: "Data Browser", icon: Table2 },
   { href: "/admin/nodes", label: "Infrastructure", icon: Server },
+  { href: "/admin/security", label: "Security posture", icon: ShieldCheck },
   { href: "/admin/audit", label: "Audit log", icon: ScrollText },
 ];
 
