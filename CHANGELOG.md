@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-09-18 — GuardianDB could latch itself wedged when a caller awaiting a slow init was cancelled
+
+Landed in `6ea49d7` alongside the ledger fix below (the commit tooling ignored
+the path restriction, so it carries both; the binary running on fc-phoenix was
+built before this change and contains only the ledger fix).
+
+`guardian::handle()` parks a slow init's `JoinHandle` in `INIT_INFLIGHT` so the
+next caller re-awaits the same attempt. The waiter `take()`s that handle and
+re-parked it only on the timeout branch, so a caller dropped mid-await —
+cancellation, not timeout — lost it: the slot read empty while the init kept
+running and holding its redb lock, and the next caller started a second init,
+hit `Database already open` on attempt 2 and latched the node wedged ("restart
+hive-cloud to recover"). Witnessed on shadw3: the first init had been
+re-awaited cleanly every 30 s for 25 minutes, then a second `opening iroh
+client` began 11 s after one more caller took the handle and failed 2 ms later.
+
+`InflightInit` now owns the handle while a caller awaits it and re-parks it on
+drop unless the attempt finished, so timeout and cancellation are one path.
+Compiled, not yet witnessed live on a node; why the first init sits at
+`opening 'hive-state' KV store` for 25+ minutes on shadw3's 25 GB store is a
+separate, open question.
+
 ## 2026-09-18 — fc-phoenix crash-looped 21,679 times on an intact deployment ledger
 
 `DeploymentLedger::open` verified its checksum by re-serializing the decoded
