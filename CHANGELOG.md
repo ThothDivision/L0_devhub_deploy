@@ -1,5 +1,25 @@
 # Changelog
 
+## 2026-09-18 — fc-phoenix crash-looped 21,679 times on an intact deployment ledger
+
+`DeploymentLedger::open` verified its checksum by re-serializing the decoded
+`LedgerPayload`. The integrity-chain work added `DeploymentAcceptance.
+integrity_chain` (`#[serde(default)]`, always serialized), so the 19 accepted
+entries in fc-phoenix's ledger — written by the previous binary, without the
+field — re-serialized with `"integrity_chain":[]` and hashed differently from
+what had been stored. The roll on 2026-09-18 03:03 UTC reached phoenix and the
+node panicked at `state.rs:623` on every boot from then on, restarting every
+~3 s and serving nothing. The file itself was never damaged: its stored
+checksum equals SHA-256 over the raw payload bytes exactly.
+
+Fixed: the payload is now read as an undecoded `RawValue` and the checksum is
+verified over those stored bytes; the decoded struct is only used after the
+check passes, and the file is rewritten in the new shape on the first boot that
+loads it. Verified by booting the fixed build against a copy of phoenix's real
+ledger: it loads, all 19 entries survive with an empty `integrity_chain`, and
+the rewritten file's checksum verifies over its raw bytes. A genuine mismatch
+still fails closed.
+
 ## 2026-09-03 — npm's `$PATH` entry points were never staged into the guest; fixed, but litebox has no guest-side shebang execution at all
 
 Follow-up to the same-day GNU-tar-header fix below: with `node -v` working

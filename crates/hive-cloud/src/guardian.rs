@@ -171,6 +171,26 @@ fn inflight_slot(
     INIT_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Holds the in-flight init's `JoinHandle` while one caller awaits it and puts
+/// it back in `INIT_INFLIGHT` on drop unless the attempt has finished (`.0` set
+/// to `None`). Parking only on the timeout branch was not enough: a caller taken
+/// out by cancellation — a client that hung up, a caller-side `timeout`, an
+/// aborted task — dropped the handle it had `take()`n, so the slot read empty
+/// while the init kept running and holding its redb lock. The next caller then
+/// spawned a second init, hit "Database already open" on attempt 2 and latched
+/// the node wedged (witnessed on shadw3, 2026-09-18: the in-flight init had been
+/// re-awaited cleanly every 30 s for 25 minutes, then a second one started 10 s
+/// after one caller took the handle).
+struct InflightInit(Option<tokio::task::JoinHandle<anyhow::Result<Handle>>>);
+
+impl Drop for InflightInit {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            *inflight_slot() = Some(task);
+        }
+    }
+}
+
 /// Lazily open (once) the GuardianDB KV store, retrying on a previous failure
 /// — but throttled (see `INIT_RETRY_BACKOFF`) and never after a wedge latch.
 async fn handle() -> anyhow::Result<&'static Handle> {
@@ -214,7 +234,7 @@ async fn handle() -> anyhow::Result<&'static Handle> {
             // Only a genuinely NEW attempt counts toward `INIT_ATTEMPTS`, which
             // keeps the "Database already open" discrimination below honest:
             // attempts > 1 now means we really did start a second full init.
-            let mut task = match inflight_slot().take() {
+            let mut task = InflightInit(Some(match inflight_slot().take() {
                 Some(existing) => {
                     tracing::info!("guardian init: re-awaiting the init already in flight (not starting a second one)");
                     existing
@@ -223,19 +243,26 @@ async fn handle() -> anyhow::Result<&'static Handle> {
                     INIT_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
                     tokio::spawn(init_handle())
                 }
-            };
-            // The timeout bounds only how long we WAIT. On expiry the task is
-            // parked, still running, so nothing it built is stranded.
-            match tokio::time::timeout(guardian_init_timeout(), &mut task).await {
-                Ok(Ok(result)) => result,
-                Err(_) => {
-                    *inflight_slot() = Some(task);
-                    Err(anyhow::anyhow!(
-                        "guardian init timed out after {:?} (iroh endpoint bind / keystore / docs bring-up never completed); the attempt is still running and will be re-awaited, not restarted",
-                        guardian_init_timeout()
-                    ))
+            }));
+            // The timeout bounds only how long we WAIT. On expiry — or when THIS
+            // caller is dropped mid-await — `InflightInit` parks the task,
+            // still running, so nothing it built is stranded.
+            let outcome = tokio::time::timeout(
+                guardian_init_timeout(),
+                task.0.as_mut().expect("in-flight init handle is held until completion"),
+            )
+            .await;
+            match outcome {
+                Ok(Ok(result)) => {
+                    task.0 = None;
+                    result
                 }
+                Err(_) => Err(anyhow::anyhow!(
+                    "guardian init timed out after {:?} (iroh endpoint bind / keystore / docs bring-up never completed); the attempt is still running and will be re-awaited, not restarted",
+                    guardian_init_timeout()
+                )),
                 Ok(Err(join_err)) => {
+                    task.0 = None;
                     // The task panicked (or was aborted, which we never do).
                     // `JoinError` carries the payload, so the panic no longer has
                     // to be caught with `catch_unwind` around the future itself.
