@@ -24,7 +24,9 @@ pub use concurrency::{ConcurrencyLimiter, ConcurrencyStats, Plan};
 pub use cron::{CronJob, CronScheduler};
 pub use ratelimit::{RateLimitStats, RateLimiter};
 pub use region::{
-    continent_of, haversine_km, select_relay_hint, NodeInfo, NodeRegistry, CENTRAL_RELAY_URL,
+    continent_of, haversine_km, select_relay_hint, NodeInfo, NodeRegistry, NodeSecurityPosture,
+    SecurityDiscoveryEvidence, SecurityExecutionEvidence, SecurityKexEvidence,
+    SecurityTrustEvidence, CENTRAL_RELAY_URL,
 };
 pub use routing::{Redirect, Rewrite, RouteOutcome, Router};
 pub use runtime_cache::RuntimeCache;

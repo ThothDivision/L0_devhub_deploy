@@ -297,6 +297,7 @@ mod tests {
             pq_ed25519_binding: None,
             pq_mldsa_binding: None,
             pq_gossip_protocol_version: None,
+            security_posture: None,
         }
     }
 

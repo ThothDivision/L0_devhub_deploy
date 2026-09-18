@@ -1032,6 +1032,7 @@ async fn async_main() -> anyhow::Result<()> {
             .map(|e| e.ed25519_binding_hex.clone()),
         pq_mldsa_binding: pq_enrollment.as_ref().map(|e| e.mldsa_binding_hex.clone()),
         pq_gossip_protocol_version: pq_enrollment.as_ref().map(|e| e.gossip_protocol_version),
+        security_posture: None,
         gpu_count: gpus.0,
         wasm_runtime: wasm_rt,
         bun_runtime: bun_rt,
@@ -1558,6 +1559,11 @@ async fn async_main() -> anyhow::Result<()> {
     // gossiped fencing epoch.
     let _ = cloud.control_plane_leader();
     cloud.registry.set_self_cp_epoch(cloud.cluster.epoch());
+    // Security posture is compact aggregate-only evidence and follows the
+    // established NodeInfo gossip path. This never probes or dials: it reads
+    // completed-handshake counters and selected local state on a background
+    // cadence, so HTTP reads remain cheap.
+    spawn_security_posture_refresh(cloud.clone());
 
     // Background loops: cron scheduler + peer gossip.
     spawn_cron_loop(cloud.clone());
@@ -3240,6 +3246,21 @@ fn spawn_disk_refresh(
                     crate::restart_audit::oom_restarts_24h(),
                     crate::restart_audit::last_oom_ms(),
                 );
+            }
+        }
+    });
+}
+
+fn spawn_security_posture_refresh(cloud: Arc<CloudState>) {
+    crate::supervise::spawn_supervised("security-posture-refresh", move || {
+        let cloud = cloud.clone();
+        async move {
+            loop {
+                cloud
+                    .registry
+                    .set_self_security_posture(crate::admin::node_security_posture(&cloud));
+                crate::supervise::beat("security-posture-refresh");
+                tokio::time::sleep(Duration::from_secs(15)).await;
             }
         }
     });
