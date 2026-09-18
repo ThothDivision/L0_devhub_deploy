@@ -86,21 +86,13 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-/* Dev Hub's persistent canvas: crop the illustration past every viewport edge
-   so the low-detail margins in the source never show through. */
+/* Dev Hub's persistent canvas keeps the supplied illustration intact. */
 body {
-  background-image:
-    linear-gradient(hsl(var(--background) / 0.48), hsl(var(--background) / 0.48)),
-    url("/dev-hub-background.png");
-  background-size: cover, max(1500px, 155vw) auto;
-  background-position: center, center 42%;
-  background-repeat: no-repeat, no-repeat;
+  background-image: url("/dev-hub-background.png");
+  background-size: max(1500px, 155vw) auto;
+  background-position: center 42%;
+  background-repeat: no-repeat;
   background-attachment: fixed;
-}
-.dark body {
-  background-image:
-    linear-gradient(hsl(var(--background) / 0.7), hsl(var(--background) / 0.7)),
-    url("/dev-hub-background.png");
 }
 
 /* Keep the application canvas transparent so the shared skin reaches all pages. */
