@@ -19,9 +19,11 @@ global “secure” assertion.
 
 ## What operators can observe
 
-`GET /v1/security/posture` is operator-only and node-local. Through the Dev
-Hub `/ops` proxy, its direct response describes the control-plane leader only.
-Missing support on old nodes is unavailable/unknown, never a healthy default.
+`GET /v1/security/posture` is operator-only. Its direct layers are node-local;
+through the Dev Hub `/ops` proxy they describe the control-plane leader. The
+same response includes `leader_observed_fleet`, an aggregate-only summary of
+compact posture gossip visible to that leader. Missing support on old nodes is
+unavailable/unknown, never a healthy default.
 
 `GET /v1/security/posture/fleet` is also operator-only. It is a
 **leader-observed aggregate** of compact, self-reported gossip summaries, not
@@ -42,10 +44,11 @@ For mesh KEM, the source of truth is completed rustls handshake metadata:
 An environment flag or provider selection alone never counts as evidence that
 PQ key exchange protected a connection. The endpoint explicitly uses AWS-LC
 and offers hybrid first, while retaining classical groups for mixed fleets.
-Public HTTPS, database TLS, relay-client TLS, and other HTTP service TLS do
-not inherit that iroh endpoint provider policy; they must not be represented
-as universally ML-KEM protected without independent negotiated-session
-telemetry and a compatible provider migration.
+Public HTTPS/raw HTTPS, database TLS, relay TLS, and internal HTTPS do not
+inherit the iroh endpoint provider policy. The posture names them separately
+as `configured_only_unsupported` or `unknown_unobservable` until that exact
+surface uses an ML-KEM-capable provider and records completed-handshake
+metadata. They must not be described as PQ-protected before then.
 
 ## Diagram and architecture mapping
 
@@ -135,7 +138,45 @@ Nodes that predate the summary remain `unavailable`, not healthy.
 Hybrid KEX is first in the offer. A live classical X25519 result is an
 actionable mixed-fleet fallback, not a green result. Genuine hybrid/PQ
 transport identity requires upstream iroh identity support; application-message
-signatures cannot fake it. The existing enrollment and dual-signature flow can
-require signatures for sensitive compatible gossip operations only after rollout
-compatibility and enrollment are confirmed; it must not make mixed-version
-fleets unavailable prematurely.
+signatures cannot fake it.
+
+## Privileged mesh envelope rollout
+
+The existing enrollment is reused for a version-3 privileged mesh envelope.
+Its dual signatures are Ed25519 plus ML-DSA-44 and are domain-separated from
+gossip v2. It signs the protocol version and algorithm suite, transport-bound
+sender, enrolled-key reference, timestamp, nonce, method/path, and SHA-256
+digest of the authenticated body. The receiver verifies that the enrolled key
+is already cross-bound to the authenticated iroh identity, rejects unknown
+mandatory versions, key/signer substitution, digest mismatch, stale messages,
+and seen nonces. This is defense in depth for application mesh requests; it
+does not replace transport admission or route-level authorization.
+
+The generic mesh request channel carries membership/enrollment, control-plane
+leader/epoch operations, deployment fanout, database-owner/Hrana proxy
+requests, and browser-admission operations. Consequently v3 protects those
+requests without changing leader routing, database owner routing, or database
+token checks. Browser capabilities remain additionally bound by their existing
+handler to endpoint identity, tenant, descriptor/policy digest, scope, lease,
+and exact serialized contents.
+
+Default behavior is compatibility-first: v3 is sent only when
+`HIVE_PQC_PRIVILEGED_ENVELOPE=1` and the peer has a validated v3 enrollment;
+otherwise legacy/v2 behavior remains available and is counted. Required mode
+is intentionally opt-in and scoped: set `HIVE_PQC_REQUIRED_PATHS`, an explicit
+future `HIVE_PQC_REQUIRED_NOT_BEFORE_MS`, and
+`HIVE_PQC_REQUIRED_EVIDENCE_CONFIRMED=1` only after operators confirm fresh,
+complete compatible evidence for every required participant. Optional
+`HIVE_PQC_COMPAT_PATHS` exceptions work only before their explicit
+`HIVE_PQC_COMPAT_EXPIRES_MS`; absent or invalid expiry does not preserve an
+exception. When active, refusal is limited to the named operation
+(`PQC_REQUIRED_INCOMPATIBLE`); it never gates endpoint bind, discovery,
+bootstrap, or unrelated mesh traffic.
+
+Operator sequence: observe negotiated per-surface evidence; remove known
+classical fallback where a surface can safely do so; confirm all required
+participants report fresh, complete compatible evidence; enable one scoped
+required policy with a dated exception if necessary; then monitor counters and
+revert the scoped policy if compatibility regresses. Unknown, unavailable,
+stale, or missing gossip posture blocks promotion rather than counting as
+compatible.

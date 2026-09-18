@@ -42,6 +42,16 @@ pub struct MldsaGossipPostureSummary {
     pub status: String,
     pub verified_total: u64,
     pub verification_failures: u64,
+    #[serde(default)]
+    pub accepted_legacy: u64,
+    #[serde(default)]
+    pub accepted_dual_signed: u64,
+    #[serde(default)]
+    pub missing_enrollment: u64,
+    #[serde(default)]
+    pub replay_or_staleness_failures: u64,
+    #[serde(default)]
+    pub downgrade_refusals: u64,
     pub last_verified_ms: Option<u64>,
 }
 

@@ -34,6 +34,7 @@ n0-future = "0.3"
 url = "2"
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 ml-dsa = { version = "0.1.1", features = ["zeroize"] }
 
 [dev-dependencies]

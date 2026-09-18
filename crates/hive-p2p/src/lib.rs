@@ -12,7 +12,7 @@
 //! * [`dial`] — open a P2P connection to a remote instance and return a duplex
 //!   byte stream a [`fluid_tunnel::TunnelClient`] can drive (the gateway side).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -32,6 +32,8 @@ const ML_DSA44_SIGNATURE_BYTES: usize = 2420;
 const PQ_BIND_DOMAIN: &[u8] = b"hive-pq-bind-v1\0";
 const GOSSIP_V2_DOMAIN: &[u8] = b"hive-gossip-v2\0";
 const GOSSIP_V2_CONTEXT: &[u8] = b"hive-gossip-v2";
+const GOSSIP_V3_DOMAIN: &[u8] = b"hive-privileged-envelope-v3\0";
+const GOSSIP_V3_CONTEXT: &[u8] = b"hive-privileged-envelope-v3";
 const PQ_RATCHET_VERSION: u8 = 1;
 
 /// The stable mesh identity is the iroh Ed25519-derived endpoint id.  ML-DSA
@@ -95,12 +97,19 @@ struct PqcSigningStats {
     failed: AtomicU64,
     missing_enrollment: AtomicU64,
     downgrade: AtomicU64,
+    accepted_legacy: AtomicU64,
+    accepted_dual: AtomicU64,
+    replay_or_stale_failures: AtomicU64,
+    downgrade_refusals: AtomicU64,
     activated_ms: Option<u64>,
     last_verified_ms: Option<u64>,
 }
 
 static PQ_SIGNING_STATS: std::sync::LazyLock<StdMutex<PqcSigningStats>> =
     std::sync::LazyLock::new(|| StdMutex::new(PqcSigningStats::default()));
+static GOSSIP_V3_NONCE: AtomicU64 = AtomicU64::new(0);
+static GOSSIP_V3_REPLAYS: std::sync::LazyLock<StdMutex<(HashSet<[u8; 32]>, VecDeque<[u8; 32]>)>> =
+    std::sync::LazyLock::new(|| StdMutex::new((HashSet::new(), VecDeque::new())));
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct PqcSigningTelemetry {
@@ -109,6 +118,10 @@ pub struct PqcSigningTelemetry {
     pub verification_failures: u64,
     pub missing_enrollment: u64,
     pub downgrade_events: u64,
+    pub accepted_legacy: u64,
+    pub accepted_dual_signed: u64,
+    pub replay_or_staleness_failures: u64,
+    pub downgrade_refusals: u64,
     pub activated_ms: Option<u64>,
     pub last_verified_ms: Option<u64>,
 }
@@ -121,6 +134,10 @@ pub fn pqc_signing_telemetry() -> PqcSigningTelemetry {
         verification_failures: state.failed.load(Ordering::Relaxed),
         missing_enrollment: state.missing_enrollment.load(Ordering::Relaxed),
         downgrade_events: state.downgrade.load(Ordering::Relaxed),
+        accepted_legacy: state.accepted_legacy.load(Ordering::Relaxed),
+        accepted_dual_signed: state.accepted_dual.load(Ordering::Relaxed),
+        replay_or_staleness_failures: state.replay_or_stale_failures.load(Ordering::Relaxed),
+        downgrade_refusals: state.downgrade_refusals.load(Ordering::Relaxed),
         activated_ms: state.activated_ms,
         last_verified_ms: state.last_verified_ms,
     }
@@ -334,7 +351,7 @@ pub fn pqc_enrollment(secret: &iroh::SecretKey) -> Option<PqcEnrollment> {
         public_key_hex: hex_encode(public),
         ed25519_binding_hex: hex_encode(&ed.to_bytes()),
         mldsa_binding_hex: hex_encode(pq.to_bytes().as_slice()),
-        gossip_protocol_version: 2,
+        gossip_protocol_version: 3,
     })
 }
 
@@ -751,6 +768,11 @@ const STREAM_GOSSIP_SIGNED: u8 = 0x03;
 /// Dual-signed gossip. This is deliberately a NEW mode: v1 has a fixed
 /// 104-byte trailer and must never be extended in place.
 const STREAM_GOSSIP_SIGNED_V2: u8 = 0x06;
+/// Versioned privileged application envelope. Unlike v2 this binds an
+/// operation nonce and an integrity digest in addition to the complete
+/// method/path/body, preventing a valid signed request from being replayed
+/// within the timestamp window or substituted into another operation.
+const STREAM_GOSSIP_SIGNED_V3: u8 = 0x07;
 /// MESH JOIN (hot-join): a NOT-YET-TRUSTED node introduces itself. Framing:
 /// `[u32 node_len][node_json][u32 proof_len][proof]` -> response `[u32 len][bytes]`
 /// (empty = rejected). The caller's identity is the QUIC connection's
@@ -794,6 +816,19 @@ const GOSSIP_METHOD_POST: u8 = 1;
 /// Domain separator for gossip signatures (versioned; bump on format change).
 const GOSSIP_SIG_DOMAIN: &[u8] = b"hive-gossip-v1";
 const GOSSIP_V2_SUITE_MLDSA44: u8 = 1;
+const GOSSIP_V3_SUITE_ED25519_MLDSA44: u8 = 1;
+const GOSSIP_V3_NONCE_BYTES: usize = 16;
+const GOSSIP_V3_KEY_REF_BYTES: usize = 16;
+const GOSSIP_V3_TRAILER_BYTES: usize = 1
+    + 1
+    + 32
+    + GOSSIP_V3_KEY_REF_BYTES
+    + 8
+    + GOSSIP_V3_NONCE_BYTES
+    + 32
+    + 64
+    + ML_DSA44_SIGNATURE_BYTES;
+const GOSSIP_V3_REPLAY_CACHE_MAX: usize = 16_384;
 /// Cap on a single gossip frame (request path/body or response) — gossip payloads
 /// are small JSON rosters; this just bounds a malformed/hostile length prefix.
 const GOSSIP_MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -1026,6 +1061,46 @@ pub fn gossip_sign_v2_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// V3 is sent only after an authenticated peer advertised enrollment version 3.
+/// The separate flag keeps the wire migration reversible.
+pub fn gossip_sign_v3_enabled() -> bool {
+    std::env::var("HIVE_PQC_PRIVILEGED_ENVELOPE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn scoped_paths(var: &str, path: &str) -> bool {
+    std::env::var(var)
+        .ok()
+        .into_iter()
+        .flat_map(|v| v.split(',').map(str::to_owned).collect::<Vec<_>>())
+        .map(|prefix| prefix.trim().to_string())
+        .any(|prefix| !prefix.is_empty() && path.starts_with(&prefix))
+}
+
+/// Required mode is deliberately hard to activate: an operator must affirm
+/// complete/fresh compatible-fleet evidence and name a scope. The transport
+/// itself never infers compatibility from an enrollment, offer, or absence.
+fn pq_required_for(path: &str, now: u64) -> bool {
+    let confirmed = std::env::var("HIVE_PQC_REQUIRED_EVIDENCE_CONFIRMED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let not_before = std::env::var("HIVE_PQC_REQUIRED_NOT_BEFORE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(u64::MAX);
+    if !confirmed || now < not_before || !scoped_paths("HIVE_PQC_REQUIRED_PATHS", path) {
+        return false;
+    }
+    // Compatibility exceptions are safe only with an explicit expiry; an
+    // absent/invalid expiry does not silently retain the exception forever.
+    let exception_expires = std::env::var("HIVE_PQC_COMPAT_EXPIRES_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    !(scoped_paths("HIVE_PQC_COMPAT_PATHS", path)
+        && exception_expires.is_some_and(|expires| now < expires))
+}
+
 pub fn verify_mode() -> VerifyMode {
     match std::env::var("HIVE_GOSSIP_VERIFY")
         .unwrap_or_default()
@@ -1248,8 +1323,203 @@ fn verify_gossip_v2(
         .map_err(|_| "could not persist ML-DSA downgrade ratchet")?;
     let mut stats = PQ_SIGNING_STATS.lock().unwrap_or_else(|p| p.into_inner());
     stats.verified.fetch_add(1, Ordering::Relaxed);
+    stats.accepted_dual.fetch_add(1, Ordering::Relaxed);
     stats.activated_ms.get_or_insert(now_ms);
     stats.last_verified_ms = Some(now_ms);
+    Ok(signer_id)
+}
+
+/// V3 is the reusable application-level envelope for privileged mesh
+/// operations. The enrolled ML-DSA key reference is informational only until
+/// it is matched against the key already bound to the authenticated Ed25519
+/// endpoint; it is never a caller-provided authority.
+fn gossip_v3_preimage(
+    method: u8,
+    path: &str,
+    sender: &[u8; 32],
+    key_ref: &[u8; GOSSIP_V3_KEY_REF_BYTES],
+    ts_ms: u64,
+    nonce: &[u8; GOSSIP_V3_NONCE_BYTES],
+    payload_digest: &[u8; 32],
+) -> Vec<u8> {
+    let mut message = Vec::with_capacity(
+        GOSSIP_V3_DOMAIN.len()
+            + 2
+            + 1
+            + 4
+            + path.len()
+            + 32
+            + GOSSIP_V3_KEY_REF_BYTES
+            + 8
+            + GOSSIP_V3_NONCE_BYTES
+            + 32,
+    );
+    message.extend_from_slice(GOSSIP_V3_DOMAIN);
+    message.push(3); // envelope version
+    message.push(GOSSIP_V3_SUITE_ED25519_MLDSA44);
+    message.push(method);
+    message.extend_from_slice(&(path.len() as u32).to_be_bytes());
+    message.extend_from_slice(path.as_bytes());
+    message.extend_from_slice(sender);
+    message.extend_from_slice(key_ref);
+    message.extend_from_slice(&ts_ms.to_be_bytes());
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(payload_digest);
+    message
+}
+
+fn digest(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
+}
+
+fn enrolled_key_ref(public_key: &[u8]) -> [u8; GOSSIP_V3_KEY_REF_BYTES] {
+    let digest = digest(public_key);
+    digest[..GOSSIP_V3_KEY_REF_BYTES]
+        .try_into()
+        .expect("fixed-size key reference")
+}
+
+fn next_v3_nonce(secret: &iroh::SecretKey, ts_ms: u64) -> [u8; GOSSIP_V3_NONCE_BYTES] {
+    let counter = GOSSIP_V3_NONCE.fetch_add(1, Ordering::Relaxed);
+    let mut material = Vec::with_capacity(32 + 16);
+    material.extend_from_slice(secret.public().as_bytes());
+    material.extend_from_slice(&ts_ms.to_be_bytes());
+    material.extend_from_slice(&counter.to_be_bytes());
+    digest(&material)[..GOSSIP_V3_NONCE_BYTES]
+        .try_into()
+        .expect("fixed-size nonce")
+}
+
+/// Build the v3 Ed25519 + ML-DSA-44 envelope trailer. The entire payload is
+/// SHA-256 digested and the digest, not a caller assertion, is signed.
+pub fn sign_privileged_gossip_v3(
+    secret: &iroh::SecretKey,
+    method: u8,
+    path: &str,
+    body: &[u8],
+    ts_ms: u64,
+) -> Option<Vec<u8>> {
+    use ml_dsa::{signature::SignatureEncoding, Keypair};
+    let key = PQ_SIGNING_KEY.read().ok()?.as_ref()?.clone();
+    let sender = *secret.public().as_bytes();
+    let public = key.0.verifying_key().encode();
+    let key_ref = enrolled_key_ref(public.as_slice());
+    let nonce = next_v3_nonce(secret, ts_ms);
+    let payload_digest = digest(body);
+    let preimage = gossip_v3_preimage(
+        method,
+        path,
+        &sender,
+        &key_ref,
+        ts_ms,
+        &nonce,
+        &payload_digest,
+    );
+    let pq_signature = key
+        .0
+        .expanded_key()
+        .sign_deterministic(&preimage, GOSSIP_V3_CONTEXT)
+        .ok()?;
+    let ed_signature = secret.sign(&preimage);
+    let mut trailer = Vec::with_capacity(GOSSIP_V3_TRAILER_BYTES);
+    trailer.extend_from_slice(&[3, GOSSIP_V3_SUITE_ED25519_MLDSA44]);
+    trailer.extend_from_slice(&sender);
+    trailer.extend_from_slice(&key_ref);
+    trailer.extend_from_slice(&ts_ms.to_be_bytes());
+    trailer.extend_from_slice(&nonce);
+    trailer.extend_from_slice(&payload_digest);
+    trailer.extend_from_slice(&ed_signature.to_bytes());
+    trailer.extend_from_slice(pq_signature.to_bytes().as_slice());
+    Some(trailer)
+}
+
+fn verify_privileged_gossip_v3(
+    trailer: &[u8],
+    method: u8,
+    path: &str,
+    body: &[u8],
+    remote_id: &str,
+    now: u64,
+) -> Result<String, &'static str> {
+    if trailer.len() != GOSSIP_V3_TRAILER_BYTES
+        || trailer[..2] != [3, GOSSIP_V3_SUITE_ED25519_MLDSA44]
+    {
+        return Err("unknown or malformed privileged envelope");
+    }
+    let sender: [u8; 32] = trailer[2..34].try_into().expect("checked trailer length");
+    let key_ref: [u8; GOSSIP_V3_KEY_REF_BYTES] =
+        trailer[34..50].try_into().expect("checked trailer length");
+    let ts = u64::from_be_bytes(trailer[50..58].try_into().expect("checked trailer length"));
+    let nonce: [u8; GOSSIP_V3_NONCE_BYTES] =
+        trailer[58..74].try_into().expect("checked trailer length");
+    let payload_digest: [u8; 32] = trailer[74..106].try_into().expect("checked trailer length");
+    if payload_digest != digest(body) || now.abs_diff(ts) > gossip_ts_window_ms() {
+        PQ_SIGNING_STATS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replay_or_stale_failures
+            .fetch_add(1, Ordering::Relaxed);
+        return Err("payload digest mismatch or timestamp outside freshness window");
+    }
+    let signer = iroh::PublicKey::from_bytes(&sender).map_err(|_| "invalid envelope signer")?;
+    let signer_id = signer.to_string();
+    if signer_id != remote_id {
+        return Err("envelope signer does not match connection identity");
+    }
+    let enrolled = PQ_PEERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&signer_id)
+        .cloned()
+        .ok_or_else(|| {
+            PQ_SIGNING_STATS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .missing_enrollment
+                .fetch_add(1, Ordering::Relaxed);
+            "missing verified ML-DSA enrollment"
+        })?;
+    if enrolled_key_ref(&enrolled.public_key) != key_ref {
+        return Err("enrolled ML-DSA key reference mismatch");
+    }
+    let preimage = gossip_v3_preimage(method, path, &sender, &key_ref, ts, &nonce, &payload_digest);
+    let ed_signature: [u8; 64] = trailer[106..170]
+        .try_into()
+        .expect("checked trailer length");
+    signer
+        .verify(&preimage, &iroh::Signature::from_bytes(&ed_signature))
+        .map_err(|_| "Ed25519 privileged envelope signature invalid")?;
+    let encoded =
+        ml_dsa::EncodedVerifyingKey::<ml_dsa::MlDsa44>::try_from(enrolled.public_key.as_slice())
+            .map_err(|_| "invalid enrolled ML-DSA public key")?;
+    let verifying = ml_dsa::VerifyingKey::<ml_dsa::MlDsa44>::decode(&encoded);
+    let pq_signature = ml_dsa::Signature::<ml_dsa::MlDsa44>::try_from(&trailer[170..])
+        .map_err(|_| "invalid ML-DSA privileged envelope signature")?;
+    if !verifying.verify_with_context(&preimage, GOSSIP_V3_CONTEXT, &pq_signature) {
+        return Err("ML-DSA privileged envelope signature invalid");
+    }
+    let replay_key = digest(&trailer[..106]);
+    let mut replays = GOSSIP_V3_REPLAYS.lock().unwrap_or_else(|p| p.into_inner());
+    if !replays.0.insert(replay_key) {
+        PQ_SIGNING_STATS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replay_or_stale_failures
+            .fetch_add(1, Ordering::Relaxed);
+        return Err("replayed privileged envelope");
+    }
+    replays.1.push_back(replay_key);
+    if replays.1.len() > GOSSIP_V3_REPLAY_CACHE_MAX {
+        if let Some(old) = replays.1.pop_front() {
+            replays.0.remove(&old);
+        }
+    }
+    let mut stats = PQ_SIGNING_STATS.lock().unwrap_or_else(|p| p.into_inner());
+    stats.accepted_dual.fetch_add(1, Ordering::Relaxed);
+    stats.verified.fetch_add(1, Ordering::Relaxed);
+    stats.activated_ms.get_or_insert(now);
+    stats.last_verified_ms = Some(now);
     Ok(signer_id)
 }
 
@@ -3850,13 +4120,38 @@ impl PeerPool {
             // V2 is selected only for a peer whose ML-DSA public key was
             // independently cross-attested and enrolled locally. Every other
             // peer stays on the old fixed v1 trailer, preserving mixed fleets.
-            let v2 = gossip_sign_v2_enabled()
-                && PQ_PEERS
-                    .lock()
-                    .ok()
-                    .and_then(|peers| peers.get(&acquired.key).cloned())
-                    .is_some_and(|peer| peer.gossip_protocol_version >= 2);
-            if v2 {
+            let peer_version = PQ_PEERS
+                .lock()
+                .ok()
+                .and_then(|peers| peers.get(&acquired.key).cloned())
+                .map(|peer| peer.gossip_protocol_version)
+                .unwrap_or_default();
+            let v3 = gossip_sign_v3_enabled() && peer_version >= 3;
+            if pq_required_for(path, now_ms()) && !v3 {
+                anyhow::bail!(
+                    "PQC_REQUIRED_INCOMPATIBLE: peer lacks enrolled privileged-envelope v3 support for this scoped operation"
+                );
+            }
+            let v2 = gossip_sign_v2_enabled() && peer_version >= 2;
+            if v3 {
+                let ts = now_ms();
+                let trailer =
+                    sign_privileged_gossip_v3(self.ep.secret_key(), method, path, body, ts)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("ML-DSA privileged envelope signing key unavailable")
+                        })?;
+                send.write_all(&[STREAM_GOSSIP_SIGNED_V3, method]).await?;
+                send.write_all(&(path.len() as u32).to_be_bytes()).await?;
+                send.write_all(path.as_bytes()).await?;
+                send.write_all(&(body.len() as u32).to_be_bytes()).await?;
+                send.write_all(body).await?;
+                send.write_all(&(trailer.len() as u32).to_be_bytes())
+                    .await?;
+                send.write_all(&trailer).await?;
+                let mut stats = PQ_SIGNING_STATS.lock().unwrap_or_else(|p| p.into_inner());
+                stats.signed.fetch_add(1, Ordering::Relaxed);
+                stats.activated_ms.get_or_insert(ts);
+            } else if v2 {
                 let ts = now_ms();
                 let trailer = sign_gossip_v2(self.ep.secret_key(), method, path, body, ts)
                     .ok_or_else(|| anyhow::anyhow!("ML-DSA v2 signing key unavailable"))?;
@@ -4720,7 +5015,10 @@ async fn serve_fleet_conn(
                 return;
             }
             match mode[0] {
-                STREAM_GOSSIP | STREAM_GOSSIP_SIGNED | STREAM_GOSSIP_SIGNED_V2 => {
+                STREAM_GOSSIP
+                | STREAM_GOSSIP_SIGNED
+                | STREAM_GOSSIP_SIGNED_V2
+                | STREAM_GOSSIP_SIGNED_V3 => {
                     if let Some(gossip) = gossip {
                         serve_gossip(recv, send, gossip, mode[0], rid, trust).await;
                     }
@@ -5150,6 +5448,31 @@ async fn serve_gossip<R, W>(
                 }
             }
         }
+    } else if stream_mode == STREAM_GOSSIP_SIGNED_V3 {
+        let trailer_len = match read_u32(&mut recv).await {
+            Ok(length) if length as usize == GOSSIP_V3_TRAILER_BYTES => length as usize,
+            _ => return,
+        };
+        let mut trailer = vec![0u8; trailer_len];
+        if recv.read_exact(&mut trailer).await.is_err() {
+            return;
+        }
+        match verify_privileged_gossip_v3(&trailer, m[0], &path, &body, &remote_id, now_ms()) {
+            Ok(signer) => verified_signer = Some(signer),
+            Err(reason) => {
+                PQ_SIGNING_STATS
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .failed
+                    .fetch_add(1, Ordering::Relaxed);
+                VERIFY_STATS.rejected.fetch_add(1, Ordering::Relaxed);
+                tracing::warn!(peer = %remote_id, %path, %reason, "REJECTED privileged dual-signed gossip");
+                let _ = send.write_all(&0u32.to_be_bytes()).await;
+                let _ = send.flush().await;
+                let _ = send.shutdown().await;
+                return;
+            }
+        }
     } else {
         VERIFY_STATS.unsigned.fetch_add(1, Ordering::Relaxed);
         if mode.enforces_signature() {
@@ -5160,6 +5483,19 @@ async fn serve_gossip<R, W>(
             let _ = send.shutdown().await;
             return;
         }
+    }
+    if stream_mode != STREAM_GOSSIP_SIGNED_V3 && pq_required_for(&path, now_ms()) {
+        PQ_SIGNING_STATS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .downgrade_refusals
+            .fetch_add(1, Ordering::Relaxed);
+        VERIFY_STATS.rejected.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(peer = %remote_id, %path, "REJECTED scoped privileged operation without v3 envelope");
+        let _ = send.write_all(&0u32.to_be_bytes()).await;
+        let _ = send.flush().await;
+        let _ = send.shutdown().await;
+        return;
     }
     // The downgrade ratchet is keyed only after this receiver has observed a
     // valid v2 message from the authenticated identity. Enrollment alone is
@@ -5184,6 +5520,13 @@ async fn serve_gossip<R, W>(
         let _ = send.flush().await;
         let _ = send.shutdown().await;
         return;
+    }
+    if stream_mode == STREAM_GOSSIP_SIGNED && verified_signer.is_some() {
+        PQ_SIGNING_STATS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .accepted_legacy
+            .fetch_add(1, Ordering::Relaxed);
     }
     let resp = handler(m[0], path, body, verified_signer).await;
     let len = (resp.len() as u32).to_be_bytes();

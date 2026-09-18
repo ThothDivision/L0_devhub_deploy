@@ -8596,6 +8596,36 @@ async fn security_posture(
                 "last_verified_ms": kex.last_verified_ms,
                 "protects": "A negotiated hybrid KEM protects the confidentiality of that mesh session.",
                 "does_not_protect": "Iroh transport identity remains Ed25519; ML-KEM does not make identity post-quantum."
+                ,
+                "tls_surface_evidence": [
+                    {
+                        "scope": "mesh_quic",
+                        "status": if kex.live_hybrid_sessions > 0 { "hybrid_negotiated" } else if kex.live_classical_sessions > 0 { "classical_negotiated" } else { "unknown_unobservable" },
+                        "provider": "AWS-LC",
+                        "evidence": "completed rustls handshake metadata",
+                        "hybrid_connections_total": kex.hybrid_connections_total,
+                        "classical_connections_total": kex.classical_connections_total,
+                        "unknown_connections_total": kex.unknown_connections_total,
+                    },
+                    {
+                        "scope": "public_https_and_raw_https",
+                        "status": "configured_only_unsupported",
+                        "provider": "Ring",
+                        "evidence": "no completed-handshake KEX telemetry; no PQ claim",
+                    },
+                    {
+                        "scope": "database_tls",
+                        "status": "unknown_unobservable",
+                        "provider": "rustls default listener configuration",
+                        "evidence": "no completed-handshake KEX telemetry; no PQ claim",
+                    },
+                    {
+                        "scope": "relay_tls_and_internal_https",
+                        "status": "unknown_unobservable",
+                        "provider": "not established by mesh provider configuration",
+                        "evidence": "surface-specific listener/client telemetry is unavailable; no PQ claim",
+                    }
+                ]
             },
             "transport": {
                 "status": if c.mesh.read().is_some() { "active" } else { "not configured" },
@@ -8624,7 +8654,10 @@ async fn security_posture(
                 "does_not_protect": "The platform as a whole is not automatically conflict-resolving CRDT replication."
             },
             "workload_isolation": isolation
-        }
+        },
+        // This is leader-observed gossip evidence colocated with this direct
+        // node-local response. It remains aggregate-only and unknown-safe.
+        "leader_observed_fleet": security_posture_fleet_value(&c)
     })))
 }
 
@@ -8658,7 +8691,7 @@ pub(crate) fn security_posture_summary(c: &CloudState) -> hive_edge::SecurityPos
         }
     };
     hive_edge::SecurityPostureSummary {
-        api_version: 1,
+        api_version: 2,
         observed_at_ms: now_ms(),
         selected_backend: c.gw.backend_name().to_string(),
         kem: hive_edge::KemPostureSummary {
@@ -8673,6 +8706,11 @@ pub(crate) fn security_posture_summary(c: &CloudState) -> hive_edge::SecurityPos
             status: mldsa_status.to_string(),
             verified_total: signing.verified_total,
             verification_failures: signing.verification_failures,
+            accepted_legacy: signing.accepted_legacy,
+            accepted_dual_signed: signing.accepted_dual_signed,
+            missing_enrollment: signing.missing_enrollment,
+            replay_or_staleness_failures: signing.replay_or_staleness_failures,
+            downgrade_refusals: signing.downgrade_refusals,
             last_verified_ms: signing.last_verified_ms,
         },
         discovery: hive_edge::DiscoveryPostureSummary {
@@ -8690,11 +8728,7 @@ pub(crate) fn security_posture_summary(c: &CloudState) -> hive_edge::SecurityPos
 /// This reads this leader's local registry, which is gossip state rather than
 /// a cryptographic fleet measurement. A missing summary is deliberately
 /// counted as unknown, including for mixed-version peers.
-async fn security_posture_fleet(
-    State(c): State<Arc<CloudState>>,
-    claims: Option<axum::Extension<crate::auth::Claims>>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    require_operator(claims.as_ref().map(|e| &e.0))?;
+fn security_posture_fleet_value(c: &CloudState) -> Value {
     use std::collections::BTreeMap;
 
     let nodes = c.registry.nodes();
@@ -8708,6 +8742,11 @@ async fn security_posture_fleet(
     let mut kem_telemetry_unavailable_nodes = 0_u64;
     let mut mldsa_verified = 0_u64;
     let mut mldsa_verification_failures = 0_u64;
+    let mut mldsa_legacy = 0_u64;
+    let mut mldsa_dual = 0_u64;
+    let mut mldsa_missing_enrollment = 0_u64;
+    let mut mldsa_replay_or_stale = 0_u64;
+    let mut mldsa_downgrade_refusals = 0_u64;
     let mut discovery: BTreeMap<&str, BTreeMap<String, u64>> =
         ["relay", "bootstrap", "pkarr", "n0", "mainline_dht"]
             .into_iter()
@@ -8721,7 +8760,7 @@ async fn security_posture_fleet(
         // A peer may have a future summary shape we do not understand. Preserve
         // its distinguishability, but do not aggregate evidence with unknown
         // semantics as if it were compatible.
-        if posture.api_version != 1 {
+        if posture.api_version != 2 {
             unsupported_posture_api_version_nodes += 1;
             continue;
         }
@@ -8737,6 +8776,11 @@ async fn security_posture_fleet(
         }
         mldsa_verified += posture.mldsa_gossip.verified_total;
         mldsa_verification_failures += posture.mldsa_gossip.verification_failures;
+        mldsa_legacy += posture.mldsa_gossip.accepted_legacy;
+        mldsa_dual += posture.mldsa_gossip.accepted_dual_signed;
+        mldsa_missing_enrollment += posture.mldsa_gossip.missing_enrollment;
+        mldsa_replay_or_stale += posture.mldsa_gossip.replay_or_staleness_failures;
+        mldsa_downgrade_refusals += posture.mldsa_gossip.downgrade_refusals;
         for (name, status) in [
             ("relay", &posture.discovery.relay),
             ("bootstrap", &posture.discovery.bootstrap),
@@ -8767,7 +8811,7 @@ async fn security_posture_fleet(
     } else {
         fleet_status
     };
-    Ok(Json(json!({
+    json!({
         "scope": "leader-observed-fleet",
         "reporting_node": c.node_name,
         "aggregate_observed_at_ms": now_ms(),
@@ -8785,6 +8829,11 @@ async fn security_posture_fleet(
         "mldsa_gossip_evidence": {
             "verified_total": mldsa_verified,
             "verification_failures": mldsa_verification_failures,
+            "accepted_legacy": mldsa_legacy,
+            "accepted_dual_signed": mldsa_dual,
+            "missing_enrollment": mldsa_missing_enrollment,
+            "replay_or_staleness_failures": mldsa_replay_or_stale,
+            "downgrade_refusals": mldsa_downgrade_refusals,
         },
         "discovery_provider_distribution": discovery,
         "layers": {
@@ -8801,7 +8850,18 @@ async fn security_posture_fleet(
             "Missing posture is unknown/mixed-version evidence, never evidence of support, activity, classical fallback, or hybrid operation.",
             "The aggregate contains no endpoint or peer identifiers, addresses, certificates, keys, handshake payloads, or per-peer security material."
         ]
-    })))
+    })
+}
+
+/// Backward-compatible aggregate route. New callers should use the
+/// `leader_observed_fleet` field of `/v1/security/posture` so direct and
+/// gossiped evidence are read together.
+async fn security_posture_fleet(
+    State(c): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(security_posture_fleet_value(&c)))
 }
 
 /// Serverless GPU pool snapshot (operator-only, same guard as `/v1/tunnels` /
