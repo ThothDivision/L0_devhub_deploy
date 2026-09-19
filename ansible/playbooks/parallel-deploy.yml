@@ -314,8 +314,14 @@
       # step exists to prevent; demand comfortably above it.
       until: >-
         rekick_mesh.status == 200 and
-        (rekick_mesh.json.visible_healthy_peers | int) >=
-        ([((rekick_mesh.json.expected_peers | int) / 4) | round(0, 'ceil') | int, 3] | max)
+        (
+          (rekick_mesh.json.expected_peers | int) == 0
+          or
+          (
+            (rekick_mesh.json.visible_healthy_peers | int) >=
+            ([((rekick_mesh.json.expected_peers | int) / 4) | round(0, 'ceil') | int, 3] | max)
+          )
+        )
 
     - name: Re-kick convergence summary
       ansible.builtin.debug:
