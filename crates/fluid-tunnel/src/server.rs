@@ -484,6 +484,18 @@ async fn proxy_local(
         }
     }
 
+    // A response to HEAD, or a 1xx/204/304, has no body BY DEFINITION and no
+    // Content-Length/chunked framing to end on. With `connection: keep-alive`
+    // the read-to-EOF arm below never sees the close it waits for, so the
+    // exchange never finished — and it holds the connect gate the whole time:
+    // one 304 forwarded into a litebox node (1 permit) wedged EVERY later
+    // forwarded request behind it, 15 s first-byte timeouts to the peer
+    // (fc-sanjose, 2026-09-19: one loopback exchange idle for 59 minutes).
+    let bodiless = meta.method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status)
+        || status == 204
+        || status == 304;
+
     // Send response head, then stream the body. `head_sent` flips FIRST: once
     // any frame may have reached the wire, the caller must never retry.
     let meta = RespMeta {
@@ -498,7 +510,9 @@ async fn proxy_local(
         serde_json::to_vec(&meta)?,
     ))?;
     // Stream the body.
-    if chunked {
+    if bodiless {
+        // nothing follows the head
+    } else if chunked {
         // Decode HTTP/1.1 chunked framing and forward ONLY the payload bytes, so
         // any Content-Encoding (gzip/br) stays valid for the client. Each chunk is
         // "<hex-size>[;ext]\r\n<data>\r\n", terminated by a zero-size chunk.

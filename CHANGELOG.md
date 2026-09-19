@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-09-19 — apps 15 s slow on three of four edges: `connection: keep-alive` + a bodiless response wedged the tunnel's connect gate
+
+`just-survey-bot.shadw.app` / `survey-botbot.shadw.app` (hosted on fc-sanjose)
+took 15.1–15.4 s through va, va3 and phx — three of the four round-robin DNS
+answers — and 0.1–0.6 s through sj itself. `x-hive-transport: http-direct`: the
+edge forwards over the peer's iroh trunk first, got no first byte for
+`HIVE_P2P_FIRSTBYTE_MS` (15 s), then the HTTP fallback answered in ~0.2 s.
+tcpdump on sj showed nothing carrying that Host reaching `:8787` until the
+fallback arrived; forwards to fc-phoenix over iroh took 0.25 s.
+
+Cause (mine, `eb20c76`): `fluid_tunnel::server::proxy_local` now sends
+`connection: keep-alive`, and for a response with neither `Content-Length` nor
+chunked framing it reads until EOF. A HEAD response or a 1xx/204/304 has no body
+by definition and no framing, so the read waited for a close a keep-alive
+upstream never sends — while holding `connect_gate(local_http)`, whose permit
+count is 1 on litebox nodes. One such exchange on sj sat idle for 59 minutes
+(`ss` showed the loopback socket owned by hive-cloud's own fd, `lastsnd`
+3.5 M ms) and every later peer-forwarded request queued behind it until the
+peer's first-byte timeout. Destroying just that socket (`ss -K`) restored iroh
+forwards immediately (15.2 s → 5.5 s → 0.46 s, then all four nodes 0.12–0.5 s
+for both sites).
+
+Fixed: `proxy_local` treats HEAD/1xx/204/304 as bodiless and ends the exchange
+at the head. Also added a per-candidate iroh cooldown in `edge.rs`
+(`HIVE_EDGE_IROH_COOLDOWN_MS`, 120 s): after a `PostSendTimeout` or
+`DeadPeerTimeout` the candidate goes HTTP-first and one probe request retries
+iroh, so a genuinely dead trunk costs one request 15 s instead of all of them.
+The cooldown is compiled and deployed but its branch has not been exercised
+live. The response that wedged sj was 433 bytes and was not captured, but the
+mechanism is reproduced: on phx (old code) one `HEAD /` forwarded over iroh hung
+and every following GET took 15.2 s (`http-direct`); after the fix, 6 HEADs per
+edge to the sj-hosted app took 0.04–0.16 s, GETs stayed on `iroh-p2p` at
+0.1–0.4 s, and no node held a stuck loopback exchange. HEAD is one trigger;
+204/304 are the same code path and were not reproduced.
+
 ## 2026-09-18 — a managed Postgres was wiped and re-created every ~70 s because the leader's stale `simulated` copy overwrote the host's promotion
 
 `surveybot-db` (project `survey-bot-real-2`, host fc-virginia-3, created
