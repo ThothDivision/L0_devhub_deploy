@@ -1,5 +1,24 @@
 # Changelog
 
+## 2026-09-20 — the litebox artifact GC hashed the whole cache on every publish, so a shim change took a node's apps dark for an hour
+
+Rolling the `process.title` fix to fc-sanjose changed `runtime_source_sha256`
+for every litebox app, so every app rebuilt its combined runtime archive at its
+next cold start. Each rebuild ended in `gc_artifacts_locked`, which called
+`verify_immutable_open` — a full SHA-256 — on the app archive and every runtime
+archive of every reference, under the global `artifact_lock`: ~125 references x
+~400 MB, measured as a new ~230 MB tar every 2 m 43 s in the runtimes directory.
+A cold start therefore queued behind ~163 s of hashing per app ahead of it, and
+a request that gave up (curl timeout, browser) left the queue, so
+`just-survey-bot` / `survey-botbot` answered nothing for 60/90/100/200/420 s
+probes across two binaries (rolling back re-invalidated the single-entry
+per-key cache and rebuilt everything again).
+
+The GC now checks that each referenced archive exists as a regular file and
+leaves content verification to where the bytes are used
+(`verify_immutable_open` at launch and at publication). Its blast-radius guards
+(empty keep set, max reap fraction, grace age) are unchanged.
+
 ## 2026-09-19 — every Next.js app on a litebox node lost all its environment variables (`process.title` wipes `process.env`)
 
 tokenhun.shadw.app (a Next app served from fc-phoenix) answered
