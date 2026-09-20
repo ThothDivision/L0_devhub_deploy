@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-09-19 — every Next.js app on a litebox node lost all its environment variables (`process.title` wipes `process.env`)
+
+tokenhun.shadw.app (a Next app served from fc-phoenix) answered
+`PROXY_API_KEY is not configured on the proxy server` although the variable was
+set in the project, baked into the deployment, and present in the litebox
+runner's own environment (`/proc/<pid>/environ`).
+
+Reproduced and bisected on phoenix with real litebox guests. A guest given the
+exact production environment saw all 13 variables; a plain `node -e` kept them;
+the same app driven in-process or through a custom `http` server answered 401
+(the middleware saw the key); only `next start` answered 500. Instrumenting the
+merged tar showed the guest's `process.env` already at 5 keys when `listening`
+fired, and the last step before it was `process.title = "next-server (v…)"` in
+`startServer`. In a guest, `process.title = 'x'` takes `process.env` from 12
+variables to 0: libuv's `uv_set_process_title` rewrites the argv block in
+place and litebox's initial stack keeps the environment strings inside it.
+
+Fixed in `litebox-bind-shim.js` (preloaded into every Node guest): `process.title`
+becomes a JS-only accessor and never reaches the native setter. Changing the
+shim changes `runtime_source_sha256`, so each deployment's combined runtime
+archive is rebuilt at its next launch. Verified by replacing the shim in a
+scratch guest's tar: the same `next start` went from 500 to 401 without the key
+and past the middleware with it. Any Node app that assigns `process.title`
+(PM2-style launchers, Next, Nest) was affected the same way.
+
 ## 2026-09-19 — apps 15 s slow on three of four edges: `connection: keep-alive` + a bodiless response wedged the tunnel's connect gate
 
 `just-survey-bot.shadw.app` / `survey-botbot.shadw.app` (hosted on fc-sanjose)
