@@ -53,7 +53,7 @@ use tokio::sync::{
     oneshot,
 };
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
-use tracing::{Instrument, Level, Span, debug, error, event, info, info_span, instrument, trace, warn};
+use tracing::{Instrument, Level, Span, debug, error, event, info_span, instrument, trace, warn};
 use transports::{LocalAddrsWatch, Transport, TransportConfig};
 use url::Url;
 
@@ -1695,7 +1695,9 @@ impl Actor {
             Ok(()) => {
                 let attempts = pending.attempts + 1;
                 self.rebind_retry = None;
-                info!(attempts, "transport rebind recovered after a failed rebind");
+                // warn, not info: the fleet filters iroh below warn, and this is the line an
+                // operator needs to see pair with `failed to rebind transports`.
+                warn!(attempts, "transport rebind recovered after a failed rebind");
                 self.transports_network_change.check_relay_connection();
                 #[cfg(not(wasm_browser))]
                 self.sock.dns_resolver.reset();
