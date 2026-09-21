@@ -946,7 +946,13 @@ async fn fetch_artifact_from_host(
             .header("x-hive-team", team)
             .timeout(std::time::Duration::from_secs(15));
         if crate::auth::enforced() {
-            if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+            if let Ok(tok) = crate::auth::issue(
+                "mesh-internal",
+                team,
+                "service",
+                false,
+                crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+            ) {
                 rb = rb.bearer_auth(tok);
             }
         }

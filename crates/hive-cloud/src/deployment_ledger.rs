@@ -119,10 +119,19 @@ struct LedgerPayload {
     outbox: BTreeMap<String, LifecycleOutboxEntry>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 struct LedgerFile {
     sentinel: String,
     payload: LedgerPayload,
+    checksum_sha256: String,
+}
+
+/// Read-side twin of `LedgerFile`: the payload stays an undecoded slice of the
+/// file so its checksum is verified over the exact bytes that were written.
+#[derive(Deserialize)]
+struct StoredLedgerFile {
+    sentinel: String,
+    payload: Box<serde_json::value::RawValue>,
     checksum_sha256: String,
 }
 
@@ -749,11 +758,15 @@ fn canonical_bytes(value: &impl Serialize) -> anyhow::Result<Vec<u8>> {
     serde_json::to_vec(value).context("serialize deployment ledger value")
 }
 
-fn payload_checksum(payload: &LedgerPayload) -> anyhow::Result<String> {
+fn raw_payload_checksum(payload_json: &[u8]) -> String {
     let mut digest = Sha256::new();
     digest.update(CHECKSUM_DOMAIN);
-    digest.update(canonical_bytes(payload)?);
-    Ok(format!("{:x}", digest.finalize()))
+    digest.update(payload_json);
+    format!("{:x}", digest.finalize())
+}
+
+fn payload_checksum(payload: &LedgerPayload) -> anyhow::Result<String> {
+    Ok(raw_payload_checksum(&canonical_bytes(payload)?))
 }
 
 fn load_payload(path: &Path) -> anyhow::Result<Option<LedgerPayload>> {
@@ -775,18 +788,27 @@ fn load_payload(path: &Path) -> anyhow::Result<Option<LedgerPayload>> {
         bytes.len() as u64 <= MAX_LEDGER_BYTES,
         "deployment ledger exceeds {MAX_LEDGER_BYTES} bytes"
     );
-    let stored: LedgerFile = serde_json::from_slice(&bytes).context("decode deployment ledger")?;
+    let stored: StoredLedgerFile =
+        serde_json::from_slice(&bytes).context("decode deployment ledger")?;
     anyhow::ensure!(
         stored.sentinel == SENTINEL,
         "deployment ledger sentinel mismatch"
     );
     validate_digest(&stored.checksum_sha256, "deployment ledger checksum")?;
+    // The checksum covers the payload's bytes AS WRITTEN. Re-serializing the
+    // decoded struct instead makes every field added later (even a
+    // `#[serde(default)]` one) change those bytes, so a ledger written by any
+    // earlier binary fails closed on the next one: fc-phoenix crash-looped
+    // 21,679 times over ~20 h after `integrity_chain` was added, with the file
+    // byte-for-byte intact.
     anyhow::ensure!(
-        payload_checksum(&stored.payload)? == stored.checksum_sha256,
+        raw_payload_checksum(stored.payload.get().as_bytes()) == stored.checksum_sha256,
         "deployment ledger checksum mismatch"
     );
-    validate_payload(&stored.payload)?;
-    Ok(Some(stored.payload))
+    let payload: LedgerPayload =
+        serde_json::from_str(stored.payload.get()).context("decode deployment ledger payload")?;
+    validate_payload(&payload)?;
+    Ok(Some(payload))
 }
 
 fn write_payload(path: &Path, payload: &LedgerPayload) -> anyhow::Result<()> {

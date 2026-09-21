@@ -1306,12 +1306,19 @@ impl LiteboxBackend {
         // process owns every litebox cell on the node and none may be running,
         // so any surviving runner is definitionally stale.
         Self::reap_orphaned_runners(&cfg.runner_bin);
-        // The guest network stack services ONE inbound connection at a time
-        // (single-listener serial re-arm); overlapping tunnel connects were
-        // accept-closed as "function closed before headers". Queue them at the
-        // tunnel's connect gate instead — a request waits microseconds rather
-        // than failing. Process-wide is correct: a node runs exactly one
-        // backend, and every function on a litebox node is a litebox guest.
+        // Litebox's own TCP accept backlog is real (up to 8 truly concurrent
+        // pending connections, litebox/src/net/mod.rs) — live packet-capture
+        // testing on fc-sanjose (2026-09-17) found the actual "function
+        // closed before headers" trigger elsewhere: the guest network stack
+        // drops its just-written response if the app closes the connection
+        // (as ours did, unconditionally, via `Connection: close`) before its
+        // poll loop flushes pending TX data to the TUN device -- fixed at the
+        // source in fluid_tunnel::server::proxy_local, which no longer asks
+        // the guest to close. This gate stays at 1 as a conservative default,
+        // not because concurrency is unsafe; raising it is a separate,
+        // deliberately unstarted follow-up (PRD `litebox-raise-connect-permits`).
+        // Process-wide is correct: a node runs exactly one backend, and every
+        // function on a litebox node is a litebox guest.
         fluid_tunnel::set_local_connect_permits(1);
         LiteboxBackend {
             cfg,
@@ -2079,18 +2086,23 @@ impl LiteboxBackend {
                 "litebox artifact GC refuses a reference with a mismatched filename: {}",
                 name.to_string_lossy()
             );
+            // Presence, never content: this loop used to SHA-256 every archive
+            // every reference names, on every publish, under `artifact_lock` --
+            // ~125 references x ~400 MB = ~50 GB, measured at ~163 s per publish
+            // on fc-sanjose (2026-09-20), so a shim change (which invalidates
+            // every app's runtime archive) queued each app's cold start behind
+            // ~2.7 minutes of hashing apiece. Content is verified where it is
+            // USED (`verify_immutable_open` at launch and at publication).
             let app_name = Self::app_archive_name(&reference.app_archive_sha256);
-            verify_immutable_open(&directories.apps, &app_name, &reference.app_archive_sha256)
-                .await?;
+            directories.apps.open_regular(&app_name).with_context(|| {
+                format!("litebox artifact GC: referenced app archive missing for {}", reference.image)
+            })?;
             keep_apps.insert(app_name);
             for runtime in reference.runtimes.values() {
                 let runtime_name = Self::runtime_archive_name(&runtime.archive_sha256);
-                verify_immutable_open(
-                    &directories.runtimes,
-                    &runtime_name,
-                    &runtime.archive_sha256,
-                )
-                .await?;
+                directories.runtimes.open_regular(&runtime_name).with_context(|| {
+                    format!("litebox artifact GC: referenced runtime archive missing for {}", reference.image)
+                })?;
                 keep_runtimes.insert(runtime_name);
             }
         }
@@ -3787,6 +3799,7 @@ fn append_litebox_runtime_augmentation_blocking(
     _deps: &[PathBuf],
     _identity: Option<&RuntimeArtifactIdentity>,
     _runtime_bin: Option<&Path>,
+    _extra_entries: &[(PathBuf, Vec<u8>)],
 ) -> anyhow::Result<()> {
     anyhow::bail!("descriptor-relative tar augmentation requires Linux openat2")
 }

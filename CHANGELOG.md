@@ -1,5 +1,150 @@
 # Changelog
 
+## 2026-09-20 — the litebox artifact GC hashed the whole cache on every publish, so a shim change took a node's apps dark for an hour
+
+Rolling the `process.title` fix to fc-sanjose changed `runtime_source_sha256`
+for every litebox app, so every app rebuilt its combined runtime archive at its
+next cold start. Each rebuild ended in `gc_artifacts_locked`, which called
+`verify_immutable_open` — a full SHA-256 — on the app archive and every runtime
+archive of every reference, under the global `artifact_lock`: ~125 references x
+~400 MB, measured as a new ~230 MB tar every 2 m 43 s in the runtimes directory.
+A cold start therefore queued behind ~163 s of hashing per app ahead of it, and
+a request that gave up (curl timeout, browser) left the queue, so
+`just-survey-bot` / `survey-botbot` answered nothing for 60/90/100/200/420 s
+probes across two binaries (rolling back re-invalidated the single-entry
+per-key cache and rebuilt everything again).
+
+The GC now checks that each referenced archive exists as a regular file and
+leaves content verification to where the bytes are used
+(`verify_immutable_open` at launch and at publication). Its blast-radius guards
+(empty keep set, max reap fraction, grace age) are unchanged.
+
+## 2026-09-19 — every Next.js app on a litebox node lost all its environment variables (`process.title` wipes `process.env`)
+
+tokenhun.shadw.app (a Next app served from fc-phoenix) answered
+`PROXY_API_KEY is not configured on the proxy server` although the variable was
+set in the project, baked into the deployment, and present in the litebox
+runner's own environment (`/proc/<pid>/environ`).
+
+Reproduced and bisected on phoenix with real litebox guests. A guest given the
+exact production environment saw all 13 variables; a plain `node -e` kept them;
+the same app driven in-process or through a custom `http` server answered 401
+(the middleware saw the key); only `next start` answered 500. Instrumenting the
+merged tar showed the guest's `process.env` already at 5 keys when `listening`
+fired, and the last step before it was `process.title = "next-server (v…)"` in
+`startServer`. In a guest, `process.title = 'x'` takes `process.env` from 12
+variables to 0: libuv's `uv_set_process_title` rewrites the argv block in
+place and litebox's initial stack keeps the environment strings inside it.
+
+Fixed in `litebox-bind-shim.js` (preloaded into every Node guest): `process.title`
+becomes a JS-only accessor and never reaches the native setter. Changing the
+shim changes `runtime_source_sha256`, so each deployment's combined runtime
+archive is rebuilt at its next launch. Verified by replacing the shim in a
+scratch guest's tar: the same `next start` went from 500 to 401 without the key
+and past the middleware with it. Any Node app that assigns `process.title`
+(PM2-style launchers, Next, Nest) was affected the same way.
+
+## 2026-09-19 — apps 15 s slow on three of four edges: `connection: keep-alive` + a bodiless response wedged the tunnel's connect gate
+
+`just-survey-bot.shadw.app` / `survey-botbot.shadw.app` (hosted on fc-sanjose)
+took 15.1–15.4 s through va, va3 and phx — three of the four round-robin DNS
+answers — and 0.1–0.6 s through sj itself. `x-hive-transport: http-direct`: the
+edge forwards over the peer's iroh trunk first, got no first byte for
+`HIVE_P2P_FIRSTBYTE_MS` (15 s), then the HTTP fallback answered in ~0.2 s.
+tcpdump on sj showed nothing carrying that Host reaching `:8787` until the
+fallback arrived; forwards to fc-phoenix over iroh took 0.25 s.
+
+Cause (mine, `eb20c76`): `fluid_tunnel::server::proxy_local` now sends
+`connection: keep-alive`, and for a response with neither `Content-Length` nor
+chunked framing it reads until EOF. A HEAD response or a 1xx/204/304 has no body
+by definition and no framing, so the read waited for a close a keep-alive
+upstream never sends — while holding `connect_gate(local_http)`, whose permit
+count is 1 on litebox nodes. One such exchange on sj sat idle for 59 minutes
+(`ss` showed the loopback socket owned by hive-cloud's own fd, `lastsnd`
+3.5 M ms) and every later peer-forwarded request queued behind it until the
+peer's first-byte timeout. Destroying just that socket (`ss -K`) restored iroh
+forwards immediately (15.2 s → 5.5 s → 0.46 s, then all four nodes 0.12–0.5 s
+for both sites).
+
+Fixed: `proxy_local` treats HEAD/1xx/204/304 as bodiless and ends the exchange
+at the head. Also added a per-candidate iroh cooldown in `edge.rs`
+(`HIVE_EDGE_IROH_COOLDOWN_MS`, 120 s): after a `PostSendTimeout` or
+`DeadPeerTimeout` the candidate goes HTTP-first and one probe request retries
+iroh, so a genuinely dead trunk costs one request 15 s instead of all of them.
+The cooldown is compiled and deployed but its branch has not been exercised
+live. The response that wedged sj was 433 bytes and was not captured, but the
+mechanism is reproduced: on phx (old code) one `HEAD /` forwarded over iroh hung
+and every following GET took 15.2 s (`http-direct`); after the fix, 6 HEADs per
+edge to the sj-hosted app took 0.04–0.16 s, GETs stayed on `iroh-p2p` at
+0.1–0.4 s, and no node held a stuck loopback exchange. HEAD is one trigger;
+204/304 are the same code path and were not reproduced.
+
+## 2026-09-18 — a managed Postgres was wiped and re-created every ~70 s because the leader's stale `simulated` copy overwrote the host's promotion
+
+`surveybot-db` (project `survey-bot-real-2`, host fc-virginia-3, created
+2026-09-09) sat at `provisioning`/`simulated` on the leader and every node.
+`spawn_db_reconcile` retries such a record ON ITS HOST: it scrubs the same-name
+container as an orphan (`podman rm -f -v`), provisions a fresh one, and promotes
+the LOCAL record to `ready`/`live`. Nothing carries that promotion back to the
+leader, and `DatabaseStore::merge_synced` lets the remote copy win every
+collision, so the next `store=databases` sync (≤60 s) put `simulated` back and
+the next reconcile tick destroyed the running database and started an empty one
+over it: 283 container create/died/remove cycles in 6 h on fc-virginia-3. Each
+cycle is also a host network-change event (see the iroh rebind finding in the
+PRD), and the leader's `connection` map stayed empty, so no `DATABASE_URL` could
+ever have been injected for it.
+
+Fixed the loop: `merge_synced` never lets a `simulated` copy overwrite a local
+`live` record with the same `created_ms` (the reconcile loop already assumed "no
+code path demotes live→simulated"; this enforces it). Verified on fc-virginia-3:
+after one last re-provision at restart the container stayed `Up 8 minutes` and
+the record stayed `ready live` with 14 connection keys through repeated syncs;
+before, a new container appeared every ~70 s (9 in 10 min). NOT fixed: the host
+still does not report its promotion to the leader, so the leader, the UI and
+env injection continue to see `provisioning` for this database.
+
+## 2026-09-18 — GuardianDB could latch itself wedged when a caller awaiting a slow init was cancelled
+
+Landed in `6ea49d7` alongside the ledger fix below (the commit tooling ignored
+the path restriction, so it carries both; the binary running on fc-phoenix was
+built before this change and contains only the ledger fix).
+
+`guardian::handle()` parks a slow init's `JoinHandle` in `INIT_INFLIGHT` so the
+next caller re-awaits the same attempt. The waiter `take()`s that handle and
+re-parked it only on the timeout branch, so a caller dropped mid-await —
+cancellation, not timeout — lost it: the slot read empty while the init kept
+running and holding its redb lock, and the next caller started a second init,
+hit `Database already open` on attempt 2 and latched the node wedged ("restart
+hive-cloud to recover"). Witnessed on shadw3: the first init had been
+re-awaited cleanly every 30 s for 25 minutes, then a second `opening iroh
+client` began 11 s after one more caller took the handle and failed 2 ms later.
+
+`InflightInit` now owns the handle while a caller awaits it and re-parks it on
+drop unless the attempt finished, so timeout and cancellation are one path.
+Compiled, not yet witnessed live on a node; why the first init sits at
+`opening 'hive-state' KV store` for 25+ minutes on shadw3's 25 GB store is a
+separate, open question.
+
+## 2026-09-18 — fc-phoenix crash-looped 21,679 times on an intact deployment ledger
+
+`DeploymentLedger::open` verified its checksum by re-serializing the decoded
+`LedgerPayload`. The integrity-chain work added `DeploymentAcceptance.
+integrity_chain` (`#[serde(default)]`, always serialized), so the 19 accepted
+entries in fc-phoenix's ledger — written by the previous binary, without the
+field — re-serialized with `"integrity_chain":[]` and hashed differently from
+what had been stored. The roll on 2026-09-18 03:03 UTC reached phoenix and the
+node panicked at `state.rs:623` on every boot from then on, restarting every
+~3 s and serving nothing. The file itself was never damaged: its stored
+checksum equals SHA-256 over the raw payload bytes exactly.
+
+Fixed: the payload is now read as an undecoded `RawValue` and the checksum is
+verified over those stored bytes; the decoded struct is only used after the
+check passes, and the file is rewritten in the new shape on the first boot that
+loads it. Verified by booting the fixed build against a copy of phoenix's real
+ledger: it loads, all 19 entries survive with an empty `integrity_chain`, and
+the rewritten file's checksum verifies over its raw bytes. A genuine mismatch
+still fails closed.
+
 ## 2026-09-03 — npm's `$PATH` entry points were never staged into the guest; fixed, but litebox has no guest-side shebang execution at all
 
 Follow-up to the same-day GNU-tar-header fix below: with `node -v` working

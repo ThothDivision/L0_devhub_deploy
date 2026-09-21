@@ -628,9 +628,8 @@ impl CloudState {
         )
         .unwrap_or_else(|error| panic!("deployment ledger failed closed: {error:#}"));
         let integrity_signer = Arc::new(
-            crate::integrity_signer::IntegritySigner::open_or_create(&node_name).unwrap_or_else(
-                |error| panic!("integrity signing key failed closed: {error:#}"),
-            ),
+            crate::integrity_signer::IntegritySigner::open_or_create(&node_name)
+                .unwrap_or_else(|error| panic!("integrity signing key failed closed: {error:#}")),
         );
         let runtime_artifact_transfer = crate::runtime_artifact_transfer::TransferService::open(
             crate::persist::data_dir().join("runtime-artifacts-v1"),

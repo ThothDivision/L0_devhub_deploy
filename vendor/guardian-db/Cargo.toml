@@ -476,8 +476,10 @@ version = "1.8"
 version = "0.13.3"
 
 [patch.crates-io]
+iroh = { path = "../iroh" }
 iroh-blobs = { path = "iroh-blobs" }
 iroh-docs = { path = "iroh-docs" }
+iroh-mdns-address-lookup = { path = "iroh-mdns-address-lookup" }
 
 [dev-dependencies.base64]
 version = "0.22.1"

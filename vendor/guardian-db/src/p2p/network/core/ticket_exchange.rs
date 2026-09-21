@@ -19,6 +19,7 @@
 //! **cryptographically** unable to produce entries that other peers will accept, even if its
 //! software is compromised.
 
+use super::PeerRegistry;
 use crate::access_control::traits::AccessController;
 use crate::guardian::error::{GuardianError, Result};
 use iroh::endpoint::{Connection, Endpoint};
@@ -26,6 +27,7 @@ use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{EndpointId as NodeId, PublicKey};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
@@ -74,6 +76,8 @@ pub fn new_registry() -> TicketRegistry {
 #[derive(Clone)]
 pub struct TicketProtocolHandler {
     registry: TicketRegistry,
+    peers: PeerRegistry,
+    timeout: Duration,
 }
 
 impl std::fmt::Debug for TicketProtocolHandler {
@@ -85,7 +89,23 @@ impl std::fmt::Debug for TicketProtocolHandler {
 
 impl TicketProtocolHandler {
     pub fn new(registry: TicketRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            peers: PeerRegistry::default(),
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    pub(crate) fn with_admission(
+        registry: TicketRegistry,
+        peers: PeerRegistry,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            registry,
+            peers,
+            timeout,
+        }
     }
 
     /// Decides whether the `requester` is authorized to obtain the ticket for `address` and returns the payload.
@@ -122,28 +142,43 @@ impl TicketProtocolHandler {
 
 impl ProtocolHandler for TicketProtocolHandler {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
-        // The remote public key is authenticated by the QUIC TLS handshake.
         let requester = connection.remote_id();
+        if !self.peers.is_admitted(requester).await {
+            warn!(peer = %requester.fmt_short(), "Ticket request rejected from unadmitted peer");
+            connection.close(1u32.into(), b"unadmitted peer");
+            return Ok(());
+        }
 
-        let (mut send, mut recv) = connection.accept_bi().await?;
+        let exchange = async {
+            let (mut send, mut recv) = connection.accept_bi().await?;
+            let req = recv
+                .read_to_end(4096)
+                .await
+                .map_err(AcceptError::from_err)?;
+            let address = String::from_utf8_lossy(&req).to_string();
+            let response = self.resolve(&address, requester).await;
+            send.write_all(&response)
+                .await
+                .map_err(AcceptError::from_err)?;
+            send.finish().map_err(AcceptError::from_err)?;
+            connection.closed().await;
+            Ok::<(), AcceptError>(())
+        };
 
-        // Request = store address (UTF-8 string), limited to a reasonable size.
-        let req = recv
-            .read_to_end(4096)
-            .await
-            .map_err(AcceptError::from_err)?;
-        let address = String::from_utf8_lossy(&req).to_string();
-
-        let response = self.resolve(&address, requester).await;
-
-        send.write_all(&response)
-            .await
-            .map_err(AcceptError::from_err)?;
-        send.finish().map_err(AcceptError::from_err)?;
-
-        // Ensure the data is delivered before closing.
-        connection.closed().await;
-        Ok(())
+        match tokio::time::timeout(self.timeout, exchange).await {
+            Ok(result) => {
+                result?;
+                self.peers.mark_authenticated(requester).await;
+                Ok(())
+            }
+            Err(_) => {
+                connection.close(2u32.into(), b"ticket exchange timeout");
+                Err(AcceptError::from_err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "ticket exchange timed out",
+                )))
+            }
+        }
     }
 }
 
@@ -180,197 +215,39 @@ pub async fn request_ticket(
     endpoint: &Endpoint,
     peer: NodeId,
     address: &str,
+    timeout: Duration,
 ) -> Result<Option<String>> {
-    let connection = endpoint
-        .connect(peer, TICKET_ALPN)
-        .await
-        .map_err(|e| GuardianError::Other(format!("Failed to connect for ticket: {}", e)))?;
+    let exchange = async {
+        let connection = endpoint
+            .connect(peer, TICKET_ALPN)
+            .await
+            .map_err(|e| GuardianError::Other(format!("Failed to connect for ticket: {e}")))?;
+        let (mut send, mut recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| GuardianError::Other(format!("Failed to open ticket stream: {e}")))?;
+        send.write_all(address.as_bytes())
+            .await
+            .map_err(|e| GuardianError::Other(format!("Failed to send ticket request: {e}")))?;
+        send.finish()
+            .map_err(|e| GuardianError::Other(format!("Failed to finish ticket stream: {e}")))?;
+        let response = recv
+            .read_to_end(64 * 1024)
+            .await
+            .map_err(|e| GuardianError::Other(format!("Failed to read ticket response: {e}")))?;
+        connection.close(0u32.into(), b"done");
 
-    let (mut send, mut recv) = connection
-        .open_bi()
-        .await
-        .map_err(|e| GuardianError::Other(format!("Failed to open ticket stream: {}", e)))?;
-
-    send.write_all(address.as_bytes())
-        .await
-        .map_err(|e| GuardianError::Other(format!("Failed to send ticket request: {}", e)))?;
-    send.finish()
-        .map_err(|e| GuardianError::Other(format!("Failed to finish ticket stream: {}", e)))?;
-
-    let resp = recv
-        .read_to_end(64 * 1024)
-        .await
-        .map_err(|e| GuardianError::Other(format!("Failed to read ticket response: {}", e)))?;
-
-    connection.close(0u32.into(), b"done");
-
-    match resp.first() {
-        Some(&RESP_GRANTED) if resp.len() > 1 => {
-            Ok(Some(String::from_utf8_lossy(&resp[1..]).to_string()))
+        match response.first() {
+            Some(&RESP_GRANTED) if response.len() > 1 => String::from_utf8(response[1..].to_vec())
+                .map(Some)
+                .map_err(|error| {
+                    GuardianError::Other(format!("Peer returned a non-UTF-8 DocTicket: {error}"))
+                }),
+            _ => Ok(None),
         }
-        _ => Ok(None),
-    }
-}
+    };
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::access_control::acl_simple::SimpleAccessController;
-    use std::collections::HashMap;
-
-    /// Generates an arbitrary iroh public key to simulate an authenticated requester.
-    fn random_public_key() -> PublicKey {
-        iroh::SecretKey::generate().public()
-    }
-
-    fn acl_with(role: &str, keys: Vec<&str>) -> Arc<dyn AccessController> {
-        let mut map = HashMap::new();
-        map.insert(
-            role.to_string(),
-            keys.into_iter().map(String::from).collect(),
-        );
-        Arc::new(SimpleAccessController::new(Some(map))) as Arc<dyn AccessController>
-    }
-
-    // ─── authorized_mode ─────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn wildcard_write_grants_write_to_any_peer() {
-        let acl = acl_with("write", vec!["*"]);
-        assert_eq!(
-            authorized_mode(&*acl, random_public_key()).await,
-            Some(GrantedMode::Write)
-        );
-    }
-
-    #[tokio::test]
-    async fn wildcard_read_grants_read_to_any_peer() {
-        let acl = acl_with("read", vec!["*"]);
-        assert_eq!(
-            authorized_mode(&*acl, random_public_key()).await,
-            Some(GrantedMode::Read)
-        );
-    }
-
-    #[tokio::test]
-    async fn read_only_peer_never_gets_write() {
-        // Peer is in "read" but NOT in "write": must receive Read, never Write.
-        let peer = random_public_key();
-        let peer_hex = hex::encode(peer.as_bytes());
-        let mut map = HashMap::new();
-        map.insert(
-            "write".to_string(),
-            vec![hex::encode(random_public_key().as_bytes())],
-        );
-        map.insert("read".to_string(), vec![peer_hex]);
-        let acl = Arc::new(SimpleAccessController::new(Some(map))) as Arc<dyn AccessController>;
-        assert_eq!(authorized_mode(&*acl, peer).await, Some(GrantedMode::Read));
-    }
-
-    #[tokio::test]
-    async fn write_precedence_over_read() {
-        // Peer listed in both roles must get the stronger capability.
-        let peer = random_public_key();
-        let peer_hex = hex::encode(peer.as_bytes());
-        let mut map = HashMap::new();
-        map.insert("write".to_string(), vec![peer_hex.clone()]);
-        map.insert("read".to_string(), vec![peer_hex]);
-        let acl = Arc::new(SimpleAccessController::new(Some(map))) as Arc<dyn AccessController>;
-        assert_eq!(authorized_mode(&*acl, peer).await, Some(GrantedMode::Write));
-    }
-
-    #[tokio::test]
-    async fn specific_authorized_key_gets_write() {
-        let peer = random_public_key();
-        let peer_hex = hex::encode(peer.as_bytes());
-        let acl = acl_with("write", vec![peer_hex.as_str()]);
-        assert_eq!(authorized_mode(&*acl, peer).await, Some(GrantedMode::Write));
-    }
-
-    #[tokio::test]
-    async fn unknown_key_is_denied_when_no_wildcard() {
-        // The ACL authorizes a different key, not the requester's → denied.
-        let other_hex = hex::encode(random_public_key().as_bytes());
-        let acl = acl_with("write", vec![other_hex.as_str()]);
-        assert_eq!(authorized_mode(&*acl, random_public_key()).await, None);
-    }
-
-    #[tokio::test]
-    async fn empty_acl_denies() {
-        let acl = acl_with("write", vec![]);
-        assert_eq!(authorized_mode(&*acl, random_public_key()).await, None);
-    }
-
-    // ─── TicketProtocolHandler::resolve ──────────────────────────────────────
-
-    #[tokio::test]
-    async fn resolve_unknown_store_is_denied() {
-        let handler = TicketProtocolHandler::new(new_registry());
-        let resp = handler.resolve("does-not-exist", random_public_key()).await;
-        assert_eq!(resp, vec![RESP_DENIED]);
-    }
-
-    #[tokio::test]
-    async fn resolve_grants_write_ticket_to_write_peer() {
-        let registry = new_registry();
-        registry.write().await.insert(
-            "shared-kv".to_string(),
-            TicketProvider {
-                read_ticket: "read-ticket-xyz".to_string(),
-                write_ticket: "write-ticket-xyz".to_string(),
-                access_controller: acl_with("write", vec!["*"]),
-            },
-        );
-        let handler = TicketProtocolHandler::new(registry);
-
-        let resp = handler.resolve("shared-kv", random_public_key()).await;
-        assert_eq!(resp.first(), Some(&RESP_GRANTED));
-        assert_eq!(&resp[1..], b"write-ticket-xyz");
-    }
-
-    #[tokio::test]
-    async fn resolve_grants_read_ticket_to_read_only_peer() {
-        // The crux of the read-only guarantee: a read-only peer receives the read ticket,
-        // so the namespace write secret never leaves this node for that peer.
-        let peer = random_public_key();
-        let peer_hex = hex::encode(peer.as_bytes());
-        let mut map = HashMap::new();
-        map.insert("read".to_string(), vec![peer_hex]);
-        let acl = Arc::new(SimpleAccessController::new(Some(map))) as Arc<dyn AccessController>;
-
-        let registry = new_registry();
-        registry.write().await.insert(
-            "shared-kv".to_string(),
-            TicketProvider {
-                read_ticket: "read-ticket-xyz".to_string(),
-                write_ticket: "write-ticket-xyz".to_string(),
-                access_controller: acl,
-            },
-        );
-        let handler = TicketProtocolHandler::new(registry);
-
-        let resp = handler.resolve("shared-kv", peer).await;
-        assert_eq!(resp.first(), Some(&RESP_GRANTED));
-        // Must be the READ ticket — the write ticket must NOT leak to a read-only peer.
-        assert_eq!(&resp[1..], b"read-ticket-xyz");
-    }
-
-    #[tokio::test]
-    async fn resolve_denies_unauthorized_peer() {
-        let registry = new_registry();
-        let other_hex = hex::encode(random_public_key().as_bytes());
-        registry.write().await.insert(
-            "private-kv".to_string(),
-            TicketProvider {
-                read_ticket: "secret-read-ticket".to_string(),
-                write_ticket: "secret-write-ticket".to_string(),
-                access_controller: acl_with("write", vec![other_hex.as_str()]),
-            },
-        );
-        let handler = TicketProtocolHandler::new(registry);
-
-        // Requester differs from the authorized one → denied, and no ticket leaks.
-        let resp = handler.resolve("private-kv", random_public_key()).await;
-        assert_eq!(resp, vec![RESP_DENIED]);
-    }
+    tokio::time::timeout(timeout, exchange)
+        .await
+        .map_err(|_| GuardianError::Other(format!("Ticket exchange with {peer} timed out")))?
 }

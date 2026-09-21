@@ -1581,6 +1581,14 @@ The exchange itself (bn-browser-fleet-crr-exchange, landed):
 - **The coordinator stamps `target` before fanout** whenever it can resolve
   the environment; remote nodes must never classify against their own
   node-local `production_branch` (never forwarded, and historically wiped).
+- **The deployment ledger's checksum is verified over the payload bytes AS
+  STORED (`RawValue`), never over a re-serialization of the decoded struct.**
+  Re-serializing makes every field added anywhere in the payload, even a
+  `#[serde(default)]` one, change the bytes, so the previous binary's ledger
+  fails closed on the next (fc-phoenix, 2026-09-18: 21,679 crash-loop restarts
+  on an intact file). A ledger rewritten with `integrity_chain` should be
+  expected to fail a binary that predates that field: never roll a node back
+  past it. Detail: `recall("deployment-ledger-checksum-raw-bytes")`.
 
 ## Compose published ports (`ports: ["9000:9000"]`)
 

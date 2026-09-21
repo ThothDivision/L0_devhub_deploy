@@ -108,12 +108,7 @@ impl GuardianRelationalStorage {
     pub async fn warm_values(&self) -> GuardianResult<usize> {
         let all: AsyncDocumentFilter = Box::pin(|_document: &Document| {
             Box::pin(async { Ok(true) })
-                as Pin<
-                    Box<
-                        dyn Future<Output = Result<bool, Box<dyn Error + Send + Sync>>>
-                            + Send,
-                    >,
-                >
+                as Pin<Box<dyn Future<Output = Result<bool, Box<dyn Error + Send + Sync>>> + Send>>
         });
         Ok(self.store.query(all).await?.len())
     }
