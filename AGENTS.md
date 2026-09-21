@@ -539,6 +539,18 @@ releases).
   leader's listener and the public round-robin host: 101, first frame is the
   prompt, `TERM_OK_42` before the next prompt, `{"type":"exited",
   "exit_code":0}` on `exit`.
+- **The shell rc also answers "command not found" WITHOUT forking
+  (`litebox-shellrc.sh`, an `extdebug` DEBUG trap running `command -v` in the
+  parent).** Interactive bash forks before it looks a command up, and under
+  litebox's fork emulation that child dies `Fatal error: glibc detected an
+  invalid stdio handle` and wedges the session (`ifconfig`, 2026-09-22) — so a
+  command that is not staged must never reach bash's own not-found path. Keep
+  the guard's failure direction safe: it only skips a command it PROVED absent
+  (`command -v` empty), leaves quoted/expanded first words alone, and is
+  installed only when `$BASH_VERSION` is set and `/dev/null` is a char device.
+  It does not cover `sh -c` (no rc is read; adding a trap there also defeats
+  bash's exec-the-last-command optimization) and it does NOT fix the second
+  external command wedging the session (`litebox-fork-child-corruption`).
 - **A TUN device has ONE owner, so every exec and shell runner gets its
   own link; the cell's provision-time link serves only the function
   process.** litebox attaches with `TUNSETIFF`, and a second runner on the

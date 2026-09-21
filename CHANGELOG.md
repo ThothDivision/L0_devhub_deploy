@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-09-22 — a command the sandbox terminal cannot find wedged the whole session (`glibc detected an invalid stdio handle`)
+
+Typing `ifconfig` (or any command not staged into the guest tar: `ip`, `ping`,
+`curl`, `vi`, `less`, `ps`, …) in a dashboard sandbox terminal on a litebox node
+printed `Fatal error: glibc detected an invalid stdio handle` and
+`sh: [pid: 1 (255)] tcsetattr: Inappropriate ioctl for device`, after which the
+session answered nothing. Reproduced on fc-sanjose through the real shell
+websocket. Interactive bash forks BEFORE it looks a command up (so it can
+redirect the error), and under litebox's fork emulation that child dies on its
+first stdio use; the shell never recovers.
+
+The staged `ENV` rc (`litebox-shellrc.sh`, was one line `exec 2>&1`) now also
+installs an `extdebug` DEBUG trap that checks the command word with
+`command -v` in the PARENT and prints `sh: <cmd>: command not found` there — no
+fork, no fatal. Leading `VAR=value` words are skipped over; builtins, keywords,
+functions, `[[`, `((`, `cd`, `for`/`if` bodies are untouched. Witnessed on a
+scratch runner on va (11 command forms, including `FOO=1 nothere`,
+`echo a; nothere; echo b`) and live on fc-sanjose (`ifconfig` and `nothere` →
+"command not found", `id` and `echo` still work, `exit` → exit_code 0). Known
+limits: a skipped command leaves `$?` at 0, a quoted/expanded first word is not
+checked, and the one-shot `sh -c` exec path is unchanged. NOT fixed here: any
+SECOND external command in a session still wedges it (the native-Linux fork
+emulation bug, `litebox-fork-child-corruption`); under investigation.
+
 ## 2026-09-22 — laptop `fc-lax3` dead for 59 h (launchd could not spawn it) and four dev/Mac nodes running without a trust list
 
 The mesh's `fc-lax3` is the laptop's `dev.shadw.fc-lax` job. It had been dead

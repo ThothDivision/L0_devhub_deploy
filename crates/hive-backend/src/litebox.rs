@@ -3867,8 +3867,21 @@ const SHELL_GUEST_PROGRAMS: &[&str] = &[
 /// runner exit 101, measured 2026-09-02) instead of the silent ENOENT a
 /// missing directory gives. `HISTFILE` is cleared for the same reason.
 const SHELL_RC_GUEST_PATH: &str = "/usr/share/hive/shellrc";
+/// `litebox-shellrc.sh`: the stderr move above PLUS a no-fork "command not
+/// found" guard. Interactive bash forks BEFORE it looks a command up (so the
+/// error can be redirected), and under the litebox fork emulation that child
+/// dies `Fatal error: glibc detected an invalid stdio handle`, after which the
+/// session prints nothing (witnessed 2026-09-22 with `ifconfig` in a dashboard
+/// sandbox terminal on fc-sanjose). The rc installs an `extdebug` DEBUG trap
+/// that checks the command word with `command -v` in the PARENT and answers
+/// `sh: <cmd>: command not found` there. Known limits, all deliberate: a
+/// skipped command leaves `$?` at 0 (`extdebug` semantics), commands whose
+/// first word is quoted/expanded (`"$x"`, `$EDITOR`) are not checked, and it
+/// does nothing for `sh -c` runs (no rc is read) or for any second EXTERNAL
+/// command that DOES exist (the separate fork bug in `litebox-fork-child-
+/// corruption`).
 #[cfg(target_os = "linux")]
-const SHELL_RC_BYTES: &[u8] = b"exec 2>&1\n";
+const SHELL_RC_BYTES: &[u8] = include_bytes!("litebox-shellrc.sh");
 
 const SHELL_GUEST_OPTIONAL_PROGRAMS: &[&str] = &[
     "/usr/bin/uname",
