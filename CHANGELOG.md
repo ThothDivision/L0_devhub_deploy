@@ -1,5 +1,27 @@
 # Changelog
 
+## 2026-09-22 — laptop `fc-lax3` dead for 59 h (launchd could not spawn it) and four dev/Mac nodes running without a trust list
+
+The mesh's `fc-lax3` is the laptop's `dev.shadw.fc-lax` job. It had been dead
+since 2026-09-19 01:01 with `last exit code = 78: EX_CONFIG`, 21,500 spawn
+attempts, and this repo's watchdog kickstarting it every minute:
+`launchd: Service could not initialize: Unable to get updated LWCR` (the
+launch-constraint record went stale after the debug binary was rebuilt). The
+same binary ran fine when launched by hand; `bootout` + `bootstrap` of the same
+plist cured it. `scripts/shadw-watchdog.sh` now detects `last exit code = 78`
+in its down branch and re-registers the plist instead of kickstarting forever.
+
+Separately, `shadw2`, `shadw3`, `fc-lax` and `fc-lax2` carried no
+`HIVE_TRUSTED_NODE_IDS` / `HIVE_PEER_TRUST` (`shadw1` did and was healthy), so
+they rejected every mutating gossip (`no verified+trusted signer`, 257 in 3000
+log lines on shadw2), saw `control-plane owner chain has NO eligible entry`
+(1915 of 3000 lines) and reported `expected_peers` 0-7 against the fleet's 26 —
+"connectivity issues" that were configuration. `fc-lax`/`fc-lax2` also still had
+bare-id bootstrap seeds and the dead `http://<ip>:3340` relay form. All four now
+have the 27-id fleet trust list (plists backed up as `*.bak-trust-*` /
+`*.bak-mesh-*`), `https://*.relay.shadw.app:3343` relays and addressed bootstrap
+peers, and report `expected_peers` 26-28 with 6-9 visible healthy peers.
+
 ## 2026-09-22 — a failed iroh rebind was never retried: fc-sanjose sat mesh-dark for 28 hours
 
 `fc-sanjose` (control-plane leader) reported `isolated: true`, zero direct peers,
