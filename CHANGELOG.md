@@ -1,5 +1,44 @@
 # Changelog
 
+## 2026-09-22 — litebox `fork()` root-caused and fixed: a second external command no longer wedges a sandbox shell
+
+The wedge behind the `ifconfig` report was not the not-found path: on a native
+Linux runner a plain `fork()` took `do_clone`'s eager copy of the guest's writable
+memory at RELOCATED host addresses, run on a second host thread. Only registers,
+the TCB pointer, a 4 KB stack window and a few ELF data words are patched;
+everything else in the copy (RELRO/`.got`/`.data.rel.ro`/stdio vtables — Rocky's
+bash is full-RELRO — and the whole heap) still points into the parent. The child ran a
+mix of its own and the parent's libc and rewrote the parent's `_rtld_global` stack
+lists, malloc and stdio state. gdb evidence: `_IO_vtable_check` failing in the child
+with `rip` in the PARENT's libc (`glibc detected an invalid stdio handle`), and the
+second child spinning in `__libc_fork`'s inlined `reclaim_stacks` walk over the
+list the first child had corrupted.
+
+`ansible/roles/litebox/files/fork-inplace.patch` (applied after `networking.patch`;
+`litebox_shim_linux` only, 180 lines) runs a plain `fork()` of a single-threaded
+caller in place, vfork-style (caller suspended until the child execs or exits, no
+relocation, writable memory restored from a snapshot afterwards); multi-threaded
+callers (Node) keep the old path. It also fixes `sys_brk` (a `brk` that cannot be
+satisfied answers the unchanged break, not `-ENOMEM`) and serves syscalls at the
+rewriter's `icebp; hlt` trap sites through the shim (they killed `head` in 25-30% of
+`ls | head` runs). Matrix on a scratch runner on va: pin runner wedges after the first
+command; the fixed release runner (`cdb25f95`) passes `id`,`id`,`uname -a`, a
+not-found command through bash's own path, `ls / | head -2`, `v=$(echo hi)`, `id -u`
+(100-iteration loops of the pipeline cases, 20 of the rest, all clean). Live on
+fc-sanjose through the real dashboard shell and one-shot exec paths: `id`,`id`,
+`uname -a`, pipelines, command substitution, `node -v` + `node -e` in one session,
+`sh -c 'ifconfig; id; nothere2; echo end'` (was fatal), all correct. Installed as
+`/usr/local/bin/litebox-runner` on fc-phoenix and fc-sanjose (old ones kept beside
+it); tokenhun (a Next guest) cold-started on it and answers 200.
+
+Known limits (documented in PATCHES.md): the parent is suspended until the child
+execs or exits, so a non-exec child that needs the parent deadlocks (`$(...)` of more
+than 64 KiB written by builtins); `(sleep 1; echo x) & echo y` prints `x` first; O(RSS)
+per fork. The `litebox-shellrc.sh` no-fork guard from the same day stays until every
+litebox node runs this runner. Also found: rolling a hive-node restart leaves the
+old litebox runners running as orphans (ppid 1, ~50% CPU each on phx) alongside the
+duplicates the new process starts — two killed by hand on phx, PRD row open.
+
 ## 2026-09-22 — a command the sandbox terminal cannot find wedged the whole session (`glibc detected an invalid stdio handle`)
 
 Typing `ifconfig` (or any command not staged into the guest tar: `ip`, `ping`,

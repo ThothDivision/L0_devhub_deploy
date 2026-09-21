@@ -549,8 +549,13 @@ releases).
   (`command -v` empty), leaves quoted/expanded first words alone, and is
   installed only when `$BASH_VERSION` is set and `/dev/null` is a char device.
   It does not cover `sh -c` (no rc is read; adding a trap there also defeats
-  bash's exec-the-last-command optimization) and it does NOT fix the second
-  external command wedging the session (`litebox-fork-child-corruption`).
+  bash's exec-the-last-command optimization). It is a BELT for runners without
+  `ansible/roles/litebox/files/fork-inplace.patch`: the wedge itself (a second
+  external command, any not-found command) was the native-Linux `fork()` copying
+  the guest's memory at relocated addresses and running the child on a mix of
+  its own and the parent's libc (`litebox-fork-child-corruption`); a runner built
+  with that patch forks in place and needs no guard. Drop the rc guard once every
+  litebox node runs the patched runner (`$?` would then be 127 again).
 - **A TUN device has ONE owner, so every exec and shell runner gets its
   own link; the cell's provision-time link serves only the function
   process.** litebox attaches with `TUNSETIFF`, and a second runner on the
