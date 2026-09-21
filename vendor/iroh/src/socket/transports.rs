@@ -678,6 +678,21 @@ impl NetworkChangeSender {
         }
     }
 
+    /// Rebinds ONLY the IP transports a previous rebind left closed, leaving
+    /// healthy sockets untouched. Returns `Ok(())` when none is closed.
+    pub(crate) fn rebind_closed(&self) -> std::io::Result<()> {
+        let mut res = Ok(());
+
+        #[cfg(not(wasm_browser))]
+        for transport in self.ip.iter().filter(|transport| transport.is_closed()) {
+            if let Err(err) = transport.rebind() {
+                res = Err(err);
+            }
+        }
+
+        res
+    }
+
     /// Rebinds underlying connections, if necessary.
     pub(crate) fn rebind(&self) -> std::io::Result<()> {
         let mut res = Ok(());

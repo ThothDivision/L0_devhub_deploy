@@ -1,5 +1,33 @@
 # Changelog
 
+## 2026-09-22 — a failed iroh rebind was never retried: fc-sanjose sat mesh-dark for 28 hours
+
+`fc-sanjose` (control-plane leader) reported `isolated: true`, zero direct peers,
+and ~25 `netwatch::udp: socket closed` warnings per second. The first failure was
+`iroh::socket: failed to rebind transports: Os { code: 98, kind: AddrInUse }` at
+2026-09-20 22:44:24 +08, seconds after a minecraft cell's podman
+died/remove/create. `netwatch` drops the old UDP socket BEFORE binding the new
+one, and iroh only logged the failure: the transport stayed closed until the
+next major link change happened to rebind it (the v4 socket came back 11 h
+later, v6 17 h later). With `HIVE_IROH_PORT` pinned, the bind fails whenever a
+concurrently forking child (podman, conmon, git ls-remote polls, litebox
+runners) still holds its copy of the old fd between `fork()` and `exec()` —
+long on a host at load 20-39. A restart reproduced it 20 s after boot
+(19:29:06Z). `meshwatch` never restarted it: the live fleet is 5-6 peers, below
+the `expected/4 = 6` floor its `ever_converged` guard needs, and the continuous
+trigger reset on every one-tick blip to 2-6 peers.
+
+`vendor/iroh` now retries: a failed rebind arms `PendingRebind` (250 ms
+doubling to 5 s, unbounded), each attempt rebinds only the transports still
+closed and, on success, runs the relay check, DNS reset, re-STUN and QUIC
+notification the link-change handler skipped. Witnessed with a deterministic
+scratch node in its own netns on va: a duplicate of the iroh UDP fd is taken
+with `pidfd_getfd`, a dummy link forces a major change (rebind fails
+EADDRINUSE on the v4 socket), then the duplicate is closed. The pre-patch
+binary was still unbound 9 s later; the patched binary retried at +0.25/+0.5/+1 s
+and re-bound `0.0.0.0` 0.5 s after the release (`transport rebind recovered`).
+The `meshwatch` small-fleet floor is a separate open row.
+
 ## 2026-09-20 — the litebox artifact GC hashed the whole cache on every publish, so a shim change took a node's apps dark for an hour
 
 Rolling the `process.title` fix to fc-sanjose changed `runtime_source_sha256`

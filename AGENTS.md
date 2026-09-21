@@ -109,6 +109,16 @@ history).
   from the drop line itself. `vendor/` IS synced by the fanout role, so a
   vendored edit made while a roll is between its sync and its build ships
   in that roll — edit vendored crates only between rolls.
+- **A failed iroh rebind must be RETRIED, never left for the next link change
+  (`vendor/iroh` patch "retry a failed rebind").** netwatch closes the old UDP
+  socket before binding the new one, so `failed to rebind ... AddrInUse` (a
+  forked child still holds the old fd, common at load with a pinned
+  `HIVE_IROH_PORT`) leaves the transport Closed — fc-sanjose sat mesh-dark 28 h
+  (`netwatch::udp: socket closed` ~25/s, `isolated: true`). `PendingRebind`
+  retries the closed sockets every 250 ms→5 s. Diagnose from `ss -uanp "sport =
+  :11204"` (no hive-cloud socket = closed) and the journal's `failed to rebind`
+  / `transport rebind recovered` pair; `meshwatch` will NOT catch it on a
+  5-6 peer fleet (open PRD `meshwatch-blind-on-small-live-fleet`).
 
 ## Address lookup: a node can only re-learn an address from a peer it can reach
 
