@@ -1137,6 +1137,27 @@ async fn run_guardian_gc_once(
     Ok(finish(report))
 }
 
+/// GuardianDB's own iroh endpoint's TLS crypto provider: aws-lc-rs with
+/// `X25519MLKEM768` (hybrid classical+ML-KEM-768) first in the key-exchange
+/// list, so it is the group offered in the initial ClientHello. Mirrors
+/// `hive_p2p::pq_hybrid_crypto_provider` (crates/hive-p2p/src/lib.rs)
+/// bit-for-bit — same reasoning (presets prefer plain ring whenever both
+/// `tls-ring`/`tls-aws-lc-rs` are compiled in, which they are workspace-wide;
+/// an explicit list rather than trusting `default_provider()`'s own ordering,
+/// which depends on rustls's `prefer-post-quantum` cargo feature happening to
+/// be feature-unified on). A peer that cannot speak `X25519MLKEM768` still
+/// completes a handshake via automatic classical fallback (X25519).
+fn guardian_pq_hybrid_crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![
+        rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+        rustls::crypto::aws_lc_rs::kx_group::X25519,
+        rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+        rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+    ];
+    std::sync::Arc::new(provider)
+}
+
 /// Build a self-hosted relay map from `HIVE_RELAY_URLS` (comma-separated relay
 /// URLs). Returns `None` when unset/empty, in which case the caller keeps
 /// n0's default relay behavior. Mirrors hive-p2p's identical
@@ -2246,8 +2267,18 @@ impl IrohBackend {
         // `bind_full()` (crates/hive-p2p/src/lib.rs) — n0's DNS + Pkarr discovery stays active
         // (unaffected by `.relay_mode()`), so peer address resolution is unchanged; only the
         // relayed-data-path / hole-punch-assist fallback moves onto hive's own mesh relays.
-        let mut endpoint_builder =
-            Endpoint::builder(iroh::endpoint::presets::N0).secret_key(self.secret_key.clone());
+        let mut endpoint_builder = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(self.secret_key.clone())
+            // Explicit provider override, same reasoning and same construction
+            // as `hive_p2p::pq_hybrid_crypto_provider` (crates/hive-p2p/src/
+            // lib.rs) -- the `N0` preset above already picked plain `ring`
+            // (classical-only key exchange) the moment it ran, because both
+            // `tls-ring` and `tls-aws-lc-rs` are compiled in workspace-wide;
+            // this call is the only thing that actually selects aws-lc-rs
+            // with `X25519MLKEM768` offered first. Kept as a duplicated few
+            // lines rather than a cross-crate call: guardian-db is vendored
+            // and does not otherwise depend on hive-p2p.
+            .crypto_provider(guardian_pq_hybrid_crypto_provider());
         let raw_relay_env = std::env::var("HIVE_RELAY_URLS").ok();
         tracing::info!(raw_relay_env = ?raw_relay_env, "guardian init: about to bind endpoint");
         if let Some(map) = hive_relay_map_from_env() {

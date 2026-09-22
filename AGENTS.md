@@ -738,6 +738,32 @@ releases).
   rebuilding the changed crate. If a just-rolled node still runs old behavior,
   `touch` the synced sources before rebuilding.
 
+## Post-quantum mesh transport (hybrid X25519MLKEM768)
+
+- **The mesh QUIC transport offers hybrid PQ key exchange first; transport
+  IDENTITY stays classical.** `hive_p2p::bind_full` and GuardianDB's own
+  separate endpoint (`vendor/guardian-db/.../core/mod.rs`) both explicitly
+  call `.crypto_provider(...)` with `kx_groups = [X25519MLKEM768, X25519,
+  SECP256R1, SECP384R1]` — mandatory, never optional: iroh's `N0`/`Minimal`
+  presets prefer plain `ring` (zero PQ) whenever both `tls-ring` and
+  `tls-aws-lc-rs` are compiled in, which they now always are workspace-wide
+  (Cargo feature unification). `hive_p2p::pq_kex_stats()` /
+  `GET /v1/relay`'s `pq_kex` block report the REAL negotiated group per
+  connection (`noq_proto::crypto::rustls::HandshakeData`) — never infer PQ
+  protection from a config flag. A peer that cannot speak MLKEM768 (an
+  unrolled binary, or `hive-browser`, permanently `tls-ring`-only —
+  aws-lc-rs's C cryptography has no `wasm32-unknown-unknown` target) still
+  connects via automatic TLS group fallback, live-verified both directions
+  (hybrid↔hybrid and forced-classical↔hybrid) with `crates/hive-p2p/src/
+  bin/p2p_demo.rs`. **Never claim "ML-DSA transport identity" or "post-
+  quantum identity" anywhere** — `iroh::EndpointId` is still a 32-byte
+  ed25519 key; ML-KEM is key-exchange only. Public dashboard/API HTTPS, DB
+  gateway TLS and the relay binaries' own outer TLS stay on the process-wide
+  `ring` default (`rustls::crypto::ring::default_provider().install_default()`
+  in main.rs/acme.rs) — deliberately, for external-client compatibility, not
+  an oversight. Full reasoning: `docs/security-architecture-audit-2026-09-22.md`,
+  `docs/pqc-migration-scope.md`.
+
 ## Geo-DNS (Seer)
 
 - **The delegation boundary is the whole story.** `shadw.app`/`shadw.cloud` are

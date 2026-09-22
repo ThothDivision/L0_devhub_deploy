@@ -568,6 +568,80 @@ pub fn verify_stats() -> (u64, u64, u64, u64, u64, u64) {
     )
 }
 
+/// Per-connection post-quantum key-exchange counters, surfaced via `/v1/relay`
+/// (mirrors `VerifyStats`'s shape) — the SOLE source of truth for whether a
+/// trunk actually negotiated hybrid PQ key exchange. Deliberately NOT derived
+/// from any config/env flag: `bind_full` offering `X25519MLKEM768` first does
+/// not prove a given peer accepted it (an old binary, or the browser build —
+/// `crates/hive-browser` stays `tls-ring`-only, aws-lc-rs is a C/BoringSSL
+/// library with no realistic wasm32 target — falls back to classical, by
+/// design, silently, as TLS group negotiation always has). Every count here
+/// comes from `noq_proto::crypto::rustls::HandshakeData::negotiated_key_exchange_group`,
+/// read back off the ACTUAL completed handshake on both the accept path
+/// (`serve_tunnels_full`) and the one place `PeerPool` mints a genuinely NEW
+/// trunk (`PeerPool::acquire`'s fresh-dial success branch) — never on a reused
+/// trunk, so this counts distinct handshakes, not requests.
+#[derive(Default)]
+pub struct PqKexStats {
+    /// A hybrid PQ group (X25519MLKEM768 or another ML-KEM combination) was
+    /// negotiated. This is a KEY-EXCHANGE property only — it says nothing
+    /// about the peer's identity, which stays classical Ed25519 regardless
+    /// (`docs/pqc-migration-scope.md` Phase 1/2, not implemented).
+    pub hybrid_pq: AtomicU64,
+    /// A classical-only group (X25519/SECP256R1/SECP384R1) was negotiated —
+    /// the peer connected fine, just without PQ protection on this leg.
+    pub classical_fallback: AtomicU64,
+    /// The handshake completed but no `HandshakeData` (or no recognized
+    /// group) could be read back — reported honestly as unknown, never
+    /// folded into either bucket above.
+    pub unknown: AtomicU64,
+}
+
+static PQ_KEX_STATS: PqKexStats = PqKexStats {
+    hybrid_pq: AtomicU64::new(0),
+    classical_fallback: AtomicU64::new(0),
+    unknown: AtomicU64::new(0),
+};
+
+/// Snapshot of the PQ key-exchange counters: `(hybrid_pq, classical_fallback, unknown)`.
+pub fn pq_kex_stats() -> (u64, u64, u64) {
+    (
+        PQ_KEX_STATS.hybrid_pq.load(Ordering::Relaxed),
+        PQ_KEX_STATS.classical_fallback.load(Ordering::Relaxed),
+        PQ_KEX_STATS.unknown.load(Ordering::Relaxed),
+    )
+}
+
+/// Read the REAL negotiated key-exchange group off a just-established
+/// connection and bucket it. Synchronous and infallible-by-construction: by
+/// the time a caller holds a `Connection` (not a `Connecting`), the TLS
+/// handshake has already completed, so `Connection::handshake_data()` never
+/// blocks here — it returns `None` only if iroh itself withheld it, which
+/// this function treats as `unknown` rather than guessing.
+fn record_kex_telemetry(conn: &Connection) {
+    let group = conn
+        .handshake_data()
+        .and_then(|data| data.downcast::<noq::crypto::rustls::HandshakeData>().ok())
+        .and_then(|hd| hd.negotiated_key_exchange_group);
+    match group {
+        Some(
+            rustls::NamedGroup::X25519MLKEM768
+            | rustls::NamedGroup::secp256r1MLKEM768
+            | rustls::NamedGroup::MLKEM768,
+        ) => {
+            PQ_KEX_STATS.hybrid_pq.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(_) => {
+            PQ_KEX_STATS
+                .classical_fallback
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        None => {
+            PQ_KEX_STATS.unknown.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// The domain-separated byte string an ed25519 gossip signature covers. Pure, so
 /// signer and verifier can't drift.
 fn gossip_sig_preimage(method: u8, path: &str, body: &[u8], ts_ms: u64) -> Vec<u8> {
@@ -2649,6 +2723,11 @@ impl PeerPool {
                     drop(state);
                     leader_guard.disarm();
                     self.opened.fetch_add(1, Ordering::Relaxed);
+                    // Once per freshly-minted trunk, never on a reused one
+                    // (the `state.trunks.get(...)` hit far above this branch
+                    // returns early before reaching here) — see
+                    // `record_kex_telemetry`'s doc comment.
+                    record_kex_telemetry(&conn);
                     // Path observability (mandatory per the CCN-preference
                     // spec): classify which transport this trunk's SELECTED
                     // path actually landed on, from iroh's own live per-path
@@ -3604,8 +3683,47 @@ pub async fn bind_full(
     if let Some(lookup) = dht::lookup_from_env(secret.as_ref()).await {
         builder = builder.address_lookup(lookup);
     }
+    builder = builder.crypto_provider(pq_hybrid_crypto_provider());
     let ep = builder.bind().await?;
     Ok(ep)
+}
+
+/// The mesh transport's TLS crypto provider: aws-lc-rs, with `X25519MLKEM768`
+/// (hybrid classical+ML-KEM-768) FIRST in the key-exchange preference list —
+/// so it is the group offered in the initial ClientHello, not merely
+/// negotiable after a HelloRetryRequest round trip.
+///
+/// This OVERRIDES whichever provider the `N0`/`Minimal` preset already
+/// installed (both presets prefer plain `ring` — classical only, zero PQ
+/// offered — whenever `tls-ring` and `tls-aws-lc-rs` are BOTH compiled in,
+/// per `endpoint/presets.rs`'s own doc comment; `hive-p2p/Cargo.toml` keeps
+/// both features on deliberately, for the browser/classical-fallback legs,
+/// which is exactly the "feature unification re-enables ring" trap
+/// `docs/pqc-migration-scope.md` names — so relying on either feature flag
+/// alone, instead of this explicit call, would silently offer zero PQ
+/// protection). The `kx_groups` list is built explicitly rather than trusted
+/// to `default_provider()`'s own ordering (which depends on whether rustls's
+/// OWN `prefer-post-quantum` cargo feature happened to be feature-unified on
+/// by some other crate in the graph — verified present here via this crate's
+/// direct `rustls` dependency, but an explicit list needs no such trust).
+///
+/// A peer that cannot speak `X25519MLKEM768` (an older binary not yet rolled
+/// to this build, or the wasm32 `hive-browser` client, which is `tls-ring`-only
+/// by necessity — aws-lc-rs is a C/BoringSSL library with no realistic wasm32
+/// target) still completes a handshake: TLS 1.3 group negotiation falls back
+/// to the first mutually-supported group in this same list (classical
+/// X25519), automatically, with no coordination or flag day. What actually
+/// got negotiated per connection is never inferred from this function having
+/// run — see `record_kex_telemetry`, the real source of truth.
+fn pq_hybrid_crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![
+        rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+        rustls::crypto::aws_lc_rs::kx_group::X25519,
+        rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+        rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+    ];
+    std::sync::Arc::new(provider)
 }
 
 /// Build a self-hosted relay map from `HIVE_RELAY_URLS` (comma-separated relay URLs,
@@ -3923,6 +4041,7 @@ pub async fn serve_tunnels_full(
                 Ok(conn) => conn,
                 Err(_) => return,
             };
+            record_kex_telemetry(&conn);
             if conn.alpn() == BROWSER_ALPN {
                 let remote_id = conn.remote_id().to_string();
                 let admitted = match browser_admission {

@@ -352,6 +352,19 @@ default-features = false
 [dependencies.iroh]
 version = "1.0.2"
 
+# Direct dependency so `p2p/network/core/mod.rs`'s own endpoint builder can
+# explicitly select the aws-lc-rs provider (X25519MLKEM768 hybrid KEM first)
+# -- mirroring `crates/hive-p2p/src/lib.rs`'s `pq_hybrid_crypto_provider`
+# (see that function's doc comment for why an explicit call, not a feature
+# flag, is required: iroh's presets prefer plain ring whenever both TLS
+# backends are compiled in, which they always are workspace-wide once ANY
+# crate enables `tls-aws-lc-rs` on the shared vendored `iroh` package).
+# Resolves to the one workspace-locked rustls 0.23.40 instance.
+[dependencies.rustls]
+version = "0.23"
+default-features = false
+features = ["aws_lc_rs", "prefer-post-quantum", "tls12", "std"]
+
 [dependencies.iroh-blobs]
 version = "0.103.0"
 

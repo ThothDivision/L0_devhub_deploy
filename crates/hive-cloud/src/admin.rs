@@ -8393,6 +8393,21 @@ async fn relay_stats(
                     "signer_mismatch": hive_p2p::verify_stats().4,
                     "rejected": hive_p2p::verify_stats().5,
                 },
+                // Post-quantum key exchange: REAL negotiated-handshake counts
+                // (`hive_p2p::record_kex_telemetry`, read off each connection's
+                // actual `HandshakeData` once, not derived from any config flag
+                // -- see docs/pqc-migration-scope.md). `hybrid_pq` is a
+                // key-exchange property only; transport IDENTITY stays
+                // classical Ed25519 regardless (no ML-DSA enrollment exists in
+                // this codebase yet). `classical_fallback` includes every peer
+                // that cannot yet speak X25519MLKEM768 -- an unrolled binary,
+                // or the wasm32 hive-browser client (aws-lc-rs has no
+                // realistic wasm32 target, a permanent boundary, not a bug).
+                "pq_kex": {
+                    "hybrid_pq": hive_p2p::pq_kex_stats().0,
+                    "classical_fallback": hive_p2p::pq_kex_stats().1,
+                    "unknown": hive_p2p::pq_kex_stats().2,
+                },
             }))
         }
         None => Json(json!({ "enabled": false })),

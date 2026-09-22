@@ -1,5 +1,41 @@
 # Changelog
 
+## 2026-09-22 — the mesh QUIC transport now offers hybrid post-quantum key exchange (X25519MLKEM768)
+
+The mesh transport (`hive_p2p::bind_full`, plus GuardianDB's own separate iroh
+endpoint) compiled with only the classical `ring` TLS backend up to this
+point: `iroh = "1"` with no feature override pulled the vendored iroh crate's
+own default `tls-ring`, and zero post-quantum key exchange was offered by any
+node (`docs/pqc-migration-scope.md`, written 2026-07-20, correctly described
+this as unimplemented). Fixed: `tls-aws-lc-rs` is now enabled alongside
+`tls-ring`, and `bind_full` (and guardian-db's endpoint) explicitly call
+`.crypto_provider(...)` with `X25519MLKEM768` first — mandatory, not optional,
+since iroh's own presets prefer plain ring whenever both TLS backends are
+compiled in (which Cargo feature unification now makes true workspace-wide;
+relying on the feature flag alone would have shipped nothing).
+
+Real negotiated-handshake telemetry (`hive_p2p::pq_kex_stats()`, exposed via
+`GET /v1/relay`'s new `pq_kex` block) reads the actual completed handshake's
+key-exchange group off each connection — never inferred from a config flag.
+Live-verified both directions with `crates/hive-p2p/src/bin/p2p_demo.rs`
+(committed tree unchanged — the print statements used were added, run, and
+reverted): two hybrid-capable endpoints negotiated `X25519MLKEM768` over a
+real QUIC tunnel carrying real HTTP traffic; a peer forced onto plain `ring`
+(zero PQ support, simulating an unrolled binary) still connected and served
+traffic normally via automatic TLS group fallback, correctly classified as
+`classical_fallback` rather than `hybrid_pq`.
+
+Transport IDENTITY is unchanged and stays classical Ed25519 — ML-KEM is a
+key-exchange primitive only. Public dashboard/API HTTPS, DB gateway TLS, and
+the relay binaries' own outer TLS were deliberately left on `ring` (external
+client compatibility, not fleet-controlled peers); `hive-browser` (wasm32)
+cannot use aws-lc-rs at all (no `wasm32-unknown-unknown` support) and is a
+permanent boundary, not a gap. Full audit, including a re-verification of
+`docs/COMPLIANCE_AUDIT.md`'s identity/authz findings and the actual scope of
+discovery (DHT/pkarr/relays real; Bluetooth absent; mDNS real but scoped to
+GuardianDB's own LAN replication mesh only) against current code:
+`docs/security-architecture-audit-2026-09-22.md`.
+
 ## 2026-09-22 — the litebox orphan reaper missed every orphan created by an ordinary runner deploy
 
 `LiteboxBackend::reap_orphaned_runners` (boot-time, SIGKILLs any process whose
