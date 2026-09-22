@@ -109,6 +109,16 @@ history).
   from the drop line itself. `vendor/` IS synced by the fanout role, so a
   vendored edit made while a roll is between its sync and its build ships
   in that roll — edit vendored crates only between rolls.
+- **A failed iroh rebind must be RETRIED, never left for the next link change
+  (`vendor/iroh` patch "retry a failed rebind").** netwatch closes the old UDP
+  socket before binding the new one, so `failed to rebind ... AddrInUse` (a
+  forked child still holds the old fd, common at load with a pinned
+  `HIVE_IROH_PORT`) leaves the transport Closed — fc-sanjose sat mesh-dark 28 h
+  (`netwatch::udp: socket closed` ~25/s, `isolated: true`). `PendingRebind`
+  retries the closed sockets every 250 ms→5 s. Diagnose from `ss -uanp "sport =
+  :11204"` (no hive-cloud socket = closed) and the journal's `failed to rebind`
+  / `transport rebind recovered` pair; `meshwatch` will NOT catch it on a
+  5-6 peer fleet (open PRD `meshwatch-blind-on-small-live-fleet`).
 
 ## Address lookup: a node can only re-learn an address from a peer it can reach
 
@@ -409,6 +419,19 @@ hard-resets the host (previous section), so the only remaining fallback was
 builds `litebox_runner_linux_userland` from a pinned commit; litebox ships no
 releases).
 
+- **A runner-binary deploy must strip `/proc/<pid>/exe`'s `" (deleted)"`
+  suffix before comparing paths, or the boot-time orphan reaper goes blind.**
+  `LiteboxBackend::reap_orphaned_runners` SIGKILLs any process whose exe is
+  the runner binary, but replacing that binary (every deploy: Linux refuses
+  an in-place overwrite of a running executable, `ETXTBSY`, so the role and
+  every ship script `mv` a new file onto the path) unlinks the orphan's OLD
+  inode while it is still mapped, and the kernel appends `" (deleted)"` to
+  that orphan's readlink from then on — a plain string comparison silently
+  stops matching exactly the orphans a binary swap creates. Confirmed with
+  `cp`+`mv -f` over a running process (the readlink target gains the
+  suffix); witnessed live on fc-phoenix (two orphans, ~48% of a core each,
+  nearly an hour) and fc-sanjose (`reaped=7` on the next restart after this
+  fix). `strip_deleted_exe_suffix` undoes the annotation before comparing.
 - **Two-tier verification, same shape as PVM.** `LiteboxBackend::is_supported()`
   (Tier 1, existence-only) gates `--litebox-probe` (Tier 2, bring-up only,
   never on a node carrying traffic — mirrors `pvm_run_smoke_test`'s gating
@@ -529,6 +552,23 @@ releases).
   leader's listener and the public round-robin host: 101, first frame is the
   prompt, `TERM_OK_42` before the next prompt, `{"type":"exited",
   "exit_code":0}` on `exit`.
+- **The shell rc also answers "command not found" WITHOUT forking
+  (`litebox-shellrc.sh`, an `extdebug` DEBUG trap running `command -v` in the
+  parent).** Interactive bash forks before it looks a command up, and under
+  litebox's fork emulation that child dies `Fatal error: glibc detected an
+  invalid stdio handle` and wedges the session (`ifconfig`, 2026-09-22) — so a
+  command that is not staged must never reach bash's own not-found path. Keep
+  the guard's failure direction safe: it only skips a command it PROVED absent
+  (`command -v` empty), leaves quoted/expanded first words alone, and is
+  installed only when `$BASH_VERSION` is set and `/dev/null` is a char device.
+  It does not cover `sh -c` (no rc is read; adding a trap there also defeats
+  bash's exec-the-last-command optimization). It is a BELT for runners without
+  `ansible/roles/litebox/files/fork-inplace.patch`: the wedge itself (a second
+  external command, any not-found command) was the native-Linux `fork()` copying
+  the guest's memory at relocated addresses and running the child on a mix of
+  its own and the parent's libc (`litebox-fork-child-corruption`); a runner built
+  with that patch forks in place and needs no guard. Drop the rc guard once every
+  litebox node runs the patched runner (`$?` would then be 127 again).
 - **A TUN device has ONE owner, so every exec and shell runner gets its
   own link; the cell's provision-time link serves only the function
   process.** litebox attaches with `TUNSETIFF`, and a second runner on the

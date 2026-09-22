@@ -91,3 +91,35 @@ endpoint) instead of dropping it.
 **Rollout rule.** This changes mesh-transport scheduling: canary on one or
 two nodes with a `/v1/mesh` assertion before any fleet-wide roll (AGENTS.md,
 "Bringing a node into the mesh").
+
+## Patch: retry a failed rebind (fluid-hive, no upstream issue yet)
+
+**Files:** `src/socket.rs` (`Actor::retry_rebind`, `PendingRebind`, the
+`rebind_retry` select arm), `src/socket/transports.rs`
+(`NetworkChangeSender::rebind_closed`), `src/socket/transports/ip.rs`
+(`IpNetworkChangeSender::is_closed`).
+
+**Problem.** `netwatch::UdpSocket::rebind` drops the old socket first and then
+binds the new one; when the bind fails the socket stays `Closed`, and
+`Actor::handle_network_change` only logged `failed to rebind transports` —
+nothing tried again until the NEXT major link change. With a pinned port
+(`HIVE_IROH_PORT`) the bind fails `EADDRINUSE` whenever any concurrently
+forking child (podman, conmon, git ls-remote polls, litebox runners) still
+holds its copy of the old fd between `fork()` and `exec()`, which is long on a
+loaded host.
+
+**Measured, 2026-09-21, fc-sanjose (control-plane leader):** the first failed
+rebind (2026-09-20 22:44:24 +08, right after a minecraft cell's
+died/remove/create) left both endpoints' IP transports closed for 28 hours
+(`netwatch::udp: socket closed` ~25/s, `isolated: true`, zero direct peers); the
+sockets only came back at the next successful major change (v4 11 h later, v6
+17 h later). A restart reproduced it 20 s after boot (19:29:06Z).
+`meshwatch` never fired: the live fleet is 5-6 peers, below the floor
+(`expected/4` = 6) its `ever_converged` guard needs.
+
+**Fix.** A failed rebind arms `PendingRebind` (250 ms, doubling, capped at 5 s,
+unbounded attempts); each attempt rebinds ONLY the IP transports that are still
+closed (healthy sockets are never bounced) and, on success, finishes what the
+link-change handler could not: relay health check, DNS reset, a fresh net
+report and the QUIC network-change notification. A later successful rebind
+from a real link change clears the pending retry.

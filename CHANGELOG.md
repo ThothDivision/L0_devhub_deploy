@@ -1,5 +1,143 @@
 # Changelog
 
+## 2026-09-22 — the litebox orphan reaper missed every orphan created by an ordinary runner deploy
+
+`LiteboxBackend::reap_orphaned_runners` (boot-time, SIGKILLs any process whose
+`/proc/<pid>/exe` is the runner binary) compared that readlink by plain string
+equality. Replacing `/usr/local/bin/litebox-runner` — what every deploy does;
+Linux refuses an in-place overwrite of a running executable (`ETXTBSY`), so the
+role and this platform's own ship scripts both `mv` a new file onto the path —
+unlinks the OLD inode while an existing orphan still has it mapped, and the
+kernel then appends `" (deleted)"` to that orphan's `/proc/<pid>/exe` from then
+on. The comparison silently stopped matching for exactly the orphans a binary
+swap creates. Two fc-phoenix runners from an earlier incarnation survived two
+restarts this way, burning ~48% of a core apiece for nearly an hour before
+being killed by hand.
+
+`strip_deleted_exe_suffix` undoes the annotation before comparing. Confirmed
+the kernel behavior directly (`cp`+`mv -f` over a running `sleep` on va: its
+`/proc/<pid>/exe` read back with the suffix). Reproduced the bug for real on
+fc-phoenix — hard-killed hive-node, swapped the runner binary the same way a
+deploy does, confirmed the two now-orphaned runners read `(deleted)` — then
+restarted onto the fixed binary: `reaped=2`, both gone, zero orphans left.
+Rolled to fc-sanjose next, which had accumulated `reaped=7` from tonight's
+earlier restarts; both survey apps and tokenhun cold-started normally
+afterward. Every litebox runner on both nodes is now a child of the current
+hive-node process.
+
+## 2026-09-22 — litebox `fork()` root-caused and fixed: a second external command no longer wedges a sandbox shell
+
+The wedge behind the `ifconfig` report was not the not-found path: on a native
+Linux runner a plain `fork()` took `do_clone`'s eager copy of the guest's writable
+memory at RELOCATED host addresses, run on a second host thread. Only registers,
+the TCB pointer, a 4 KB stack window and a few ELF data words are patched;
+everything else in the copy (RELRO/`.got`/`.data.rel.ro`/stdio vtables — Rocky's
+bash is full-RELRO — and the whole heap) still points into the parent. The child ran a
+mix of its own and the parent's libc and rewrote the parent's `_rtld_global` stack
+lists, malloc and stdio state. gdb evidence: `_IO_vtable_check` failing in the child
+with `rip` in the PARENT's libc (`glibc detected an invalid stdio handle`), and the
+second child spinning in `__libc_fork`'s inlined `reclaim_stacks` walk over the
+list the first child had corrupted.
+
+`ansible/roles/litebox/files/fork-inplace.patch` (applied after `networking.patch`;
+`litebox_shim_linux` only, 180 lines) runs a plain `fork()` of a single-threaded
+caller in place, vfork-style (caller suspended until the child execs or exits, no
+relocation, writable memory restored from a snapshot afterwards); multi-threaded
+callers (Node) keep the old path. It also fixes `sys_brk` (a `brk` that cannot be
+satisfied answers the unchanged break, not `-ENOMEM`) and serves syscalls at the
+rewriter's `icebp; hlt` trap sites through the shim (they killed `head` in 25-30% of
+`ls | head` runs). Matrix on a scratch runner on va: pin runner wedges after the first
+command; the fixed release runner (`cdb25f95`) passes `id`,`id`,`uname -a`, a
+not-found command through bash's own path, `ls / | head -2`, `v=$(echo hi)`, `id -u`
+(100-iteration loops of the pipeline cases, 20 of the rest, all clean). Live on
+fc-sanjose through the real dashboard shell and one-shot exec paths: `id`,`id`,
+`uname -a`, pipelines, command substitution, `node -v` + `node -e` in one session,
+`sh -c 'ifconfig; id; nothere2; echo end'` (was fatal), all correct. Installed as
+`/usr/local/bin/litebox-runner` on fc-phoenix and fc-sanjose (old ones kept beside
+it); tokenhun (a Next guest) cold-started on it and answers 200.
+
+Known limits (documented in PATCHES.md): the parent is suspended until the child
+execs or exits, so a non-exec child that needs the parent deadlocks (`$(...)` of more
+than 64 KiB written by builtins); `(sleep 1; echo x) & echo y` prints `x` first; O(RSS)
+per fork. The `litebox-shellrc.sh` no-fork guard from the same day stays until every
+litebox node runs this runner. Also found: rolling a hive-node restart leaves the
+old litebox runners running as orphans (ppid 1, ~50% CPU each on phx) alongside the
+duplicates the new process starts — two killed by hand on phx, PRD row open.
+
+## 2026-09-22 — a command the sandbox terminal cannot find wedged the whole session (`glibc detected an invalid stdio handle`)
+
+Typing `ifconfig` (or any command not staged into the guest tar: `ip`, `ping`,
+`curl`, `vi`, `less`, `ps`, …) in a dashboard sandbox terminal on a litebox node
+printed `Fatal error: glibc detected an invalid stdio handle` and
+`sh: [pid: 1 (255)] tcsetattr: Inappropriate ioctl for device`, after which the
+session answered nothing. Reproduced on fc-sanjose through the real shell
+websocket. Interactive bash forks BEFORE it looks a command up (so it can
+redirect the error), and under litebox's fork emulation that child dies on its
+first stdio use; the shell never recovers.
+
+The staged `ENV` rc (`litebox-shellrc.sh`, was one line `exec 2>&1`) now also
+installs an `extdebug` DEBUG trap that checks the command word with
+`command -v` in the PARENT and prints `sh: <cmd>: command not found` there — no
+fork, no fatal. Leading `VAR=value` words are skipped over; builtins, keywords,
+functions, `[[`, `((`, `cd`, `for`/`if` bodies are untouched. Witnessed on a
+scratch runner on va (11 command forms, including `FOO=1 nothere`,
+`echo a; nothere; echo b`) and live on fc-sanjose (`ifconfig` and `nothere` →
+"command not found", `id` and `echo` still work, `exit` → exit_code 0). Known
+limits: a skipped command leaves `$?` at 0, a quoted/expanded first word is not
+checked, and the one-shot `sh -c` exec path is unchanged. NOT fixed here: any
+SECOND external command in a session still wedges it (the native-Linux fork
+emulation bug, `litebox-fork-child-corruption`); under investigation.
+
+## 2026-09-22 — laptop `fc-lax3` dead for 59 h (launchd could not spawn it) and four dev/Mac nodes running without a trust list
+
+The mesh's `fc-lax3` is the laptop's `dev.shadw.fc-lax` job. It had been dead
+since 2026-09-19 01:01 with `last exit code = 78: EX_CONFIG`, 21,500 spawn
+attempts, and this repo's watchdog kickstarting it every minute:
+`launchd: Service could not initialize: Unable to get updated LWCR` (the
+launch-constraint record went stale after the debug binary was rebuilt). The
+same binary ran fine when launched by hand; `bootout` + `bootstrap` of the same
+plist cured it. `scripts/shadw-watchdog.sh` now detects `last exit code = 78`
+in its down branch and re-registers the plist instead of kickstarting forever.
+
+Separately, `shadw2`, `shadw3`, `fc-lax` and `fc-lax2` carried no
+`HIVE_TRUSTED_NODE_IDS` / `HIVE_PEER_TRUST` (`shadw1` did and was healthy), so
+they rejected every mutating gossip (`no verified+trusted signer`, 257 in 3000
+log lines on shadw2), saw `control-plane owner chain has NO eligible entry`
+(1915 of 3000 lines) and reported `expected_peers` 0-7 against the fleet's 26 —
+"connectivity issues" that were configuration. `fc-lax`/`fc-lax2` also still had
+bare-id bootstrap seeds and the dead `http://<ip>:3340` relay form. All four now
+have the 27-id fleet trust list (plists backed up as `*.bak-trust-*` /
+`*.bak-mesh-*`), `https://*.relay.shadw.app:3343` relays and addressed bootstrap
+peers, and report `expected_peers` 26-28 with 6-9 visible healthy peers.
+
+## 2026-09-22 — a failed iroh rebind was never retried: fc-sanjose sat mesh-dark for 28 hours
+
+`fc-sanjose` (control-plane leader) reported `isolated: true`, zero direct peers,
+and ~25 `netwatch::udp: socket closed` warnings per second. The first failure was
+`iroh::socket: failed to rebind transports: Os { code: 98, kind: AddrInUse }` at
+2026-09-20 22:44:24 +08, seconds after a minecraft cell's podman
+died/remove/create. `netwatch` drops the old UDP socket BEFORE binding the new
+one, and iroh only logged the failure: the transport stayed closed until the
+next major link change happened to rebind it (the v4 socket came back 11 h
+later, v6 17 h later). With `HIVE_IROH_PORT` pinned, the bind fails whenever a
+concurrently forking child (podman, conmon, git ls-remote polls, litebox
+runners) still holds its copy of the old fd between `fork()` and `exec()` —
+long on a host at load 20-39. A restart reproduced it 20 s after boot
+(19:29:06Z). `meshwatch` never restarted it: the live fleet is 5-6 peers, below
+the `expected/4 = 6` floor its `ever_converged` guard needs, and the continuous
+trigger reset on every one-tick blip to 2-6 peers.
+
+`vendor/iroh` now retries: a failed rebind arms `PendingRebind` (250 ms
+doubling to 5 s, unbounded), each attempt rebinds only the transports still
+closed and, on success, runs the relay check, DNS reset, re-STUN and QUIC
+notification the link-change handler skipped. Witnessed with a deterministic
+scratch node in its own netns on va: a duplicate of the iroh UDP fd is taken
+with `pidfd_getfd`, a dummy link forces a major change (rebind fails
+EADDRINUSE on the v4 socket), then the duplicate is closed. The pre-patch
+binary was still unbound 9 s later; the patched binary retried at +0.25/+0.5/+1 s
+and re-bound `0.0.0.0` 0.5 s after the release (`transport rebind recovered`).
+The `meshwatch` small-fleet floor is a separate open row.
+
 ## 2026-09-20 — the litebox artifact GC hashed the whole cache on every publish, so a shim change took a node's apps dark for an hour
 
 Rolling the `process.title` fix to fc-sanjose changed `runtime_source_sha256`

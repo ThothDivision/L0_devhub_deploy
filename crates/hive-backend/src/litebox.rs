@@ -1338,6 +1338,25 @@ impl LiteboxBackend {
     /// and must never be swept. Identification is by `/proc/<pid>/exe` against
     /// the configured runner path (never by name substring, which could match
     /// a tenant process), and this process's own children cannot exist yet.
+    ///
+    /// **Must survive a runner BINARY swap, not just a hive-cloud restart.**
+    /// Every deploy of `/usr/local/bin/litebox-runner` (the ansible role, or
+    /// `mv -f` onto the running path — there is no other way to replace an
+    /// in-use executable on Linux, which refuses in-place overwrite with
+    /// `ETXTBSY`) unlinks the OLD inode while an old orphan still maps it, so
+    /// the kernel appends `" (deleted)"` to that orphan's `/proc/<pid>/exe`
+    /// readlink from then on — confirmed live (`cp`+`mv -f` over a running
+    /// `sleep`, va, 2026-09-22): `/tmp/x/a.bin` reads back as
+    /// `/tmp/x/a.bin (deleted)`, which string-equality with the canonical
+    /// path silently stops matching. Witnessed for real: two fc-phoenix
+    /// runners from an earlier hive-cloud incarnation survived TWO restarts
+    /// of the fixed-binary-path reaper above — each one immediately after a
+    /// runner binary swap — burning ~48% of a core apiece for nearly an hour
+    /// until killed by hand. `strip_deleted_exe_suffix` undoes exactly that
+    /// kernel annotation before comparing; it must never strip a REAL literal
+    /// `" (deleted)"` suffix a tenant path could have — `runner_bin` is a
+    /// platform-controlled config value, never tenant input, so there is no
+    /// path here for that ambiguity to matter.
     fn reap_orphaned_runners(runner_bin: &Path) {
         #[cfg(target_os = "linux")]
         {
@@ -1354,7 +1373,9 @@ impl LiteboxBackend {
                 if pid == std::process::id() {
                     continue;
                 }
-                let exe = std::fs::read_link(entry.path().join("exe")).ok();
+                let exe = std::fs::read_link(entry.path().join("exe"))
+                    .ok()
+                    .map(|p| strip_deleted_exe_suffix(&p));
                 let matches = match (&exe, &canonical) {
                     (Some(exe), Some(canonical)) => exe == canonical || exe.as_path() == runner_bin,
                     (Some(exe), None) => exe.as_path() == runner_bin,
@@ -2512,6 +2533,19 @@ fn sha256_parts(parts: &[&[u8]]) -> String {
         hasher.update(part);
     }
     hex_sha256(&hasher.finalize())
+}
+
+/// Undoes the kernel's `" (deleted)"` annotation on a `/proc/<pid>/exe`
+/// readlink target whose backing inode was unlinked while still mapped —
+/// see `reap_orphaned_runners`'s doc comment for why this fires on every
+/// ordinary runner-binary deploy, not just a crash.
+#[cfg(target_os = "linux")]
+fn strip_deleted_exe_suffix(path: &Path) -> PathBuf {
+    const SUFFIX: &str = " (deleted)";
+    match path.to_str() {
+        Some(s) if s.ends_with(SUFFIX) => PathBuf::from(&s[..s.len() - SUFFIX.len()]),
+        _ => path.to_path_buf(),
+    }
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -3867,8 +3901,21 @@ const SHELL_GUEST_PROGRAMS: &[&str] = &[
 /// runner exit 101, measured 2026-09-02) instead of the silent ENOENT a
 /// missing directory gives. `HISTFILE` is cleared for the same reason.
 const SHELL_RC_GUEST_PATH: &str = "/usr/share/hive/shellrc";
+/// `litebox-shellrc.sh`: the stderr move above PLUS a no-fork "command not
+/// found" guard. Interactive bash forks BEFORE it looks a command up (so the
+/// error can be redirected), and under the litebox fork emulation that child
+/// dies `Fatal error: glibc detected an invalid stdio handle`, after which the
+/// session prints nothing (witnessed 2026-09-22 with `ifconfig` in a dashboard
+/// sandbox terminal on fc-sanjose). The rc installs an `extdebug` DEBUG trap
+/// that checks the command word with `command -v` in the PARENT and answers
+/// `sh: <cmd>: command not found` there. Known limits, all deliberate: a
+/// skipped command leaves `$?` at 0 (`extdebug` semantics), commands whose
+/// first word is quoted/expanded (`"$x"`, `$EDITOR`) are not checked, and it
+/// does nothing for `sh -c` runs (no rc is read) or for any second EXTERNAL
+/// command that DOES exist (the separate fork bug in `litebox-fork-child-
+/// corruption`).
 #[cfg(target_os = "linux")]
-const SHELL_RC_BYTES: &[u8] = b"exec 2>&1\n";
+const SHELL_RC_BYTES: &[u8] = include_bytes!("litebox-shellrc.sh");
 
 const SHELL_GUEST_OPTIONAL_PROGRAMS: &[&str] = &[
     "/usr/bin/uname",
