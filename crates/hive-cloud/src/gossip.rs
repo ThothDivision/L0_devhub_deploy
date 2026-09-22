@@ -186,6 +186,21 @@ async fn dispatch_verified(
     signer: Option<&str>,
 ) -> Vec<u8> {
     match path {
+        // Private Marketplace container gateway.  Its envelope retains the
+        // original HMAC headers and raw body; `mesh_dispatch` reconstructs an
+        // ordinary request into the Marketplace router so the destination
+        // consumes the nonce exactly once.
+        "/v1/marketplace/gateway-mesh" if method == hive_p2p::GOSSIP_POST => {
+            let request =
+                serde_json::from_slice::<crate::marketplace_gateway::MarketplaceMeshRequest>(body);
+            match request {
+                Ok(request) => crate::marketplace::mesh_dispatch(cloud.clone(), request)
+                    .await
+                    .and_then(|response| serde_json::to_vec(&response).ok())
+                    .unwrap_or_default(),
+                Err(_) => Vec::new(),
+            }
+        }
         "/v1/nodes/announce" if method == hive_p2p::GOSSIP_POST => {
             if let Ok(node) = serde_json::from_slice::<hive_edge::NodeInfo>(body) {
                 return jb(

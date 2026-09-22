@@ -696,7 +696,11 @@ pub(crate) fn sanitize_tag(s: &str) -> String {
     let out = out
         .trim_matches(|c| c == '-' || c == '.' || c == '_')
         .to_string();
-    if out.is_empty() { "app".into() } else { out }
+    if out.is_empty() {
+        "app".into()
+    } else {
+        out
+    }
 }
 
 pub(crate) fn project_volume_name(
@@ -3159,9 +3163,23 @@ async fn run_build(
             || actual_branch == prod_branch,
         "resolved branch {actual_branch:?} contradicts the server-owned production branch {prod_branch:?}"
     );
+    // Marketplace migrations run after the managed Postgres record is Ready
+    // and before any workload runtime environment or traffic artifact is
+    // produced. The runner's only execution surface is BuildExecutor's
+    // migration capability; its secret connection value never enters either
+    // build_env, runtime_env, deployment records, or logs.
+    if cloud
+        .marketplace_releases
+        .workload_for_project(&project)
+        .is_some()
+    {
+        crate::marketplace_migrations::run(&cloud, &project, &dir)
+            .await
+            .map_err(|code| anyhow::anyhow!("{code}"))?;
+    }
     let is_production = trust.lane.is_production();
     let allow_all_environment = !trust.lane.is_fork();
-    let build_env = cloud.projects.env_map_for_execution_exact(
+    let mut build_env = cloud.projects.env_map_for_execution_exact(
         &project,
         incarnation,
         trust.lane.environment(),
@@ -3175,7 +3193,7 @@ async fn run_build(
         crate::project_settings::EnvExecutionScope::Runtime,
         allow_all_environment,
     )?;
-    let runtime_env = if req.no_fanout {
+    let mut runtime_env = if req.no_fanout {
         // Coordinator-filtered, ephemeral runtime values. Build variables are
         // always re-selected locally by explicit environment + build scope and
         // can never hitchhike in this compatibility map.
@@ -3183,6 +3201,7 @@ async fn run_build(
     } else {
         stored_runtime_env
     };
+    inject_marketplace_runtime(&project, &mut build_env, &mut runtime_env)?;
     if trust.lane.is_fork() {
         log(format!(
             "Fork preview: only explicitly preview-scoped variables are eligible ({} build, {} runtime); all-environment and production values are withheld.",
@@ -3782,6 +3801,7 @@ async fn run_build(
             apply_vercel_config(&mut manifest, vc, &|s| log(s));
         }
     }
+    inject_marketplace_workload_credential(&cloud, &project, &mut manifest)?;
 
     log("Uploading build outputs…".into());
     log(format!(
@@ -6432,16 +6452,59 @@ async fn produce_manifest(
     // project namespace. Takes precedence over a lone Dockerfile (it expresses the
     // full topology). Single-Dockerfile projects are unaffected.
     let compose_path = crate::compose::compose_file(dir);
-    if compose_path.is_some() {
-        anyhow::bail!(
-            "BUILD_ISOLATION_UNSUPPORTED_SURFACE: builder protocol v1 rejects Compose source builds; no repository command was run on the host"
-        );
-    }
     let dockerfile = container_build_file(dir);
-    if dockerfile.is_some() {
-        anyhow::bail!(
-            "BUILD_ISOLATION_UNSUPPORTED_SURFACE: builder protocol v1 rejects Dockerfile and Containerfile source builds; no repository command was run on the host"
-        );
+    if let Some(compose) = compose_path {
+        let isolated = require_build_session(&mut isolated)?;
+        let image = build_oci_source(
+            cloud,
+            bid,
+            isolated,
+            dir,
+            &compose,
+            crate::build_executor::BuildSurface::Compose,
+        )
+        .await?;
+        return image_container_manifest(
+            cloud,
+            bid,
+            project,
+            incarnation,
+            &image,
+            Some(3000),
+            Some(ServiceProtocol::Http),
+            0,
+            0.0,
+            0,
+            None,
+        )
+        .await;
+    }
+    if let Some(dockerfile) = dockerfile {
+        let isolated = require_build_session(&mut isolated)?;
+        let port = parse_expose(&dockerfile).await.unwrap_or(3000);
+        let image = build_oci_source(
+            cloud,
+            bid,
+            isolated,
+            dir,
+            &dockerfile,
+            crate::build_executor::BuildSurface::Dockerfile,
+        )
+        .await?;
+        return image_container_manifest(
+            cloud,
+            bid,
+            project,
+            incarnation,
+            &image,
+            Some(port),
+            Some(ServiceProtocol::Http),
+            0,
+            0.0,
+            0,
+            None,
+        )
+        .await;
     }
     if let Ok(s) = tokio::fs::read_to_string(dir.join("fluid.json")).await {
         if let Some(session) = isolated.as_mut() {
@@ -6477,6 +6540,241 @@ async fn produce_manifest(
         )
         .await
     }
+}
+
+/// Build a Dockerfile or the single source-built Compose service wholly inside
+/// the live-probed BuildExecutor. The host only imports the executor-produced
+/// OCI archive after it has been copied back through the existing sealed-output
+/// path; it never receives the checkout as a bind mount and never invokes a
+/// host-native image builder.
+async fn build_oci_source(
+    cloud: &Arc<CloudState>,
+    bid: &str,
+    isolated: &mut IsolatedBuild,
+    dir: &Path,
+    definition: &Path,
+    surface: crate::build_executor::BuildSurface,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !isolated.host_build && isolated.builder_v2,
+        "BUILDER_V2_UNAVAILABLE: OCI source builds require the runsc BuildExecutor"
+    );
+    let definition = validate_builder_definition(dir, definition, surface).await?;
+    let definition_name = definition
+        .strip_prefix(dir)
+        .ok()
+        .and_then(|path| path.to_str())
+        .ok_or_else(|| anyhow::anyhow!("BUILDER_V2_INVALID_INPUT: invalid build definition"))?;
+    let archive_name = format!(".hive-builder-v2-{}.oci", Uuid::new_v4().simple());
+    let tag = format!("localhost/hive-source-{}:build", Uuid::new_v4().simple());
+    let script = r#"set -eu
+definition=$1
+archive=$2
+tag=$3
+case "$definition" in
+  ""|/*|*..*|*\\*) printf '%s\n' BUILDER_V2_INVALID_INPUT >&2; exit 41 ;;
+esac
+test -f "$definition"
+test ! -L "$definition"
+rm -f -- "$archive"
+buildah --storage-driver=vfs bud --isolation=chroot --format=oci --layers=false \
+  --no-cache --file "$definition" --tag "$tag" .
+buildah --storage-driver=vfs push --format=oci "$tag" "oci-archive:$archive:hive-workload"
+test -s "$archive"
+"#;
+    cloud.builds.log(
+        bid,
+        "Builder v2: validating and building OCI image in runsc isolation.",
+    );
+    isolated
+        .run(
+            dir,
+            script,
+            "builder-v2 OCI source build",
+            &[definition_name.to_owned(), archive_name.clone(), tag],
+            false,
+            cloud,
+            bid,
+            &Default::default(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("BUILDER_V2_BUILD_FAILED"))?;
+    isolated.finish().await?;
+    let archive = dir.join(&archive_name);
+    let image = load_attested_oci_archive(&archive).await?;
+    let _ = tokio::fs::remove_file(&archive).await;
+    cloud.builds.log(
+        bid,
+        "Builder v2: OCI image resolved to an immutable digest.",
+    );
+    Ok(image)
+}
+
+/// Validate all repository-directed OCI inputs before the executor sees them.
+/// Error strings intentionally carry no checkout path, host detail, or topology.
+async fn validate_builder_definition(
+    dir: &Path,
+    definition: &Path,
+    surface: crate::build_executor::BuildSurface,
+) -> anyhow::Result<PathBuf> {
+    let root = tokio::fs::canonicalize(dir)
+        .await
+        .map_err(|_| anyhow::anyhow!("BUILDER_V2_INVALID_INPUT"))?;
+    let candidate = tokio::fs::canonicalize(definition)
+        .await
+        .map_err(|_| anyhow::anyhow!("BUILDER_V2_INVALID_INPUT"))?;
+    anyhow::ensure!(
+        candidate.starts_with(&root)
+            && tokio::fs::symlink_metadata(&candidate)
+                .await
+                .map(|m| m.is_file() && !m.file_type().is_symlink())
+                .unwrap_or(false),
+        "BUILDER_V2_INVALID_INPUT"
+    );
+    let contents = tokio::fs::read_to_string(&candidate)
+        .await
+        .map_err(|_| anyhow::anyhow!("BUILDER_V2_INVALID_INPUT"))?;
+    anyhow::ensure!(contents.len() <= 1024 * 1024, "BUILDER_V2_INVALID_INPUT");
+    match surface {
+        crate::build_executor::BuildSurface::Dockerfile => {
+            for line in contents.lines() {
+                let directive = line.trim().to_ascii_lowercase();
+                anyhow::ensure!(
+                    !directive.starts_with("add http")
+                        && !directive.contains("--mount")
+                        && !directive.contains("--network=host")
+                        && !directive.contains("--privileged")
+                        && !directive.contains("--device"),
+                    "BUILDER_V2_UNSUPPORTED_SURFACE"
+                );
+            }
+        }
+        crate::build_executor::BuildSurface::Compose => {
+            let compose: serde_yaml::Value = serde_yaml::from_str(&contents)
+                .map_err(|_| anyhow::anyhow!("BUILDER_V2_INVALID_INPUT"))?;
+            let services = compose
+                .get("services")
+                .and_then(serde_yaml::Value::as_mapping)
+                .ok_or_else(|| anyhow::anyhow!("BUILDER_V2_INVALID_INPUT"))?;
+            anyhow::ensure!(services.len() == 1, "BUILDER_V2_UNSUPPORTED_SURFACE");
+            let service = services
+                .values()
+                .next()
+                .and_then(serde_yaml::Value::as_mapping)
+                .ok_or_else(|| anyhow::anyhow!("BUILDER_V2_INVALID_INPUT"))?;
+            for forbidden in [
+                "privileged",
+                "network_mode",
+                "volumes",
+                "devices",
+                "secrets",
+                "configs",
+                "pid",
+                "ipc",
+            ] {
+                anyhow::ensure!(
+                    !service.contains_key(&serde_yaml::Value::String(forbidden.into())),
+                    "BUILDER_V2_UNSUPPORTED_SURFACE"
+                );
+            }
+            let build = service
+                .get(&serde_yaml::Value::String("build".into()))
+                .ok_or_else(|| anyhow::anyhow!("BUILDER_V2_UNSUPPORTED_SURFACE"))?;
+            let context = match build {
+                serde_yaml::Value::String(value) => value.as_str(),
+                serde_yaml::Value::Mapping(map) => map
+                    .get(&serde_yaml::Value::String("context".into()))
+                    .and_then(serde_yaml::Value::as_str)
+                    .unwrap_or("."),
+                _ => return Err(anyhow::anyhow!("BUILDER_V2_INVALID_INPUT")),
+            };
+            let context = crate::build_executor::WorkspacePath::parse(context.to_owned())
+                .map_err(|_| anyhow::anyhow!("BUILDER_V2_INVALID_INPUT"))?;
+            anyhow::ensure!(context.as_str() == ".", "BUILDER_V2_UNSUPPORTED_SURFACE");
+            let context = root.join(context.as_str());
+            anyhow::ensure!(
+                tokio::fs::canonicalize(&context)
+                    .await
+                    .map(|path| path.starts_with(&root))
+                    .unwrap_or(false),
+                "BUILDER_V2_INVALID_INPUT"
+            );
+            let dockerfile = match build {
+                serde_yaml::Value::Mapping(map) => map
+                    .get(&serde_yaml::Value::String("dockerfile".into()))
+                    .and_then(serde_yaml::Value::as_str)
+                    .unwrap_or("Dockerfile"),
+                _ => "Dockerfile",
+            };
+            let dockerfile = crate::build_executor::WorkspacePath::parse(dockerfile.to_owned())
+                .map_err(|_| anyhow::anyhow!("BUILDER_V2_INVALID_INPUT"))?;
+            let dockerfile = root.join(dockerfile.as_str());
+            let dockerfile = tokio::fs::canonicalize(dockerfile)
+                .await
+                .map_err(|_| anyhow::anyhow!("BUILDER_V2_INVALID_INPUT"))?;
+            anyhow::ensure!(
+                dockerfile.starts_with(&root)
+                    && tokio::fs::symlink_metadata(&dockerfile)
+                        .await
+                        .map(|m| m.is_file() && !m.file_type().is_symlink())
+                        .unwrap_or(false),
+                "BUILDER_V2_INVALID_INPUT"
+            );
+            return Box::pin(validate_builder_definition(
+                &root,
+                &dockerfile,
+                crate::build_executor::BuildSurface::Dockerfile,
+            ))
+            .await;
+        }
+        crate::build_executor::BuildSurface::RepositoryCommands => unreachable!(),
+    }
+    Ok(candidate)
+}
+
+/// Import the sealed archive without building on the host, then select only the
+/// image ID that Podman reports after import. A tag is never returned to the
+/// deployment manifest.
+async fn load_attested_oci_archive(archive: &Path) -> anyhow::Result<String> {
+    let metadata = tokio::fs::symlink_metadata(archive)
+        .await
+        .map_err(|_| anyhow::anyhow!("BUILDER_V2_OUTPUT_INVALID"))?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() > 0,
+        "BUILDER_V2_OUTPUT_INVALID"
+    );
+    let output = Command::new("podman")
+        .arg("load")
+        .arg("--input")
+        .arg(archive)
+        .env("PATH", podman_path_env())
+        .output()
+        .await
+        .map_err(|_| anyhow::anyhow!("BUILDER_V2_IMPORT_FAILED"))?;
+    anyhow::ensure!(output.status.success(), "BUILDER_V2_IMPORT_FAILED");
+    let text = String::from_utf8_lossy(&output.stdout);
+    let loaded = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Loaded image: "))
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("BUILDER_V2_OUTPUT_INVALID"))?;
+    let inspect = Command::new("podman")
+        .args(["image", "inspect", "--format", "{{.Id}}", loaded])
+        .env("PATH", podman_path_env())
+        .output()
+        .await
+        .map_err(|_| anyhow::anyhow!("BUILDER_V2_IMPORT_FAILED"))?;
+    anyhow::ensure!(inspect.status.success(), "BUILDER_V2_IMPORT_FAILED");
+    let image = String::from_utf8_lossy(&inspect.stdout).trim().to_owned();
+    anyhow::ensure!(
+        image.starts_with("sha256:")
+            && image.len() == 71
+            && image[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
+        "BUILDER_V2_OUTPUT_INVALID"
+    );
+    Ok(image)
 }
 
 /// The module a direct-interpreter `start_cmd` names, when the argv is one
@@ -9122,6 +9420,7 @@ fn build_executor_platform_fault(error: &anyhow::Error) -> bool {
 struct IsolatedBuild {
     root: PathBuf,
     session: Option<crate::build_executor::BuildSession>,
+    builder_v2: bool,
     /// When set, repository commands run as PLAIN HOST PROCESSES in the
     /// checkout, exactly as `MockBackend`/`LiteboxBackend` have always built
     /// (AGENTS.md: litebox `run_build` is byte-identical to
@@ -9150,6 +9449,7 @@ impl IsolatedBuild {
         Ok(Self {
             root: root.to_path_buf(),
             session: Some(session),
+            builder_v2: executor.capability().builder_v2,
             host_build: false,
         })
     }
@@ -9162,6 +9462,7 @@ impl IsolatedBuild {
         Self {
             root: root.to_path_buf(),
             session: None,
+            builder_v2: false,
             host_build: true,
         }
     }
@@ -9604,7 +9905,11 @@ async fn command_version(program: &Path, args: &[&str], cwd: &Path) -> String {
         Ok(Ok(output)) if output.status.success() => {
             let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            if stdout.is_empty() { stderr } else { stdout }
+            if stdout.is_empty() {
+                stderr
+            } else {
+                stdout
+            }
         }
         _ => "unavailable".to_string(),
     }
@@ -10059,8 +10364,8 @@ async fn parse_expose(path: &Path) -> Option<u16> {
 /// trailingSlash, images, crons, and per-function overrides (matched by glob).
 fn apply_vercel_config(m: &mut Manifest, vc: &fluid_build::VercelConfig, log: &dyn Fn(String)) {
     use fluid_core::{
-        CondValue, CronSpec, Header, HeaderRule, ImagesConfig, LocalPattern, Redirect,
-        RemotePattern, Rewrite, RuleCondition, redirect_status,
+        redirect_status, CondValue, CronSpec, Header, HeaderRule, ImagesConfig, LocalPattern,
+        Redirect, RemotePattern, Rewrite, RuleCondition,
     };
 
     let conv_conds = |cs: &[fluid_build::VercelCondition]| -> Vec<RuleCondition> {
@@ -10327,14 +10632,138 @@ fn container_volume_cfg(
     // is pinned (unlike compose) so scale-out instances coexist; the backend
     // assigns dynamic addresses within the project subnet.
     let (net, subnet, gw) = project_net(project);
+    // The Marketplace application's stable private API hostname resolves to
+    // THIS node's bridge gateway only for the configured Marketplace project.
+    // The node-local HTTPS gateway then selects a destination over Iroh; the
+    // application never receives mesh topology.  Other tenant projects get no
+    // such host entry and cannot address the gateway by this name.
+    let hosts = std::env::var("HIVE_MARKETPLACE_PROJECT")
+        .ok()
+        .filter(|configured| configured == project)
+        .map(|_| {
+            let host = std::env::var("HIVE_MARKETPLACE_GATEWAY_HOST")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "devhub-marketplace.internal".into());
+            vec![format!("{host}:{gw}")]
+        })
+        .unwrap_or_default();
     serde_json::json!({
         "vol": name,
         "volpath": container_volume_path(volume_path),
         "net": net,
         "subnet": subnet,
         "gw": gw,
+        "hosts": hosts,
     })
     .to_string()
+}
+
+/// Inject the Marketplace application's server/runtime contract from
+/// node-owned secrets.  The repository never carries these values and the
+/// deployment request cannot override them.  Only the public Clerk key is
+/// exposed to the build, because Next.js must bake `NEXT_PUBLIC_*` values;
+/// every other value remains runtime-only.
+fn inject_marketplace_runtime(
+    project: &str,
+    build_env: &mut std::collections::BTreeMap<String, String>,
+    runtime_env: &mut std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    if std::env::var("HIVE_MARKETPLACE_PROJECT").ok().as_deref() != Some(project) {
+        return Ok(());
+    }
+    let required = |name: &str| -> anyhow::Result<String> {
+        std::env::var(name)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Marketplace runtime is missing required operator secret {name}")
+            })
+    };
+    let values = [
+        (
+            "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY",
+            required("HIVE_MARKETPLACE_RUNTIME_NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY")?,
+        ),
+        (
+            "CLERK_SECRET_KEY",
+            required("HIVE_MARKETPLACE_RUNTIME_CLERK_SECRET_KEY")?,
+        ),
+        (
+            "CLERK_JWT_ISSUER",
+            required("HIVE_MARKETPLACE_RUNTIME_CLERK_JWT_ISSUER")?,
+        ),
+        (
+            "DEVHUB_PRIVATE_BACKEND_URL",
+            "https://devhub-marketplace.internal".to_string(),
+        ),
+        (
+            "DEVHUB_MARKETPLACE_KEY_ID",
+            required("HIVE_MARKETPLACE_RUNTIME_DEVHUB_MARKETPLACE_KEY_ID")?,
+        ),
+        (
+            "DEVHUB_MARKETPLACE_SIGNING_SECRET",
+            required("HIVE_MARKETPLACE_RUNTIME_DEVHUB_MARKETPLACE_SIGNING_SECRET")?,
+        ),
+    ];
+    for (key, value) in values {
+        runtime_env.insert(key.to_owned(), value);
+    }
+    let public_key = runtime_env
+        .get("NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY")
+        .cloned()
+        .expect("Marketplace public key inserted above");
+    build_env.insert("NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY".into(), public_key);
+    Ok(())
+}
+
+/// Attach the sole fixed Marketplace credential mount selector to container
+/// functions. The selector is issued by `MarketplaceReleaseStore`, not by a
+/// project setting, deploy request, or repository manifest; hive-backend maps
+/// it to the fixed root-owned runtime files and rejects every other mount.
+fn inject_marketplace_workload_credential(
+    cloud: &CloudState,
+    project: &str,
+    manifest: &mut Manifest,
+) -> anyhow::Result<()> {
+    let credential = cloud
+        .marketplace_releases
+        .unambiguous_credential_for_project(project)
+        .map_err(|code| anyhow::anyhow!("{code}"))?;
+    let Some(credential) = credential else {
+        return Ok(());
+    };
+    for function in &mut manifest.functions {
+        anyhow::ensure!(
+            function.start_cmd.first().map(String::as_str) == Some("__container__")
+                && function.start_cmd.len() == 4,
+            "marketplace_workload_certificate_runtime_unsupported"
+        );
+        let mut config: serde_json::Value = serde_json::from_str(&function.start_cmd[3])
+            .map_err(|_| anyhow::anyhow!("marketplace_workload_certificate_runtime_unsupported"))?;
+        let object = config.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!("marketplace_workload_certificate_runtime_unsupported")
+        })?;
+        // These platform-generated keys are never accepted from tenant
+        // manifests. A preexisting value indicates an attempt to bypass the
+        // immutable release authority and fails closed.
+        anyhow::ensure!(
+            !object.contains_key("marketplace_workload_mtls")
+                && !object.contains_key("marketplace_credential_id"),
+            "marketplace_workload_certificate_runtime_unsupported"
+        );
+        object.insert(
+            "marketplace_workload_mtls".into(),
+            serde_json::Value::Bool(true),
+        );
+        object.insert(
+            "marketplace_credential_id".into(),
+            serde_json::Value::String(credential.clone()),
+        );
+        function.start_cmd[3] = serde_json::to_string(&config)
+            .map_err(|_| anyhow::anyhow!("marketplace_workload_certificate_runtime_unsupported"))?;
+    }
+    Ok(())
 }
 
 /// Deterministic per-project podman network (name, /24 subnet, gateway) in the
@@ -10492,30 +10921,37 @@ async fn image_container_manifest(
     let path = podman_path_env();
     // Fully qualify short names (`user/img` → `docker.io/user/img`) — Linux podman
     // rejects unqualified refs ("short-name resolution enforced").
-    let qualified = qualify_image_ref(image);
+    let qualified = if image.starts_with("sha256:") {
+        image.to_owned()
+    } else {
+        qualify_image_ref(image)
+    };
     let image = qualified.as_str();
-    // Pull the image (fail the build with the registry error if it can't be fetched —
-    // e.g. not found / private registry needing auth).
-    log(format!("Pulling image {image} …"));
-    let t0 = now_ms();
-    let out = Command::new("podman")
-        .args(["pull", image])
-        .env("PATH", &path)
-        .output()
-        .await?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        let msg = err
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("pull failed");
-        anyhow::bail!("podman pull {image} failed: {}", msg.trim());
+    // A builder-v2 image has already been imported from the sealed OCI archive
+    // and is addressed only by its local content digest. Pulling it would turn
+    // a mutable registry/tag into deployment authority.
+    if !image.starts_with("sha256:") {
+        log(format!("Pulling image {image} …"));
+        let t0 = now_ms();
+        let out = Command::new("podman")
+            .args(["pull", image])
+            .env("PATH", &path)
+            .output()
+            .await?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let msg = err
+                .lines()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("pull failed");
+            anyhow::bail!("podman pull {image} failed: {}", msg.trim());
+        }
+        log(format!(
+            "Pulled {image} in {}ms",
+            now_ms().saturating_sub(t0)
+        ));
     }
-    log(format!(
-        "Pulled {image} in {}ms",
-        now_ms().saturating_sub(t0)
-    ));
 
     // Port + protocol: explicit values win outright. Otherwise auto-detect from the
     // image's own `ExposedPorts` (falling back to 8080/http when nothing is exposed
@@ -11648,11 +12084,9 @@ mod tests {
         assert!(adapter_manifest("p", "nextjs", &dir, None).await.is_none());
         // No server function yet → None even for opennext.
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(
-            adapter_manifest("p", "opennext", &dir, None)
-                .await
-                .is_none()
-        );
+        assert!(adapter_manifest("p", "opennext", &dir, None)
+            .await
+            .is_none());
         // Full OpenNext output → hybrid manifest (assets + origin fallthrough).
         std::fs::create_dir_all(dir.join(".open-next/server-functions/default")).unwrap();
         std::fs::write(
@@ -12208,15 +12642,13 @@ mod tests {
         assert_eq!(sanitize_tag("---weird///name---"), "weird-name");
         assert_eq!(sanitize_tag(""), "app");
         // Only [a-z0-9._-] survive.
-        assert!(
-            sanitize_tag("Foo/Bar:Baz")
-                .chars()
-                .all(|c| c.is_ascii_lowercase()
-                    || c.is_ascii_digit()
-                    || c == '.'
-                    || c == '_'
-                    || c == '-')
-        );
+        assert!(sanitize_tag("Foo/Bar:Baz")
+            .chars()
+            .all(|c| c.is_ascii_lowercase()
+                || c.is_ascii_digit()
+                || c == '.'
+                || c == '_'
+                || c == '-'));
     }
 
     #[test]

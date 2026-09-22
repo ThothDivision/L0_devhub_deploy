@@ -249,6 +249,7 @@ pub struct BuildNetworkPolicy {
     pub bridge: String,
     pub subnet: String,
     pub gateway: String,
+    pub dns_enabled: bool,
     pub dns_upstream_ipv4: Vec<String>,
     pub policy_id: String,
     pub policy_digest: String,
@@ -261,6 +262,29 @@ pub struct BuildNetworkPolicy {
     pub fleet_public_ipv4: Vec<String>,
     pub fleet_probe_ipv4: String,
     pub provision_lock_path: PathBuf,
+}
+
+/// Separate host-attested network capability for Marketplace SQL migration
+/// jobs. It is never selected by ordinary build requests.
+#[derive(Clone, Debug)]
+pub struct MigrationNetworkPolicy {
+    pub policy: BuildNetworkPolicy,
+    pub target_verify_path: PathBuf,
+    pub target_verify_sha256: [u8; 32],
+}
+
+#[derive(Clone, Debug)]
+pub struct MigrationNetworkTarget {
+    pub ipv4: std::net::Ipv4Addr,
+    pub port: u16,
+}
+
+fn is_valid_migration_target(ipv4: std::net::Ipv4Addr) -> bool {
+    !ipv4.is_unspecified()
+        && !ipv4.is_loopback()
+        && !ipv4.is_link_local()
+        && !ipv4.is_multicast()
+        && ipv4 != std::net::Ipv4Addr::BROADCAST
 }
 
 #[derive(Clone, Debug)]
@@ -295,6 +319,14 @@ pub struct BuildExecutorConfig {
     /// `None` means `--network=none`. Some means attach only to the named,
     /// live-verified host policy network.
     pub network_policy: Option<BuildNetworkPolicy>,
+    /// A migration-only attachment. Keeping this distinct from
+    /// `network_policy` prevents a normal repository build from inheriting
+    /// database egress.
+    pub migration_network_policy: Option<MigrationNetworkPolicy>,
+    /// Explicit host-published capability for OCI source builds.  Existing
+    /// executor installations deliberately omit this and therefore remain
+    /// repository-command-only until Ansible has completed the v2 probe.
+    pub builder_v2: bool,
 }
 
 const INSTALLED_CAPABILITY_PATH: &str = "/var/lib/hive/build-executor.json";
@@ -382,6 +414,36 @@ struct InstalledCapability {
     builder_uid: u32,
     builder_gid: u32,
     workspace_bytes: u64,
+    #[serde(default)]
+    builder_v2: bool,
+    #[serde(default)]
+    migration_network: Option<InstalledMigrationNetworkCapability>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstalledMigrationNetworkCapability {
+    capability_id: String,
+    capability_version: u32,
+    policy_version: u32,
+    network_name: String,
+    network_bridge: String,
+    network_subnet: String,
+    network_gateway: String,
+    network_dns_upstream_ipv4: Vec<String>,
+    network_policy_id: String,
+    network_policy_digest: String,
+    network_verify_path: PathBuf,
+    network_verify_sha256: String,
+    nft_binary: PathBuf,
+    nft_policy_path: PathBuf,
+    nft_table: String,
+    nft_bridge_table: String,
+    fleet_public_ipv4: Vec<String>,
+    fleet_probe_ipv4: String,
+    provision_lock_path: PathBuf,
+    target_verify_path: PathBuf,
+    target_verify_sha256: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -404,6 +466,7 @@ pub struct BuildCapability {
     pub gid: u32,
     pub volume_driver: String,
     pub egress: BuildEgressCapability,
+    pub builder_v2: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -532,6 +595,8 @@ pub struct BuildSession {
     workspace_volume: String,
     _lifecycle_lock: Option<Arc<std::fs::File>>,
     cleanup: CleanupGuard,
+    network_policy: Option<BuildNetworkPolicy>,
+    migration: bool,
     surface: BuildSurface,
     deadline: Instant,
     emitted_log_bytes: u64,
@@ -853,27 +918,62 @@ impl BuildExecutor {
                 max_total_time: Duration::from_secs(45 * 60),
             },
             allowed_env: BTreeSet::new(),
-            network_policy: Some(BuildNetworkPolicy {
-                network: declaration.network_name,
-                bridge: declaration.network_bridge,
-                subnet: declaration.network_subnet,
-                gateway: declaration.network_gateway,
-                dns_upstream_ipv4: declaration.network_dns_upstream_ipv4,
-                policy_id: declaration.network_policy_id,
-                policy_digest: declaration.network_policy_digest,
-                verify_path: declaration.network_verify_path,
-                verify_sha256: parse_sha256(
-                    &declaration.network_verify_sha256,
-                    "network verifier sha256",
-                )?,
-                nft_binary: declaration.nft_binary,
-                nft_policy_path: declaration.nft_policy_path,
-                nft_table: declaration.nft_table,
-                nft_bridge_table: declaration.nft_bridge_table,
-                fleet_public_ipv4: declaration.fleet_public_ipv4,
-                fleet_probe_ipv4: declaration.fleet_probe_ipv4,
-                provision_lock_path: declaration.provision_lock_path,
-            }),
+            // Ordinary BuildExecutor jobs are intentionally offline. The
+            // legacy declaration's network facts are retained for its
+            // integrity checks above but are not an ambient build capability.
+            network_policy: None,
+            migration_network_policy: declaration
+                .migration_network
+                .map(|migration| {
+                    if migration.capability_id != "hive-marketplace-migration-network"
+                        || migration.capability_version != 1
+                        || migration.policy_version != 1
+                        || migration.network_policy_id != "marketplace-migration-v1"
+                        || migration.network_dns_upstream_ipv4.len() != 0
+                        || !migration.target_verify_path.is_absolute()
+                    {
+                        return Err(BuildExecutorError::new(
+                            BuildExecutorErrorCode::CapabilityMismatch,
+                            "load Marketplace migration capability",
+                            "migration capability declaration is incomplete",
+                        ));
+                    }
+                    validate_trusted_executable(
+                        &migration.target_verify_path,
+                        "Marketplace migration target verifier",
+                    )?;
+                    Ok(MigrationNetworkPolicy {
+                        policy: BuildNetworkPolicy {
+                            network: migration.network_name,
+                            bridge: migration.network_bridge,
+                            subnet: migration.network_subnet,
+                            gateway: migration.network_gateway,
+                            dns_enabled: false,
+                            dns_upstream_ipv4: migration.network_dns_upstream_ipv4,
+                            policy_id: migration.network_policy_id,
+                            policy_digest: migration.network_policy_digest,
+                            verify_path: migration.network_verify_path,
+                            verify_sha256: parse_sha256(
+                                &migration.network_verify_sha256,
+                                "migration network verifier sha256",
+                            )?,
+                            nft_binary: migration.nft_binary,
+                            nft_policy_path: migration.nft_policy_path,
+                            nft_table: migration.nft_table,
+                            nft_bridge_table: migration.nft_bridge_table,
+                            fleet_public_ipv4: migration.fleet_public_ipv4,
+                            fleet_probe_ipv4: migration.fleet_probe_ipv4,
+                            provision_lock_path: migration.provision_lock_path,
+                        },
+                        target_verify_path: migration.target_verify_path,
+                        target_verify_sha256: parse_sha256(
+                            &migration.target_verify_sha256,
+                            "migration target verifier sha256",
+                        )?,
+                    })
+                })
+                .transpose()?,
+            builder_v2: declaration.builder_v2,
         };
         Self::new(config).await
     }
@@ -906,6 +1006,15 @@ impl BuildExecutor {
             &mut hasher,
             "builder-image",
             config.builder_image.as_bytes(),
+        );
+        digest_field(
+            &mut hasher,
+            "builder-v2",
+            if config.builder_v2 {
+                b"enabled"
+            } else {
+                b"disabled"
+            },
         );
         digest_field(&mut hasher, "builder-init", BUILDER_INIT_PATH.as_bytes());
         for capability in BUILDER_CAPABILITIES {
@@ -1081,6 +1190,7 @@ impl BuildExecutor {
                     gid: config.user.gid,
                     volume_driver: config.volume.driver.clone(),
                     egress: BuildEgressCapability::Denied,
+                    builder_v2: config.builder_v2,
                 },
             }),
         };
@@ -1131,11 +1241,15 @@ impl BuildExecutor {
             gid: config.user.gid,
             volume_driver: config.volume.driver.clone(),
             egress,
+            builder_v2: config.builder_v2,
         })
     }
 
-    async fn acquire_lifecycle_lock(&self) -> Result<Option<Arc<std::fs::File>>> {
-        let Some(policy) = self.inner.config.network_policy.as_ref() else {
+    async fn acquire_lifecycle_lock(
+        &self,
+        policy: Option<&BuildNetworkPolicy>,
+    ) -> Result<Option<Arc<std::fs::File>>> {
+        let Some(policy) = policy else {
             return Ok(None);
         };
         let path = policy.provision_lock_path.clone();
@@ -1201,13 +1315,99 @@ impl BuildExecutor {
     }
 
     pub async fn begin(&self, request: BuildRequest) -> Result<BuildSession> {
+        self.begin_with_network(request, None, false, None).await
+    }
+
+    /// Begin the only BuildExecutor surface permitted to contact a managed
+    /// Marketplace Postgres. The target verifier is host-owned and must prove
+    /// an exact IPv4/5432 rule before the sandbox is created.
+    pub async fn begin_migration(
+        &self,
+        request: BuildRequest,
+        target: MigrationNetworkTarget,
+    ) -> Result<BuildSession> {
+        if target.port != 5432 || !is_valid_migration_target(target.ipv4) {
+            return Err(BuildExecutorError::new(
+                BuildExecutorErrorCode::InvalidRequest,
+                "begin Marketplace migration",
+                "migration target is not a managed Postgres endpoint",
+            ));
+        }
+        let Some(migration) = self.inner.config.migration_network_policy.as_ref() else {
+            return Err(BuildExecutorError::new(
+                BuildExecutorErrorCode::CapabilityUnavailable,
+                "begin Marketplace migration",
+                "MARKETPLACE_MIGRATION_NETWORK_UNAVAILABLE",
+            ));
+        };
+        validate_trusted_executable(
+            &migration.target_verify_path,
+            "Marketplace migration target verifier",
+        )?;
+        if sha256_file(&migration.target_verify_path).await? != migration.target_verify_sha256 {
+            return Err(BuildExecutorError::new(
+                BuildExecutorErrorCode::CapabilityMismatch,
+                "begin Marketplace migration",
+                "migration target verifier differs from the declared capability",
+            ));
+        }
+        let mut verifier = Command::new(&migration.target_verify_path);
+        verifier
+            .arg("--migration-target")
+            .arg(format!("{}:{}", target.ipv4, target.port))
+            .env_clear()
+            .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let verified = tokio::time::timeout(Duration::from_secs(15), verifier.status())
+            .await
+            .map_err(|_| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::CapabilityUnavailable,
+                    "verify Marketplace migration target",
+                    "migration target verifier timed out",
+                )
+            })?
+            .map_err(|error| {
+                BuildExecutorError::new(
+                    BuildExecutorErrorCode::CapabilityUnavailable,
+                    "verify Marketplace migration target",
+                    error.to_string(),
+                )
+            })?;
+        if !verified.success() {
+            return Err(BuildExecutorError::new(
+                BuildExecutorErrorCode::CapabilityMismatch,
+                "verify Marketplace migration target",
+                "migration target policy is not active",
+            ));
+        }
+        // Install the migration-specific cleanup contract before entering the
+        // normal session startup path.  From this point any error or Drop,
+        // including one before a container was created, clears the exact
+        // target through the root-owned verifier.
+        let mut cleanup = CleanupGuard::new(self);
+        cleanup.set_migration_policy(migration.clone());
+        self.begin_with_network(request, Some(migration.policy.clone()), true, Some(cleanup))
+            .await
+    }
+
+    async fn begin_with_network(
+        &self,
+        request: BuildRequest,
+        network_policy: Option<BuildNetworkPolicy>,
+        migration: bool,
+        cleanup: Option<CleanupGuard>,
+    ) -> Result<BuildSession> {
         let surface = request.surface;
         let deadline = Instant::now() + self.inner.config.limits.max_total_time;
-        if surface != BuildSurface::RepositoryCommands {
+        if surface != BuildSurface::RepositoryCommands && !self.inner.config.builder_v2 {
             return Err(BuildExecutorError::new(
                 BuildExecutorErrorCode::UnsupportedSurface,
                 "begin build",
-                "builder protocol v1 rejects Dockerfile and Compose surfaces",
+                "BUILDER_V2_UNAVAILABLE: host capability does not attest OCI source builds",
             ));
         }
         let requested_metadata = tokio::fs::symlink_metadata(&request.checkout)
@@ -1251,14 +1451,20 @@ impl BuildExecutor {
                 "checkout must remain a real directory after canonicalization",
             ));
         }
-        let lifecycle_lock = self.acquire_lifecycle_lock().await?;
-        if let Some(policy) = self.inner.config.network_policy.as_ref() {
+        let lifecycle_lock = self.acquire_lifecycle_lock(network_policy.as_ref()).await?;
+        if let Some(policy) = network_policy.as_ref() {
             self.verify_network_policy(policy).await?;
         }
         let id = Uuid::new_v4().simple().to_string();
         let workspace_volume = format!("hive-build-ws-{id}");
         let container = format!("hive-build-{id}");
-        let mut cleanup = CleanupGuard::new(self);
+        let mut cleanup = cleanup.unwrap_or_else(|| CleanupGuard::new(self));
+        if migration {
+            // CleanupGuard owns a clone so its synchronous Drop fallback keeps
+            // the trusted lifecycle lock held until verifier cleanup finishes,
+            // even though BuildSession drops its own field first.
+            cleanup.set_lifecycle_lock(lifecycle_lock.clone());
+        }
         self.create_volume(&workspace_volume, self.inner.config.limits.workspace_bytes)
             .await?;
         cleanup.add_volume(workspace_volume.clone());
@@ -1270,7 +1476,7 @@ impl BuildExecutor {
                 "{workspace_volume}:{WORKSPACE_MOUNT}:rw,U,nodev,nosuid"
             )],
             None,
-            self.inner.config.network_policy.as_ref(),
+            network_policy.as_ref(),
             WORKSPACE_MOUNT,
             idle,
             &[],
@@ -1333,6 +1539,8 @@ impl BuildExecutor {
             workspace_volume,
             _lifecycle_lock: lifecycle_lock,
             cleanup,
+            network_policy,
+            migration,
             surface,
             deadline,
             emitted_log_bytes: 0,
@@ -1543,7 +1751,7 @@ impl BuildExecutor {
             || bridge != policy.bridge
             || ipv6 != Some(false)
             || internal != Some(false)
-            || dns != Some(true)
+            || dns != Some(policy.dns_enabled)
             || !dns_exact
             || policy_label != Some(policy.policy_id.as_str())
             || !subnet_ok
@@ -2225,6 +2433,14 @@ impl BuildSession {
         &self.executor.inner.capability.policy_digest
     }
 
+    /// Finish a session only after its full cleanup contract has completed.
+    /// Marketplace migrations use this before reporting readiness so a failed
+    /// target-set clear cannot be mistaken for a clean completion. Dropping a
+    /// session remains the cancellation-safe fallback.
+    pub async fn destroy(mut self) -> Result<()> {
+        self.cleanup.cleanup(&self.executor).await
+    }
+
     pub async fn run<F>(&mut self, step: BuildStep, mut log: F) -> Result<BuildStepResult>
     where
         F: FnMut(BuildLogLine),
@@ -2259,7 +2475,7 @@ impl BuildSession {
                 self.workspace_volume
             )],
             Some(&env_file.path),
-            self.executor.inner.config.network_policy.as_ref(),
+            self.network_policy.as_ref(),
             &step.cwd.container_path(),
             &wrapper,
             &script_args,
@@ -2422,6 +2638,50 @@ impl BuildSession {
             elapsed: start.elapsed(),
             emitted_log_bytes: self.emitted_log_bytes.saturating_sub(before),
         })
+    }
+
+    /// Execute one SQL migration through the already-created migration-only
+    /// sandbox. The URL is passed only as a short-lived container env-file
+    /// value; the normal step redactor receives it and no caller gets it back.
+    pub async fn run_marketplace_migration<F>(
+        &mut self,
+        relative_sql: &str,
+        database_url: String,
+        log: F,
+    ) -> Result<BuildStepResult>
+    where
+        F: FnMut(BuildLogLine),
+    {
+        if !self.migration {
+            return Err(BuildExecutorError::new(
+                BuildExecutorErrorCode::CapabilityMismatch,
+                "run Marketplace migration",
+                "Marketplace migration execution requires the dedicated network capability",
+            ));
+        }
+        if database_url.trim().is_empty() {
+            return Err(BuildExecutorError::new(
+                BuildExecutorErrorCode::InvalidRequest,
+                "run Marketplace migration",
+                "migration credential is unavailable",
+            ));
+        }
+        let path = WorkspacePath::parse(relative_sql.to_owned())?;
+        let mut env = BTreeMap::new();
+        env.insert("DATABASE_URL".to_owned(), database_url);
+        self.run(
+            BuildStep {
+                label: "marketplace-migration".into(),
+                script: "exec /usr/bin/psql --set=ON_ERROR_STOP=1 --no-psqlrc --file \"$1\"".into(),
+                args: vec![path.container_path()],
+                cwd: WorkspacePath::root(),
+                env,
+                timeout: None,
+                accept_nonzero: false,
+            },
+            log,
+        )
+        .await
     }
 
     pub async fn import_cache_archive(&mut self, archive: &Path, cwd: WorkspacePath) -> Result<()> {
@@ -3194,11 +3454,16 @@ async fn atomic_exchange_directories(staging: &Path, destination: &Path) -> Resu
 struct CleanupState {
     containers: Vec<String>,
     volumes: Vec<String>,
+    /// Only migration sessions populate this.  It is deliberately retained
+    /// until the root-owned verifier proves both the nft target set and the
+    /// migration network have no surviving session state.
+    migration_policy: Option<MigrationNetworkPolicy>,
 }
 
 struct CleanupGuard {
     podman: PathBuf,
     env: BTreeMap<String, String>,
+    lifecycle_lock: Option<Arc<std::fs::File>>,
     state: Option<CleanupState>,
 }
 
@@ -3207,6 +3472,7 @@ impl CleanupGuard {
         Self {
             podman: executor.inner.config.podman_path.clone(),
             env: executor.inner.config.podman_env.clone(),
+            lifecycle_lock: None,
             state: Some(CleanupState::default()),
         }
     }
@@ -3221,6 +3487,16 @@ impl CleanupGuard {
         if let Some(state) = self.state.as_mut() {
             state.volumes.push(name);
         }
+    }
+
+    fn set_migration_policy(&mut self, policy: MigrationNetworkPolicy) {
+        if let Some(state) = self.state.as_mut() {
+            state.migration_policy = Some(policy);
+        }
+    }
+
+    fn set_lifecycle_lock(&mut self, lock: Option<Arc<std::fs::File>>) {
+        self.lifecycle_lock = lock;
     }
 
     async fn remove_container(&mut self, executor: &BuildExecutor, name: &str) -> Result<()> {
@@ -3272,6 +3548,13 @@ impl CleanupGuard {
                 ));
             }
         }
+        if let Some(policy) = state.migration_policy.take() {
+            if let Err(error) = clear_migration_target_async(&policy).await {
+                state.migration_policy = Some(policy);
+                self.state = Some(state);
+                return Err(error);
+            }
+        }
         Ok(())
     }
 }
@@ -3281,14 +3564,21 @@ impl Drop for CleanupGuard {
         let Some(state) = self.state.take() else {
             return;
         };
-        if state.containers.is_empty() && state.volumes.is_empty() {
+        if state.containers.is_empty()
+            && state.volumes.is_empty()
+            && state.migration_policy.is_none()
+        {
             return;
         }
         let podman = self.podman.clone();
         let env = self.env.clone();
+        let lifecycle_lock = self.lifecycle_lock.take();
         let _ = std::thread::Builder::new()
             .name("hive-build-cleanup".to_string())
-            .spawn(move || cleanup_sync(&podman, &env, state));
+            .spawn(move || {
+                let _lifecycle_lock = lifecycle_lock;
+                cleanup_sync(&podman, &env, state);
+            });
     }
 }
 
@@ -3340,6 +3630,95 @@ fn cleanup_sync(podman: &Path, env: &BTreeMap<String, String>, mut state: Cleanu
                 .into_iter()
                 .map(OsString::from),
         );
+    }
+    if let Some(policy) = state.migration_policy.take() {
+        run_migration_target_cleanup_sync(&policy);
+    }
+}
+
+/// Clear the exact Marketplace target only after every tracked migration
+/// container and volume has gone. The verifier owns the trusted lifecycle lock,
+/// capability/policy validation, nft mutation, empty-set proof, and final
+/// attachment proof; the unprivileged caller supplies no cleanup scope.
+async fn clear_migration_target_async(policy: &MigrationNetworkPolicy) -> Result<()> {
+    validate_trusted_executable(
+        &policy.target_verify_path,
+        "Marketplace migration cleanup verifier",
+    )?;
+    if sha256_file(&policy.target_verify_path).await? != policy.target_verify_sha256 {
+        return Err(BuildExecutorError::new(
+            BuildExecutorErrorCode::CapabilityMismatch,
+            "clear Marketplace migration target",
+            "migration cleanup verifier differs from the declared capability",
+        ));
+    }
+    let mut command = Command::new(&policy.target_verify_path);
+    command
+        .arg("--clear-migration-target")
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let status = tokio::time::timeout(CLEANUP_TIMEOUT, command.status())
+        .await
+        .map_err(|_| {
+            BuildExecutorError::new(
+                BuildExecutorErrorCode::CleanupFailed,
+                "clear Marketplace migration target",
+                "migration cleanup verifier timed out",
+            )
+        })?
+        .map_err(|_| {
+            BuildExecutorError::new(
+                BuildExecutorErrorCode::CleanupFailed,
+                "clear Marketplace migration target",
+                "could not run migration cleanup verifier",
+            )
+        })?;
+    if !status.success() {
+        return Err(BuildExecutorError::new(
+            BuildExecutorErrorCode::CleanupFailed,
+            "clear Marketplace migration target",
+            "migration cleanup verification failed",
+        ));
+    }
+    Ok(())
+}
+
+fn run_migration_target_cleanup_sync(policy: &MigrationNetworkPolicy) {
+    let child = std::process::Command::new(&policy.target_verify_path)
+        .arg("--clear-migration-target")
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else {
+        eprintln!("Marketplace migration cleanup verifier could not start");
+        return;
+    };
+    let deadline = std::time::Instant::now() + CLEANUP_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    eprintln!("Marketplace migration cleanup verifier failed");
+                }
+                return;
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                eprintln!("Marketplace migration cleanup verifier timed out");
+                return;
+            }
+        }
     }
 }
 

@@ -21,6 +21,27 @@ hive_data_dir: "/var/lib/hive/data"
 # hive_name and hive_region come from inventory (per-host vars).
 hive_listen: "0.0.0.0:8787"
 hive_admin: "127.0.0.1:8786"
+# ---------- Marketplace settlement ----------
+# Addresses and HMAC keys remain in the encrypted vault; this explicit profile
+# gate intentionally leaves settlement unavailable until audited contracts are
+# deployed and approved.
+hive_marketplace_settlement_profile: ""
+hive_marketplace_testnet_atomic_split_audited: false
+hive_marketplace_testnet_configuration_reference: ""
+# The private Marketplace gateway remains disabled unless a project and a
+# private Podman-bridge bind address are deliberately configured.
+hive_marketplace_project: ""
+hive_marketplace_gateway_host: "devhub-marketplace.internal"
+hive_marketplace_gateway_listen: ""
+hive_marketplace_gateway_tls_cert: "/etc/hive/marketplace-ca/gateway.crt"
+hive_marketplace_gateway_tls_key: "/etc/hive/marketplace-ca/gateway.key"
+hive_marketplace_gateway_ca_cert: "/etc/hive/marketplace-ca/ca.crt"
+# Root-owned only. CA/server material and per-workload client credentials are
+# supplied from vault; no private key is placed in generated environment files.
+hive_marketplace_gateway_client_ca: ""
+# Fixed in the runtime; retained as documentation only. It is intentionally
+# not rendered into the service environment.
+hive_marketplace_workload_cert_root: "/var/lib/hive/marketplace-workload-certs"
 # HIVE_BOOTSTRAP_PEERS: one existing node's 64-hex iroh NodeId is enough for
 # a NEW node to join (see roles/mesh_bootstrap and playbooks/node-join.yml).
 # For a from-scratch fleet, leave the first node's bootstrap_peers empty.

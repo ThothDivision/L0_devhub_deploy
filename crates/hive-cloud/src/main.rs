@@ -60,6 +60,9 @@ mod integrity_signer;
 mod lease;
 mod listener_audit;
 mod marketplace;
+mod marketplace_gateway;
+mod marketplace_migrations;
+mod marketplace_releases;
 mod memwatch;
 mod mesh_raw;
 mod mesh_shell;
@@ -1545,6 +1548,13 @@ async fn async_main() -> anyhow::Result<()> {
         tracing::info!(gateway = %args.listen, "iroh P2P tunnel server accepting peer connections (join + raw-target surfaces on)");
     }
 
+    // An opt-in, private HTTPS endpoint for Marketplace containers.  It is
+    // intentionally not merged into the Admin or public edge routers: the
+    // listener forwards its allowlisted contract through authenticated Iroh
+    // gossip and the destination node performs Marketplace HMAC verification.
+    marketplace_gateway::spawn(cloud.clone());
+    marketplace_releases::spawn_credential_rotation(cloud.clone());
+
     // Initial owner resolution (single-node: this node is owner) + seed the
     // gossiped fencing epoch.
     let _ = cloud.control_plane_leader();
@@ -1922,6 +1932,7 @@ async fn async_main() -> anyhow::Result<()> {
             .unwrap_or(120),
     );
     let admin_router = admin::router(cloud.clone())
+        .merge(crate::marketplace_releases::routes(cloud.clone()))
         // Marketplace is authenticated with its own service credential inside
         // the module; it must never consume a DevHub hive_jwt.
         .merge(crate::marketplace::routes(cloud.clone()))
