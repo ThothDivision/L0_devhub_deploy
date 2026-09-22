@@ -88,6 +88,16 @@ const TEMPLATES: Template[] = [
   // world-standard, actively-maintained public image — EULA=TRUE is
   // Mojang's own required acceptance flag, not a platform invention.
   { name: "Minecraft Server", desc: "Java Edition server (itzg/minecraft-server) with a persistent world, raw TCP.", image: "itzg/minecraft-server:latest", port: 25565, protocol: "tcp", env: { EULA: "TRUE" }, memory: "3g", tag: "MC", color: "#5b8c3e" },
+
+  // Web3 / smart contracts (EVM) — one entry per directory of Chainlink's
+  // smart-contract-examples monorepo. Each is a self-contained Hardhat
+  // project: the Node build lane installs + compiles it, and your RPC URL /
+  // deployer key go in Environment Variables on the configure screen (they
+  // stay encrypted at rest). Contract dirs have no long-running server —
+  // the deployment surfaces the compile + deploy build logs.
+  { name: "Smart Contract — Lottery", desc: "Chainlink VRF + Automation lottery dApp (Hardhat, EVM).", repo: "https://github.com/smartcontractkit/smart-contract-examples", root: "lottery", branch: "main", tag: "Ξ", color: "#375bd2" },
+  { name: "Smart Contract — Random SVG NFT", desc: "On-chain generative SVG NFT minted with Chainlink VRF (Hardhat).", repo: "https://github.com/smartcontractkit/smart-contract-examples", root: "random-svg-nft", branch: "main", tag: "Ξ", color: "#627eea" },
+  { name: "Smart Contract — NFT Collection", desc: "Full NFT collection starter: ERC-721, deploy scripts, Chainlink (Hardhat).", repo: "https://github.com/smartcontractkit/smart-contract-examples", root: "ultimate-nft-repo", branch: "main", tag: "Ξ", color: "#8247e5" },
 ];
 
 function slug(s: string) {
@@ -447,6 +457,36 @@ export default function NewProjectPage() {
         <ArrowLeft className="h-4 w-4" /> Back
       </Link>
       <h1 className="mb-6 text-2xl sm:text-3xl font-semibold tracking-tight">Let&apos;s build something new</h1>
+
+      {/* Web3 spotlight — smart contracts are a first-class deployment shape on
+          this platform, so surface them ABOVE the source bar (they're also in
+          the Clone Template list below, which keeps paging). Each jumps straight
+          to the same configure screen as any template (team picker + env vars
+          for the RPC URL / deployer key). Uploading your own contract source is
+          the existing .zip / Git URL paths below — no contract-specific flow. */}
+      <div className="mb-8">
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-sm font-medium text-secondary">Deploy a smart contract</h2>
+          <Link href="/new/upload" className="text-xs text-secondary underline decoration-dotted underline-offset-2 hover:text-fg">
+            Upload your own (.zip)
+          </Link>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          {TEMPLATES.filter((t) => t.tag === "Ξ").map((t) => (
+            <button
+              key={t.name}
+              onClick={() => { setError(""); setSelected(t); }}
+              disabled={deploying}
+              className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2 text-sm hover:bg-subtle disabled:opacity-50"
+            >
+              <span className="flex h-6 w-6 items-center justify-center rounded text-xs font-bold text-white" style={{ background: t.color }}>
+                {t.tag}
+              </span>
+              <span className="font-medium">{t.name.replace("Smart Contract — ", "")}</span>
+            </button>
+          ))}
+        </div>
+      </div>
 
       {/* Unified source bar — a Git repository URL OR a container image / registry
           reference. The source type is auto-detected on submit and routed to the
