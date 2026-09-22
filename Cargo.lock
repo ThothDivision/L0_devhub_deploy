@@ -2358,6 +2358,7 @@ dependencies = [
  "redb 4.1.0",
  "rust-stemmers",
  "rust_decimal",
+ "rustls",
  "serde",
  "serde_cbor",
  "serde_json",
@@ -2797,6 +2798,8 @@ dependencies = [
  "iroh-mainline-address-lookup",
  "n0-future",
  "n0-mainline",
+ "noq",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
@@ -4395,6 +4398,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa6c890013591e709a3e45dd53501351b7e27e7ff3c7e9fc3dce43e300e7e9d3"
 dependencies = [
  "aes-gcm",
+ "aws-lc-rs",
  "bytes",
  "derive_more 2.1.1",
  "enum-assoc",
@@ -7211,6 +7215,7 @@ version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dad543404f98bfc969aeb71994105c592acfc6c43323fddcd016bb208d1c65cb"
 dependencies = [
+ "aws-lc-rs",
  "base64",
  "bytes",
  "futures-core",
