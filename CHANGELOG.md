@@ -1,5 +1,30 @@
 # Changelog
 
+## 2026-09-22 — the litebox orphan reaper missed every orphan created by an ordinary runner deploy
+
+`LiteboxBackend::reap_orphaned_runners` (boot-time, SIGKILLs any process whose
+`/proc/<pid>/exe` is the runner binary) compared that readlink by plain string
+equality. Replacing `/usr/local/bin/litebox-runner` — what every deploy does;
+Linux refuses an in-place overwrite of a running executable (`ETXTBSY`), so the
+role and this platform's own ship scripts both `mv` a new file onto the path —
+unlinks the OLD inode while an existing orphan still has it mapped, and the
+kernel then appends `" (deleted)"` to that orphan's `/proc/<pid>/exe` from then
+on. The comparison silently stopped matching for exactly the orphans a binary
+swap creates. Two fc-phoenix runners from an earlier incarnation survived two
+restarts this way, burning ~48% of a core apiece for nearly an hour before
+being killed by hand.
+
+`strip_deleted_exe_suffix` undoes the annotation before comparing. Confirmed
+the kernel behavior directly (`cp`+`mv -f` over a running `sleep` on va: its
+`/proc/<pid>/exe` read back with the suffix). Reproduced the bug for real on
+fc-phoenix — hard-killed hive-node, swapped the runner binary the same way a
+deploy does, confirmed the two now-orphaned runners read `(deleted)` — then
+restarted onto the fixed binary: `reaped=2`, both gone, zero orphans left.
+Rolled to fc-sanjose next, which had accumulated `reaped=7` from tonight's
+earlier restarts; both survey apps and tokenhun cold-started normally
+afterward. Every litebox runner on both nodes is now a child of the current
+hive-node process.
+
 ## 2026-09-22 — litebox `fork()` root-caused and fixed: a second external command no longer wedges a sandbox shell
 
 The wedge behind the `ifconfig` report was not the not-found path: on a native

@@ -419,6 +419,19 @@ hard-resets the host (previous section), so the only remaining fallback was
 builds `litebox_runner_linux_userland` from a pinned commit; litebox ships no
 releases).
 
+- **A runner-binary deploy must strip `/proc/<pid>/exe`'s `" (deleted)"`
+  suffix before comparing paths, or the boot-time orphan reaper goes blind.**
+  `LiteboxBackend::reap_orphaned_runners` SIGKILLs any process whose exe is
+  the runner binary, but replacing that binary (every deploy: Linux refuses
+  an in-place overwrite of a running executable, `ETXTBSY`, so the role and
+  every ship script `mv` a new file onto the path) unlinks the orphan's OLD
+  inode while it is still mapped, and the kernel appends `" (deleted)"` to
+  that orphan's readlink from then on — a plain string comparison silently
+  stops matching exactly the orphans a binary swap creates. Confirmed with
+  `cp`+`mv -f` over a running process (the readlink target gains the
+  suffix); witnessed live on fc-phoenix (two orphans, ~48% of a core each,
+  nearly an hour) and fc-sanjose (`reaped=7` on the next restart after this
+  fix). `strip_deleted_exe_suffix` undoes the annotation before comparing.
 - **Two-tier verification, same shape as PVM.** `LiteboxBackend::is_supported()`
   (Tier 1, existence-only) gates `--litebox-probe` (Tier 2, bring-up only,
   never on a node carrying traffic — mirrors `pvm_run_smoke_test`'s gating
