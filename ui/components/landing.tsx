@@ -201,13 +201,14 @@ export function Landing() {
 
         <div className="relative z-10 mx-auto max-w-5xl px-6 pb-2 pt-[3.15rem] text-center sm:pt-[4.2rem]">
           <h1 className="text-balance text-5xl font-normal leading-[1.05] tracking-tight text-white sm:text-7xl">
-            <span className="font-bold">The compute market</span>
+            <span className="font-bold">The serverless cloud</span>
             <br />
-            for every service on Earth
+            for people and their agents
           </h1>
-          <p className="mx-auto mt-7 max-w-xl text-lg leading-relaxed text-zinc-400">
-            Unleash the Power of Peer-to-Peer: Seamlessly Connect, Collaborate, and Conquer with Our
-            Cutting-Edge Cloud
+          <p className="mx-auto mt-7 max-w-2xl text-lg leading-relaxed text-zinc-400">
+            Deploy apps, databases, and AI workloads across a distributed edge network. Ship simply,
+            scale as you grow, and keep control of where your infrastructure runs, with all the
+            familiar features from Vercel.
           </p>
           <div className="mt-10 flex items-center justify-center gap-4">
             <Link
