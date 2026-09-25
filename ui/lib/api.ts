@@ -1118,6 +1118,10 @@ export interface ProjectSettings {
    *  the Network settings page (an immediate, no-redeploy live edit),
    *  not here. */
   container?: ContainerSettings | null;
+  /** Dashboard-managed game-server config (Drive mods sync + version pins +
+   *  world-save snapshots). Absent/null = not configured. Applies on the
+   *  next deploy — see the Game settings page. */
+  game?: GameServerSettings | null;
   /** The project's paid dedicated public IPv4 allocation, if purchased
    *  (`hive_cloud::tencent_eip::provision_from_checkout`). `null`/absent
    *  until purchased; stays set across redeploys (the same address is
@@ -1136,6 +1140,29 @@ export interface ContainerSettings {
   cpus?: string | null;
   pids?: number | null;
   volume_mount_path?: string | null;
+}
+
+/** See `ProjectSettings.game`. Mirrors
+ *  `hive_cloud::project_settings::GameServerSettings` field-for-field. */
+export interface GameServerSettings {
+  /** Drive folder holding this server's mod/plugin files, e.g. "/mods".
+   *  Empty/null = no Drive sync. */
+  mods_drive_path?: string | null;
+  /** Directory inside the persistent volume the files land in (default
+   *  "mods" — "plugins" for a Bukkit-style server). */
+  mods_dest_subdir?: string | null;
+  /** Game version pin, e.g. "1.21.4" — stamped as the `VERSION` env var on
+   *  the container when the image/compose file did not already set one. */
+  game_version?: string | null;
+  /** Server type/flavor, e.g. "PAPER"/"FORGE"/"FABRIC" — stamped as the
+   *  `TYPE` env var with the same never-override rule. */
+  server_type?: string | null;
+  /** Snapshot the world dir of the persistent volume before each deploy
+   *  (rollback point per build, kept inside the volume). */
+  world_snapshot_on_deploy?: boolean;
+  /** World directory inside the volume that gets snapshotted (default
+   *  "world"). */
+  world_subdir?: string | null;
 }
 
 // ---- Browser-replicated database (browser_db contract) ----
