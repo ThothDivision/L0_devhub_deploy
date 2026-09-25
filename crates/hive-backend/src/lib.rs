@@ -15,6 +15,13 @@
 
 pub mod cell_orphans;
 pub mod container_cli;
+// Firecracker stays declared on EVERY platform: `hive-cloud` names
+// `FirecrackerBackend` unconditionally (resources.rs, main.rs), so gating the
+// module to linux alone broke the macOS build -- caught by a host `cargo check`
+// after I made exactly that change. Its Unix-only INTERNALS are gated inside
+// the module instead, so the type exists everywhere while /dev/kvm, vsock and
+// fd passing compile only where they exist. Windows shadow nodes isolate
+// through Litebox's Linux-userland-on-Windows runner, never Firecracker.
 pub mod firecracker;
 pub mod litebox;
 pub mod litebox_macos;
@@ -321,6 +328,10 @@ pub async fn connect_endpoint(ep: &CellEndpoint) -> anyhow::Result<Box<dyn Duple
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     match ep {
         CellEndpoint::Tcp(addr) => Ok(Box::new(tokio::net::TcpStream::connect(addr).await?)),
+        // A vsock endpoint is reached over the VMM's Unix socket -- a
+        // Firecracker-only path that has no Windows equivalent (Windows
+        // shadow nodes isolate via Litebox, which serves over TCP).
+        #[cfg(unix)]
         CellEndpoint::Vsock { uds, port } => {
             let mut s = tokio::net::UnixStream::connect(uds).await?;
             s.write_all(format!("CONNECT {port}\n").as_bytes()).await?;
@@ -344,6 +355,15 @@ pub async fn connect_endpoint(ep: &CellEndpoint) -> anyhow::Result<Box<dyn Duple
             );
             Ok(Box::new(s))
         }
+        // On a non-unix host a Vsock endpoint can never have been produced
+        // (no Firecracker), so refusing it here is unreachable in practice --
+        // but it must parse, and an honest error beats a silent fallback.
+        #[cfg(not(unix))]
+        CellEndpoint::Vsock { uds, .. } => Err(anyhow::anyhow!(
+            "vsock endpoints are not supported on this platform ({}); \
+             Windows shadow nodes isolate through Litebox over TCP",
+            uds
+        )),
     }
 }
 

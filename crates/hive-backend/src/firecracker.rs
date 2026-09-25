@@ -35,12 +35,19 @@ use hive_core::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+// File-descriptor passing and vsock-over-UDS are Unix-only. The Firecracker
+// MODULE stays declared on every platform (hive-cloud names
+// `FirecrackerBackend` unconditionally), but these imports -- and every site
+// that uses them -- are Unix-gated so `hive-backend` also typechecks for a
+// Windows target, where isolation comes from Litebox instead.
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -2272,11 +2279,20 @@ impl CellBackend for FirecrackerBackend {
                 "cell {} final rootfs sidecar does not describe its exact hashed bytes",
                 spec.id
             );
+            // `/proc/<pid>/fd/<n>` is Linux-only; it exists so the boot
+            // argument can name an ALREADY-OPEN, unlinked file. On a non-unix
+            // host this branch is unreachable -- Firecracker never boots there
+            // (no /dev/kvm) -- but it must still parse, so fall back to the
+            // overlay path rather than referencing a descriptor that has no
+            // portable equivalent.
+            #[cfg(target_os = "linux")]
             let held_path = PathBuf::from(format!(
                 "/proc/{}/fd/{}",
                 std::process::id(),
                 file.as_raw_fd()
             ));
+            #[cfg(not(target_os = "linux"))]
+            let held_path = overlay.clone();
             boot_rootfs_stamp = Some(hashed_stamp);
             boot_rootfs_proof_stamp = Some(proof_stamp);
             boot_rootfs_file = Some(file);
