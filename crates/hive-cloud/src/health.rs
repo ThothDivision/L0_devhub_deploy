@@ -42,6 +42,12 @@
 //! a fleet-visible verdict. Keeping them separate is the whole fix — the same
 //! decomposition the deployment circuit breaker uses (a broken app opens a
 //! circuit; it does not mark the host unhealthy).
+//!
+//! One stale reading is not enough either: [`demote`] withdraws a peer only
+//! once its gossip has been stale at the end of [`DEMOTE_STALE_ROUNDS`]
+//! consecutive gossip rounds ([`note_gossip_round`]); before that — and while
+//! the gossip loop is not ending rounds at all — it is `Deferred` and only
+//! marked cold.
 
 use hive_core::now_ms;
 use parking_lot::RwLock;
@@ -69,6 +75,90 @@ use std::sync::OnceLock;
 /// live nodes from client DNS, which clients reach directly by public IP and
 /// never through the mesh.
 pub const GOSSIP_ALIVE_MS: u64 = 25_000;
+
+/// Consecutive gossip rounds that must END with a peer gossip-stale before
+/// any transport failure may withdraw it. One stale reading is a round-timing
+/// artifact as often as a dead peer: a relayed `last_seen_ms` ages past
+/// `GOSSIP_ALIVE_MS` whenever this observer's round (or the relay's) runs
+/// long, and the next round refreshes it. Witnessed 2026-09-24: fc-virginia
+/// demoted fc-sanjose 57 times while three other nodes heard it throughout.
+pub const DEMOTE_STALE_ROUNDS: u32 = 2;
+
+/// The active prober's cadence (`HIVE_HEALTH_INTERVAL`, seconds, default 5).
+/// One reader for the prober and the gossip-round margin check.
+pub fn probe_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(env_secs("HIVE_HEALTH_INTERVAL", 5))
+}
+
+/// One probe sample's budget on a peer that is not failing
+/// (`HIVE_HEALTH_TIMEOUT`, seconds, default 2).
+pub fn probe_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(env_secs("HIVE_HEALTH_TIMEOUT", 2))
+}
+
+/// How long a probe round waits for its probes: two samples at
+/// [`probe_timeout`] plus a second of slack. A failing peer's probe (two
+/// samples at the dial-fallback ceiling) runs on past it as a straggler.
+pub fn probe_deadline() -> std::time::Duration {
+    probe_timeout() * 2 + std::time::Duration::from_secs(1)
+}
+
+/// Upper bound on the prober's start-to-start round period.
+pub fn probe_period_bound() -> std::time::Duration {
+    probe_interval() + probe_deadline()
+}
+
+fn env_secs(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(default)
+}
+
+/// cold_key(identity) -> consecutive round ends that found it gossip-stale.
+fn stale_rounds() -> &'static RwLock<HashMap<String, u32>> {
+    static STALE: OnceLock<RwLock<HashMap<String, u32>>> = OnceLock::new();
+    STALE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Called by the gossip loop as each round ends: count, per peer, the
+/// consecutive round ends at which its gossip was stale. A fresh peer (and a
+/// peer the registry no longer holds) drops back to zero. After a stall
+/// (`resumed_after_stall`) the count restarts: a round end from before a
+/// freeze and one after it are not consecutive evidence — the freeze itself
+/// aged every peer.
+pub fn note_gossip_round(registry: &hive_edge::region::NodeRegistry, resumed_after_stall: bool) {
+    let verdicts = registry.gossip_freshness(GOSSIP_ALIVE_MS);
+    let mut map = stale_rounds().write();
+    if resumed_after_stall {
+        map.clear();
+    }
+    let next: HashMap<String, u32> = verdicts
+        .into_iter()
+        .filter(|(_, fresh)| !fresh)
+        .map(|(identity, _)| {
+            let key = cold_key(&identity);
+            let n = map.get(&key).copied().unwrap_or(0).saturating_add(1);
+            (key, n)
+        })
+        .collect();
+    *map = next;
+}
+
+/// May a stale peer be withdrawn now? Only after [`DEMOTE_STALE_ROUNDS`]
+/// consecutive stale round ends, and never while the gossip loop has stopped
+/// ending rounds (before its first round, a whole-runtime freeze, a dead
+/// loop): this node's registry is not being refreshed then, so every peer
+/// looks stale from it and the answer is HOLD. A peer nobody gossips still
+/// leaves DNS and placement through `NodeRegistry::nodes()`'s 30 s cutoff.
+fn stale_long_enough(identity: &hive_edge::region::PeerIdentity) -> bool {
+    !crate::gossip_round::stalled()
+        && stale_rounds()
+            .read()
+            .get(&cold_key(identity))
+            .is_some_and(|n| *n >= DEMOTE_STALE_ROUNDS)
+}
 
 /// How long a peer stays locally cold after a transport failure. Deliberately
 /// SHORTER than the health-probe interval's recovery path: it is a routing
@@ -101,6 +191,7 @@ fn endpoint_cold_key(endpoint_id: &str) -> String {
 
 static DEMOTED: AtomicU64 = AtomicU64::new(0);
 static REFUSED_GOSSIP_ALIVE: AtomicU64 = AtomicU64::new(0);
+static DEFERRED_STALE: AtomicU64 = AtomicU64::new(0);
 static UNKNOWN_PEER: AtomicU64 = AtomicU64::new(0);
 static COLD_MARKS: AtomicU64 = AtomicU64::new(0);
 static RESTORED: AtomicU64 = AtomicU64::new(0);
@@ -163,11 +254,12 @@ fn demote_inner(
     reason: &str,
     observed_last_seen_ms: Option<u64>,
 ) -> bool {
-    let outcome = registry.demote_if_gossip_stale(
+    let outcome = registry.demote_if_gossip_stale_gated(
         node,
         expected_endpoint_id,
         observed_last_seen_ms,
         GOSSIP_ALIVE_MS,
+        stale_long_enough,
     );
     let (identity, demoted) = match outcome {
         hive_edge::region::PeerDemotion::Missing => {
@@ -175,6 +267,22 @@ fn demote_inner(
             return false;
         }
         hive_edge::region::PeerDemotion::GossipAlive(identity) => (identity, false),
+        hive_edge::region::PeerDemotion::Deferred(identity) => {
+            DEFERRED_STALE.fetch_add(1, Ordering::Relaxed);
+            if mark_cold_key(cold_key(&identity)) {
+                tracing::info!(
+                    node = %identity.name,
+                    endpoint_id = identity.endpoint_id.as_deref().unwrap_or("legacy-name-only"),
+                    reason,
+                    stale_rounds_required = DEMOTE_STALE_ROUNDS,
+                    gossip_loop_stalled = crate::gossip_round::stalled(),
+                    "peer transport failed and its gossip is stale, but not yet for consecutive \
+                     gossip rounds (or this node's gossip loop is not ending rounds) — \
+                     withdrawal deferred; marked locally cold"
+                );
+            }
+            return false;
+        }
         hive_edge::region::PeerDemotion::Demoted(identity) => (identity, true),
     };
     let newly_cold = mark_cold_key(cold_key(&identity));
@@ -308,8 +416,13 @@ pub fn stats() -> serde_json::Value {
     serde_json::json!({
         "gossip_alive_ms": GOSSIP_ALIVE_MS,
         "cold_window_ms": cold_window_ms(),
+        "demote_stale_rounds": DEMOTE_STALE_ROUNDS,
         "demoted": DEMOTED.load(Ordering::Relaxed),
         "refused_gossip_alive": REFUSED_GOSSIP_ALIVE.load(Ordering::Relaxed),
+        // Stale peers NOT withdrawn because their staleness had not yet
+        // lasted DEMOTE_STALE_ROUNDS consecutive gossip rounds.
+        "deferred_stale": DEFERRED_STALE.load(Ordering::Relaxed),
+        "gossip_rounds": crate::gossip_round::stats(),
         // Calls naming an id the registry has never held (a bare endpoint id
         // from the gossip round, a seed that never meshed). Neither a
         // withdrawal nor a refusal — reported so the two real counters above

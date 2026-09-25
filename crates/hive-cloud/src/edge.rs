@@ -138,8 +138,7 @@ async fn edge_pipeline_inner(
         // token. Proxy the lookup to the leader rather than fail-validating
         // every issuance ~13/14 of the time (adversarial finding). Unknown
         // token everywhere = flat 404, no existence leak.
-        let leader = cloud.control_plane_leader();
-        if leader != cloud.node_name {
+        if let Some(leader) = cloud.leader_forward_target() {
             if let Some(ip) = cloud
                 .registry
                 .nodes()

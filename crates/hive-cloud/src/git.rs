@@ -11253,10 +11253,12 @@ pub fn spawn_git_poll_reconcile(cloud: Arc<CloudState>) {
             loop {
                 tick.tick().await;
                 crate::supervise::beat("git-poll-reconcile");
-                // LEADER ONLY: exactly one node polls + deploys, mirroring every other
-                // reconciler's control-plane gate — otherwise each node would start the
-                // same build for the same push.
-                if !cloud.is_control_plane_leader() {
+                // LEADER ONLY: exactly one node polls + deploys — otherwise each
+                // node would start the same build for the same push. The shared
+                // background-job gate (tenure + voter quorum), never the bare
+                // request-path leader test: a flapping follower ran 21 poll
+                // cycles and deployed on 2026-09-24.
+                if !crate::leadership::may_act(&cloud, crate::leadership::Job::GitPoll) {
                     continue;
                 }
                 git_poll_cycle(&cloud).await;

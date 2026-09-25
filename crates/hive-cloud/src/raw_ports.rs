@@ -523,7 +523,11 @@ pub async fn allocate_raw_ports_coordinated(
         stamp(manifest, &targets, &allocs);
         return Ok(ports);
     }
-    let leader = cloud.control_plane_leader();
+    let Some(leader) = cloud.leader_forward_target() else {
+        anyhow::bail!(
+            "raw-port allocation: no serving control-plane leader is resolvable from this node right now"
+        );
+    };
     let peer = cloud.registry.nodes().into_iter().find(|n| {
         n.name == leader && !n.is_self && n.healthy && n.peer_id.is_some() && n.iroh_addr.is_some()
     });
@@ -612,7 +616,10 @@ pub async fn release_raw_ports_coordinated(cloud: &Arc<CloudState>, project: &st
     if cloud.is_control_plane_leader() {
         return retired;
     }
-    let leader = cloud.control_plane_leader();
+    let Some(leader) = cloud.leader_forward_target() else {
+        tracing::warn!(project, "raw-port retirement: no serving control-plane leader is resolvable from this node — leader-side live claim remains unavailable and will retry from the deletion tombstone");
+        return retired;
+    };
     let peer = cloud.registry.nodes().into_iter().find(|n| {
         n.name == leader && !n.is_self && n.healthy && n.peer_id.is_some() && n.iroh_addr.is_some()
     });

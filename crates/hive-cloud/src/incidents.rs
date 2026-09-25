@@ -92,9 +92,48 @@ impl IncidentStore {
         *self.items.write() = data;
     }
 
+    /// Open `req` — or, when an UNRESOLVED incident with the same title and the
+    /// same `affected` set already exists, touch that one (`updated_ms` only:
+    /// no timeline entry, so a condition re-asserted every tick cannot grow it
+    /// without bound) and return it. Lookup and insert happen under ONE write
+    /// lock, so two concurrent openers of the same condition get one incident.
+    ///
+    /// Deduplication is the DEFAULT because every automated opener fires on a
+    /// cadence or on an edge that can recur: the node-death self-heal alone
+    /// opened 3.4k–12.5k duplicate "Redeploying … its host node went offline"
+    /// incidents per node in a day, and the DNS "delegation held" pair re-armed
+    /// on every leadership edge. Only an operator's explicit POST opens a new
+    /// record unconditionally ([`Self::open_new`]).
     pub fn open(&self, req: OpenReq) -> Incident {
+        let mut items = self.items.write();
+        let mut wanted = req.affected.clone();
+        wanted.sort();
+        if let Some(inc) = items.iter_mut().find(|i| {
+            i.status != IncidentStatus::Resolved && i.title == req.title && {
+                let mut have = i.affected.clone();
+                have.sort();
+                have == wanted
+            }
+        }) {
+            inc.updated_ms = now_ms();
+            return inc.clone();
+        }
+        let inc = Self::build(req);
+        items.push(inc.clone());
+        inc
+    }
+
+    /// Always open a NEW incident — the operator's `POST /v1/incidents`. Never
+    /// for an automated opener (use [`Self::open`]).
+    pub fn open_new(&self, req: OpenReq) -> Incident {
+        let inc = Self::build(req);
+        self.items.write().push(inc.clone());
+        inc
+    }
+
+    fn build(req: OpenReq) -> Incident {
         let now = now_ms();
-        let inc = Incident {
+        Incident {
             id: format!("inc_{}", uuid::Uuid::new_v4().simple()),
             title: req.title,
             severity: req.severity,
@@ -111,9 +150,7 @@ impl IncidentStore {
                     req.message
                 },
             }],
-        };
-        self.items.write().push(inc.clone());
-        inc
+        }
     }
 
     pub fn update(&self, id: &str, req: UpdateReq) -> Option<Incident> {

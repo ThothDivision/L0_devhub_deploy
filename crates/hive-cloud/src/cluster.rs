@@ -1,19 +1,31 @@
 //! Control-plane ownership: WHO is the single writer, and the fencing that keeps
 //! it single during transitions.
 //!
-//! Two mechanisms, one resolution order (`control_plane_owner`):
+//! Two mechanisms, never mixed (`control_plane_owner_with_source`):
 //!
 //! 1. **Operator-curated owner chain** (`HIVE_CP_OWNER_CHAIN`, comma-separated
-//!    node names, e.g. `fc-sanjose,fc-bangkok,fc-virginia`): the FIRST entry that
-//!    is currently healthy + cryptographically identified + publicly addressable
-//!    is the control-plane owner. No open election over fleet membership — the
-//!    candidate set is a short list the operator controls, entry order IS the
-//!    failover order. A NAT'd dev laptop joining the mesh can never win.
-//! 2. **Identity election fallback** (`billing_leader`): only when no chain is
-//!    configured (single-node/dev, pre-migration deploys) or every chain entry is
-//!    dark (availability beats strict staticness — logged loudly). Lowest healthy
-//!    ed25519 `peer_id` wins, publicly-addressable nodes preferred; the legacy
-//!    `HIVE_CP_LEADER` single pin is honored here.
+//!    node names, e.g. `fc-sanjose,fc-phoenix,fc-virginia-3`): the STRICT owner
+//!    is the FIRST entry that is PRESENT in `registry.nodes()` (its own gossip
+//!    reached this node, directly or relayed, inside the 30 s freshness window)
+//!    + cryptographically identified + publicly addressable. The observer's own
+//!    `healthy` flag is deliberately NOT consulted: gossip presence proves the
+//!    process is alive and writing, and a transport-only fault between THIS
+//!    observer and the owner must not demote it — that per-observer demotion is
+//!    what let fc-virginia elect itself (and a fallback) 121 times a day while
+//!    fc-sanjose never stopped serving. When no entry qualifies the answer is
+//!    `None` — HOLD, never the identity election: a chain that is dark to this
+//!    observer is exactly the view a partitioned minority has, and electing from
+//!    it is the split brain. `HIVE_CP_LEADER`/`HIVE_DNS_LEADER_NODE` pins are
+//!    ignored while a chain is set.
+//! 2. **Identity election** (`billing_leader`): ONLY when no chain is
+//!    configured (single-node/dev meshes). Lowest healthy ed25519 `peer_id`
+//!    wins, publicly-addressable nodes preferred; the legacy `HIVE_CP_LEADER`
+//!    single pin is honored here.
+//!
+//! Background single-writer jobs never ask this module directly: they ask
+//! `leadership::may_act`, which layers tenure, isolation and a voter quorum on
+//! top of the owner resolved here. Request-path forwarding asks
+//! `CloudState::control_plane_leader`.
 //!
 //! The [`Cluster`] instance tracks the observed owner and a monotonic **epoch**
 //! that bumps on every ownership change (promotion/failover). The epoch is
@@ -34,6 +46,43 @@
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::sync::Arc;
+
+/// Where [`Cluster::control_plane_owner_with_source`] found its answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OwnerSource {
+    /// The strict owner of a configured `HIVE_CP_OWNER_CHAIN`.
+    Chain,
+    /// The identity election — only ever used when NO chain is configured.
+    Election,
+    /// Chain configured, no strict owner: a best-effort forwarding target,
+    /// never an authority (see the resolver's doc).
+    Fallback,
+}
+
+impl OwnerSource {
+    /// Whether this answer names a real owner (a write authority and a
+    /// wholesale-adoption source), as opposed to a forwarding guess.
+    pub fn is_authority(self) -> bool {
+        matches!(self, OwnerSource::Chain | OwnerSource::Election)
+    }
+
+    /// Whether a follower may REPLACE a whole store with `owner`'s snapshot.
+    /// Stricter than [`Self::is_authority`]: a chain owner qualifies only when
+    /// it is the chain HEAD. A backup is the strict owner only in the views of
+    /// observers that currently miss the head, and while per-node chains
+    /// differ it may not even be the owner in its OWN view (fc-virginia's
+    /// chain omits itself, so phx/va3 resolving it would adopt a stale fork
+    /// from a node that holds, not writes). Until the signed lease attests a
+    /// failover owner's store digests, only merge stores are pulled from one.
+    pub fn may_adopt_wholesale_from(self, owner: &str, chain: &[String]) -> bool {
+        match self {
+            OwnerSource::Election => true,
+            OwnerSource::Chain => chain.first().map(String::as_str) == Some(owner),
+            OwnerSource::Fallback => false,
+        }
+    }
+}
 
 #[derive(Clone, Serialize)]
 pub struct ClusterStatus {
@@ -112,40 +161,85 @@ impl Cluster {
             .unwrap_or_default()
     }
 
-    /// Resolve the control-plane owner: first healthy+identified+addressable
-    /// chain entry, else (chain unset or fully dark) the identity election with
-    /// the legacy pin. THE single resolution point for every single-writer role
-    /// (admin mutations, billing meter, ACME, Vercel DNS) — see the module doc.
+    /// The STRICT chain owner: the first `chain` entry present in `nodes` (the
+    /// gossip-fresh set) with a cryptographic identity and a public address.
+    /// Presence, never the observer's `healthy` flag — see the module doc.
+    /// `None` when no entry qualifies (HOLD).
+    pub fn strict_chain_owner(chain: &[String], nodes: &[hive_edge::NodeInfo]) -> Option<String> {
+        chain
+            .iter()
+            .find(|entry| {
+                nodes.iter().any(|n| {
+                    &n.name == *entry
+                        && n.peer_id.as_deref().is_some_and(|id| !id.is_empty())
+                        && Self::addressable(n)
+                })
+            })
+            .cloned()
+    }
+
+    pub(crate) fn addressable(n: &hive_edge::NodeInfo) -> bool {
+        n.public_ip
+            .as_deref()
+            .is_some_and(|ip| !ip.trim().is_empty())
+            || n.public_ip6
+                .as_deref()
+                .is_some_and(|ip| !ip.trim().is_empty())
+    }
+
+    /// Resolve the control-plane owner. With a chain configured: the strict
+    /// chain owner (`pref` ignored), else `None`. Without one: the identity
+    /// election with the legacy pin. THE owner every single-writer role sits
+    /// on — see the module doc.
     pub fn control_plane_owner(
         chain: &[String],
         pref: Option<&str>,
         nodes: &[hive_edge::NodeInfo],
     ) -> Option<String> {
-        let eligible = |name: &str| {
-            nodes.iter().any(|n| {
-                n.name == name
-                    && n.healthy
-                    && n.peer_id.is_some()
-                    && (n.public_ip.as_deref().is_some_and(|ip| !ip.is_empty())
-                        || n.public_ip6.as_deref().is_some_and(|ip| !ip.is_empty()))
-            })
-        };
-        if !chain.is_empty() {
-            for entry in chain {
-                if eligible(entry) {
-                    return Some(entry.clone());
-                }
-            }
-            // Every curated candidate is dark: availability beats strict
-            // staticness (the audit's HIVE_DNS_LEADER_NODE freeze is the
-            // cautionary tale for wedging here) — but say so loudly, this is an
-            // operator-attention condition, not a normal path.
+        Self::control_plane_owner_with_source(chain, pref, nodes, "")
+            .filter(|(_, source)| source.is_authority())
+            .map(|(owner, _)| owner)
+    }
+
+    /// [`Self::control_plane_owner`] plus WHERE the answer came from, and — only
+    /// while a chain is set and no entry is the strict owner — a best-effort
+    /// FORWARDING target: the first chain entry present in `nodes` that is not
+    /// `me` ([`OwnerSource::Fallback`]). A fallback is never an authority: it
+    /// may receive a forwarded write (which it refuses unless it really owns),
+    /// but nothing is ever adopted wholesale from it and it never makes `me`
+    /// the owner. With no chain entry present at all the answer is `None` and
+    /// the HOLD is logged at most once per 5 minutes.
+    pub fn control_plane_owner_with_source(
+        chain: &[String],
+        pref: Option<&str>,
+        nodes: &[hive_edge::NodeInfo],
+        me: &str,
+    ) -> Option<(String, OwnerSource)> {
+        if chain.is_empty() {
+            return Self::billing_leader_with_pref(pref, nodes)
+                .map(|owner| (owner, OwnerSource::Election));
+        }
+        if let Some(owner) = Self::strict_chain_owner(chain, nodes) {
+            return Some((owner, OwnerSource::Chain));
+        }
+        static LAST_HOLD_WARN_MS: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let now = hive_core::now_ms();
+        let last = LAST_HOLD_WARN_MS.load(std::sync::atomic::Ordering::Relaxed);
+        if now.saturating_sub(last) >= 5 * 60 * 1000 {
+            LAST_HOLD_WARN_MS.store(now, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
                 chain = ?chain,
-                "control-plane owner chain has NO eligible (healthy+public) entry; falling back to identity election"
+                "control-plane owner chain has NO present, identified, public entry in this \
+                 node's gossip view -- HOLDING (no owner; leader-only jobs pause everywhere this \
+                 view holds, forwarded writes answer a retryable 503). Never falls back to the \
+                 identity election while a chain is set."
             );
         }
-        Self::billing_leader_with_pref(pref, nodes)
+        chain
+            .iter()
+            .find(|entry| *entry != me && nodes.iter().any(|n| &n.name == *entry))
+            .map(|entry| (entry.clone(), OwnerSource::Fallback))
     }
 
     /// Elect the BILLING coordinator from live mesh membership — web3-style: no
@@ -417,15 +511,23 @@ mod tests {
 
     #[test]
     fn owner_chain_dark_primary_promotes_next_backup() {
-        let nodes = vec![
-            public(node("sj", Some("ccc"), false), "170.106.158.151"), // primary dead
+        // "Dark" = absent from the gossip-fresh set, not this observer's
+        // `healthy` verdict: a present-but-locally-unhealthy primary (a
+        // transport-only fault from this observer) stays the owner.
+        let backups = vec![
             public(node("bkk", Some("aaa"), true), "43.152.247.70"),
             public(node("va", Some("bbb"), true), "43.166.206.175"),
         ];
         let chain = vec!["sj".to_string(), "bkk".to_string(), "va".to_string()];
         assert_eq!(
-            Cluster::control_plane_owner(&chain, None, &nodes).as_deref(),
+            Cluster::control_plane_owner(&chain, None, &backups).as_deref(),
             Some("bkk")
+        );
+        let mut with_unhealthy_primary = backups.clone();
+        with_unhealthy_primary.push(public(node("sj", Some("ccc"), false), "170.106.158.151"));
+        assert_eq!(
+            Cluster::control_plane_owner(&chain, None, &with_unhealthy_primary).as_deref(),
+            Some("sj")
         );
     }
 
@@ -445,15 +547,18 @@ mod tests {
     }
 
     #[test]
-    fn owner_chain_all_dark_falls_back_to_election() {
+    fn owner_chain_all_dark_holds_instead_of_electing() {
         let nodes = vec![
-            public(node("sj", Some("ccc"), false), "170.106.158.151"),
             public(node("other", Some("aaa"), true), "1.2.3.4"), // not in chain
         ];
         let chain = vec!["sj".to_string()];
         assert_eq!(
-            Cluster::control_plane_owner(&chain, None, &nodes).as_deref(),
-            Some("other")
+            Cluster::control_plane_owner(&chain, Some("other"), &nodes),
+            None
+        );
+        assert_eq!(
+            Cluster::control_plane_owner_with_source(&chain, None, &nodes, "other"),
+            None
         );
     }
 

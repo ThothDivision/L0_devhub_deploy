@@ -12,10 +12,9 @@
 //! store, this module is ONE mechanism: a [`REGISTRY`] of [`SyncedStore`]
 //! entries, each a `(name, snapshot, adopt)` triple. The gossip layer exposes
 //! every entry at `GET /v1/store-snapshot/<name>` (see `gossip::dispatch`), and
-//! the relational-mirror loop's follower branch (see
-//! `spawn_relational_mirror_loop` in `main.rs`) iterates the registry every
-//! tick, pulls each store's snapshot from the leader, and adopts it when it
-//! differs.
+//! the follower pull (`crate::store_follower`) iterates the registry every
+//! tick, pulls each store's snapshot from the leader through [`fetch_snapshot`]
+//! (the one size-aware transfer policy), and adopts it when it differs.
 //!
 //! Contract: `snapshot` must produce DETERMINISTIC bytes for equal state (maps
 //! serialized via sorted `BTreeMap`/pre-sorted `Vec`), because the follower's
@@ -626,6 +625,95 @@ pub fn serve(cloud: &Arc<CloudState>, name: &str) -> Vec<u8> {
         .unwrap_or_default()
 }
 
+// ---- snapshot transfer policy ---------------------------------------------
+//
+// ONE place decides how a store snapshot crosses a trunk, for every caller
+// (the follower pull in `store_follower`, `reconcile_on_promotion`): a trunk
+// sustains ~170 KB/s (1200-byte PMTU, 64 ms RTT, measured), so a fixed 10 s
+// budget can never carry billing (6.2 MB) or incidents (10.9 MB), and a fixed
+// long budget still turns growth into a permanent failure once a store
+// outgrows it. The budget is derived from the store's size instead.
+
+/// Snapshot size at which a store is LARGE: it leaves the follower pull's
+/// concurrent batch for the serial lane and gets a size-derived budget.
+pub const LARGE_STORE_BYTES: usize = 1 << 20;
+/// Budget and response bound for a snapshot not known to be large.
+const SMALL_FETCH_SECS: u64 = 10;
+const SMALL_RESPONSE_CAP: usize = 16 << 20;
+/// Response bound for a large snapshot (the memory ceiling of one pull).
+const LARGE_RESPONSE_CAP: usize = 64 << 20;
+/// The slowest sustained rate a large budget is sized for — well under the
+/// measured ~170 KB/s, so a slow-but-moving trunk still finishes.
+const LARGE_MIN_RATE: usize = 64 << 10;
+
+/// The latest snapshot size of each store any peer served this process.
+static REMOTE_BYTES: std::sync::Mutex<Option<HashMap<&'static str, usize>>> =
+    std::sync::Mutex::new(None);
+
+fn remote_bytes() -> std::sync::MutexGuard<'static, Option<HashMap<&'static str, usize>>> {
+    REMOTE_BYTES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The size to plan `store`'s next fetch for: the larger of the local copy
+/// (`local_len`) and the latest snapshot a peer served this process.
+pub fn size_hint(store: &str, local_len: usize) -> usize {
+    remote_bytes()
+        .as_ref()
+        .and_then(|sizes| sizes.get(store).copied())
+        .unwrap_or(0)
+        .max(local_len)
+}
+
+/// `(timeout_secs, response_cap)` for a fetch of `hint` bytes. Large: the
+/// time `hint` plus 25 % growth takes at [`LARGE_MIN_RATE`] plus 30 s of
+/// setup, floored at `HIVE_STORE_SYNC_LARGE_TIMEOUT_SECS` (240) — and never
+/// below what the response cap could carry at that rate, so a store never
+/// grows into a budget that always fails.
+pub fn fetch_budget(hint: usize) -> (u64, usize) {
+    if hint <= LARGE_STORE_BYTES {
+        return (SMALL_FETCH_SECS, SMALL_RESPONSE_CAP);
+    }
+    let floor = std::env::var("HIVE_STORE_SYNC_LARGE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(240);
+    let planned = hint.saturating_add(hint / 4).min(LARGE_RESPONSE_CAP);
+    let derived = (planned / LARGE_MIN_RATE) as u64 + 30;
+    (derived.max(floor), LARGE_RESPONSE_CAP)
+}
+
+/// Fetch `store`'s snapshot from one peer under the budget its size calls
+/// for ([`fetch_budget`] of `hint`, normally [`size_hint`]), recording the
+/// size served. `None` on any failure.
+pub async fn fetch_snapshot(
+    cloud: &Arc<CloudState>,
+    peer_id: &str,
+    addr: &str,
+    store: &SyncedStore,
+    hint: usize,
+) -> Option<Vec<u8>> {
+    let (timeout_secs, response_cap) = fetch_budget(hint);
+    let path = format!("/v1/store-snapshot/{}", store.name);
+    let bytes = crate::gossip::request_to_with_response_cap(
+        cloud,
+        peer_id,
+        addr,
+        hive_p2p::GOSSIP_GET,
+        &path,
+        &[],
+        timeout_secs,
+        response_cap,
+    )
+    .await?;
+    let mut sizes = remote_bytes();
+    let seen = sizes.get_or_insert_with(HashMap::new).entry(store.name).or_default();
+    *seen = bytes.len();
+    Some(bytes)
+}
+
 pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
     let mut peers: Vec<(String, String, String)> = cloud
         .registry
@@ -649,118 +737,48 @@ pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
     }
     let peer_names: Vec<String> = peers.iter().map(|(n, _, _)| n.clone()).collect();
 
-    let mut fetches = Vec::with_capacity(REGISTRY.len() * peers.len());
-    for (store_idx, store) in REGISTRY.iter().enumerate() {
-        for (peer_name, peer_id, addr) in &peers {
-            let path = format!("/v1/store-snapshot/{}", store.name);
-            fetches.push(async move {
-                let bytes = crate::gossip::request_to(
-                    cloud,
-                    peer_id,
-                    addr,
-                    hive_p2p::GOSSIP_GET,
-                    &path,
-                    &[],
-                    10,
-                )
-                .await;
-                (store_idx, peer_name.clone(), bytes)
+    // Each store's local snapshot BEFORE its fetch window: a wholesale store
+    // whose local copy changed during the window is not adopted (below).
+    let before: Vec<Vec<u8>> = REGISTRY.iter().map(|s| (s.snapshot)(cloud)).collect();
+    let hints: Vec<usize> = REGISTRY
+        .iter()
+        .zip(&before)
+        .map(|(store, local)| size_hint(store.name, local.len()))
+        .collect();
+    let fetch_all = |store_idx: usize| {
+        let peers = &peers;
+        let hint = hints[store_idx];
+        async move {
+            let store = &REGISTRY[store_idx];
+            let fetches = peers.iter().map(|(peer_name, peer_id, addr)| async move {
+                let bytes = fetch_snapshot(cloud, peer_id, addr, store, hint).await;
+                (peer_name.clone(), bytes)
             });
+            futures::future::join_all(fetches)
+                .await
+                .into_iter()
+                .filter_map(|(peer_name, bytes)| {
+                    Some((peer_name, bytes.filter(|b| !b.is_empty())?))
+                })
+                .collect::<Vec<(String, Vec<u8>)>>()
         }
-    }
-    let results = futures::future::join_all(fetches).await;
-    let mut by_store: Vec<Vec<(String, Vec<u8>)>> = vec![Vec::new(); REGISTRY.len()];
-    for (store_idx, peer_name, resp) in results {
-        let Some(bytes) = resp else { continue };
-        if bytes.is_empty() {
-            continue;
-        }
-        by_store[store_idx].push((peer_name, bytes));
-    }
-
-    // Freshly re-read right HERE, after the (up to 10s) peer round trip above
-    // — not once before it. `admin_ingress` starts serving/forwarding writes
-    // to this node the instant `is_control_plane_leader()` flips true
-    // (state.rs, no caching, no coordination with this function), which
-    // typically happens well before this loop even starts, let alone
-    // finishes its network wait. A snapshot taken before the wait cannot see
-    // a write that legitimately landed locally during it, so comparing
-    // against one risks silently discarding an already-200'd write under a
-    // peer's (necessarily pre-promotion, i.e. stale) snapshot — the exact
-    // scenario this whole mechanism exists to guard against, turned back on
-    // itself. Re-reading here shrinks that window from "up to 10s" to the
-    // (now negligible) gap between this line and each store's `adopt()` call.
-    let local_snapshots: Vec<Vec<u8>> = REGISTRY.iter().map(|s| (s.snapshot)(cloud)).collect();
+    };
 
     let mut adopted: Vec<&'static str> = Vec::new();
-    for (store_idx, store) in REGISTRY.iter().enumerate() {
-        if MERGE_STORES.contains(&store.name) {
-            for (peer_name, bytes) in &by_store[store_idx] {
-                if bytes == &local_snapshots[store_idx] {
-                    continue;
-                }
-                if let Some(n) = (store.adopt)(cloud, bytes) {
-                    adopted.push(store.name);
-                    tracing::warn!(
-                        store = store.name,
-                        from_peer = %peer_name,
-                        local_bytes = local_snapshots[store_idx].len(),
-                        peer_bytes = bytes.len(),
-                        adopted_count = n,
-                        "store_sync: promotion reconciliation merged a peer's snapshot"
-                    );
-                }
-            }
-            continue;
-        }
-        // Wholesale-replace stores (apikeys/teams/billing/webhooks/domains/
-        // integrations/enterprise SSO secrets/identity/... — everything not
-        // in MERGE_STORES) get NO per-record provenance or signature check
-        // (this module's own doc: the sole boundary is "must be a trusted
-        // mesh member"), so trusting whichever single arbitrary peer answers
-        // fastest with the longest payload would let ANY ONE reachable
-        // trusted node — not necessarily one that was ever the control-plane
-        // leader, merely one that is alive and answers
-        // `GET /v1/store-snapshot/<name>` — become the adopted source of
-        // truth for fleet-wide secrets the instant some OTHER node gets
-        // promoted (a real, non-rare trigger: leadership flapping happens on
-        // this fleet with no node compromise involved at all). Requiring at
-        // least 2 INDEPENDENT peers to report byte-identical content raises
-        // that bar to "collude two already-trusted mesh members" while
-        // costing nothing in the legitimate recovery case: a genuinely
-        // fresher state that reached the outgoing leader before it stepped
-        // down had already replicated to every follower via the ordinary
-        // 60s store_sync pull loop, so more than one surviving peer holds it
-        // — a single lone responder is the anomalous case, not the common one.
-        let mut by_bytes: HashMap<&[u8], Vec<&str>> = HashMap::new();
-        for (peer_name, bytes) in &by_store[store_idx] {
-            by_bytes
-                .entry(bytes.as_slice())
-                .or_default()
-                .push(peer_name.as_str());
-        }
-        let best = by_bytes
-            .into_iter()
-            .filter(|(bytes, corroborators)| {
-                bytes.len() > local_snapshots[store_idx].len() && corroborators.len() >= 2
-            })
-            .max_by_key(|(bytes, _)| bytes.len());
-        let Some((bytes, corroborators)) = best else {
-            continue;
-        };
-        if let Some(n) = (store.adopt)(cloud, bytes) {
-            adopted.push(store.name);
-            tracing::warn!(
-                store = store.name,
-                from_peers = ?corroborators,
-                local_bytes = local_snapshots[store_idx].len(),
-                peer_bytes = bytes.len(),
-                adopted_count = n,
-                "store_sync: promotion reconciliation adopted a peer-corroborated richer \
-                 snapshot -- this node's own copy may have missed writes the outgoing leader \
-                 accepted"
-            );
-        }
+    // Small stores: every (store, peer) at once, as before. Large ones
+    // (`LARGE_STORE_BYTES`): one store at a time — from every peer at once,
+    // each peer being its own trunk — under the size-derived budget, and
+    // adopted right after its own fetch, so a long transfer never widens any
+    // other store's window.
+    let (large, small): (Vec<usize>, Vec<usize>) =
+        (0..REGISTRY.len()).partition(|&i| hints[i] > LARGE_STORE_BYTES);
+    let small_results = futures::future::join_all(small.iter().map(|&i| fetch_all(i))).await;
+    for (&store_idx, candidates) in small.iter().zip(small_results) {
+        adopt_on_promotion(cloud, store_idx, &before[store_idx], &candidates, &mut adopted);
+    }
+    for store_idx in large {
+        let candidates = fetch_all(store_idx).await;
+        adopt_on_promotion(cloud, store_idx, &before[store_idx], &candidates, &mut adopted);
     }
     if !adopted.is_empty() {
         // Promotion merges are authoritative mutations. Queue them immediately;
@@ -774,4 +792,104 @@ pub async fn reconcile_on_promotion(cloud: &Arc<CloudState>) {
         stores_adopted = ?adopted,
         "store_sync: promotion reconciliation complete"
     );
+}
+
+/// Adopt what the peers served for one store at promotion (`candidates`:
+/// `(peer, bytes)`, empties dropped), against `before` — the local snapshot
+/// taken before the fetch window.
+fn adopt_on_promotion(
+    cloud: &Arc<CloudState>,
+    store_idx: usize,
+    before: &[u8],
+    candidates: &[(String, Vec<u8>)],
+    adopted: &mut Vec<&'static str>,
+) {
+    let store = &REGISTRY[store_idx];
+    // Freshly re-read right HERE, after the peer round trip — not once before
+    // it. `admin_ingress` starts serving/forwarding writes to this node the
+    // instant `is_control_plane_leader()` flips true (state.rs, no caching, no
+    // coordination with this function), which typically happens well before
+    // this loop even starts, let alone finishes its network wait.
+    let local = (store.snapshot)(cloud);
+    if MERGE_STORES.contains(&store.name) {
+        for (peer_name, bytes) in candidates {
+            if bytes == &local {
+                continue;
+            }
+            if let Some(n) = (store.adopt)(cloud, bytes) {
+                adopted.push(store.name);
+                tracing::warn!(
+                    store = store.name,
+                    from_peer = %peer_name,
+                    local_bytes = local.len(),
+                    peer_bytes = bytes.len(),
+                    adopted_count = n,
+                    "store_sync: promotion reconciliation merged a peer's snapshot"
+                );
+            }
+        }
+        return;
+    }
+    // Wholesale-replace stores (apikeys/teams/billing/webhooks/domains/
+    // integrations/enterprise SSO secrets/identity/... — everything not
+    // in MERGE_STORES) get NO per-record provenance or signature check
+    // (this module's own doc: the sole boundary is "must be a trusted
+    // mesh member"), so trusting whichever single arbitrary peer answers
+    // fastest with the longest payload would let ANY ONE reachable
+    // trusted node — not necessarily one that was ever the control-plane
+    // leader, merely one that is alive and answers
+    // `GET /v1/store-snapshot/<name>` — become the adopted source of
+    // truth for fleet-wide secrets the instant some OTHER node gets
+    // promoted (a real, non-rare trigger: leadership flapping happens on
+    // this fleet with no node compromise involved at all). Requiring at
+    // least 2 INDEPENDENT peers to report byte-identical content raises
+    // that bar to "collude two already-trusted mesh members" while
+    // costing nothing in the legitimate recovery case: a genuinely
+    // fresher state that reached the outgoing leader before it stepped
+    // down had already replicated to every follower via the ordinary
+    // 60s store_sync pull loop, so more than one surviving peer holds it
+    // — a single lone responder is the anomalous case, not the common one.
+    let mut by_bytes: HashMap<&[u8], Vec<&str>> = HashMap::new();
+    for (peer_name, bytes) in candidates {
+        by_bytes
+            .entry(bytes.as_slice())
+            .or_default()
+            .push(peer_name.as_str());
+    }
+    let best = by_bytes
+        .into_iter()
+        .filter(|(bytes, corroborators)| bytes.len() > local.len() && corroborators.len() >= 2)
+        .max_by_key(|(bytes, _)| bytes.len());
+    let Some((bytes, corroborators)) = best else {
+        return;
+    };
+    // A write this node accepted DURING the fetch window is in `local` and in
+    // no peer's copy: replacing wholesale would silently drop an already-200'd
+    // write. Keep the local copy; the outgoing leader's trailing writes are the
+    // lesser loss (CS-4's attested digests recover them exactly).
+    if local != before {
+        tracing::warn!(
+            store = store.name,
+            from_peers = ?corroborators,
+            local_bytes = local.len(),
+            peer_bytes = bytes.len(),
+            "store_sync: promotion reconciliation NOT adopting a corroborated richer snapshot -- \
+             this node accepted writes to the store during the fetch, which a wholesale replace \
+             would drop"
+        );
+        return;
+    }
+    if let Some(n) = (store.adopt)(cloud, bytes) {
+        adopted.push(store.name);
+        tracing::warn!(
+            store = store.name,
+            from_peers = ?corroborators,
+            local_bytes = local.len(),
+            peer_bytes = bytes.len(),
+            adopted_count = n,
+            "store_sync: promotion reconciliation adopted a peer-corroborated richer \
+             snapshot -- this node's own copy may have missed writes the outgoing leader \
+             accepted"
+        );
+    }
 }

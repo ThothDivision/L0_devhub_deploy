@@ -2157,8 +2157,8 @@ fn write_atomic(name: &str, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, dir.join(name))
 }
 
-/// Leader-elected reconcile loop. Runs on every node; only the elected leader
-/// (same election as the billing meter: lowest healthy iroh identity) acts.
+/// Leader-only reconcile loop. Runs on every node (the flap memory warms
+/// everywhere); only the node `leadership::may_act(DnsWrite)` admits writes.
 /// Enabled when a `VERCEL_API_TOKEN` is present AND (`HIVE_INGRESS != ngrok` or
 /// `HIVE_DNS_RECONCILE=1` for pre-cutover testing).
 pub fn spawn_reconciler(cloud: Arc<CloudState>) {
@@ -2203,12 +2203,15 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
                                   // Edge-trigger for the "delegation held" incident (see the call site).
         let mut geo_hold_active = false;
         let mut api_hold_active = false;
-        // Leadership tenure edge: `false` → `true` is this node taking over.
-        let mut was_leader = false;
+        // The ownership term this node last took over DNS writing under
+        // (`leadership::Verdict::term`). A new term — never a `may_act` edge,
+        // which also flips on a quorum or isolation blip inside one tenure —
+        // is this node taking over.
+        let mut leader_term: Option<u64> = None;
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
         loop {
             tick.tick().await;
-            if backoff > 0 && was_leader {
+            if backoff > 0 && leader_term.is_some() {
                 // Exponential backoff on API failure: 30s * 2^n, capped at 5 min.
                 // Leader-only: a follower makes no API calls, so it has nothing
                 // to back off from and must keep warming its damping on the
@@ -2224,25 +2227,16 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             // function `GET /v1/dns/stats` calls — an operator must never be
             // looking at a different verdict than the one being published.
             let registry_nodes = cloud.registry.nodes();
-            // Same single-writer resolution as admin mutations, ACME and the
-            // billing meter (owner chain first, health+addressability gated;
-            // identity election fallback) — one designation for every
-            // single-writer role, structurally closing the CP-vs-DNS pin drift
-            // (proposal step 6). `HIVE_DNS_LEADER_NODE` remains honored as a
-            // deliberate LEGACY split-pin on the fallback path (health-gated,
-            // never a raw unguarded check — an unguarded pin silently freezes
-            // published DNS if the pinned node dies).
-            let dns_pref = std::env::var("HIVE_DNS_LEADER_NODE")
-                .ok()
-                .filter(|s| !s.trim().is_empty());
-            let chain = crate::cluster::Cluster::owner_chain_from_env();
-            let pref = dns_pref.or_else(|| std::env::var("HIVE_CP_LEADER").ok());
-            let leader = crate::cluster::Cluster::control_plane_owner(
-                &chain,
-                pref.as_deref(),
-                &registry_nodes,
-            );
-            let is_leader = leader.as_deref() == Some(cloud.node_name.as_str());
+            // The shared leader-only job gate (`leadership::may_act`): the
+            // strict chain owner with tenure, isolation and a voter quorum —
+            // one designation for every single-writer role. With a chain set
+            // only that owner can ever write DNS; a chain dark in this node's
+            // view HOLDS (no writer) instead of electing a fallback, which is
+            // what put fc-virginia beside the real writer on 2026-09-24 and let
+            // it plan deletes of live records. `HIVE_DNS_LEADER_NODE` survives
+            // only on a chain-less mesh.
+            let verdict = crate::leadership::check(&cloud, crate::leadership::Job::DnsWrite);
+            let is_leader = verdict.allowed;
             // Convergence guard: a node that was told to JOIN an existing fleet
             // (HIVE_BOOTSTRAP_PEERS set) but currently sees ONLY itself in the
             // registry has not yet synced gossip — its view of the healthy set
@@ -2319,19 +2313,24 @@ pub fn spawn_reconciler(cloud: Arc<CloudState>) {
             );
             memory.persist().await;
             if !is_leader {
-                // Tenure end. Everything scoped to "while I was the writer" is
-                // now stale evidence about a zone someone else is changing:
-                // the backoff counts API failures this node is no longer
-                // making, and the delegation observation is a listing this
-                // node will not refresh. Both drop to their unknown state so a
-                // return to leadership re-proves rather than resumes.
-                was_leader = false;
-                backoff = 0;
-                api_ns_published = None;
+                // Tenure end — only when OWNERSHIP ended (`term` gone), never on
+                // a quorum/isolation/tenure blip inside one ownership run, in
+                // which no other node wrote the zone. Everything scoped to
+                // "while I was the writer" is then stale evidence about a zone
+                // someone else is changing: the backoff counts API failures
+                // this node is no longer making, and the delegation
+                // observation is a listing this node will not refresh. Both
+                // drop to their unknown state so a return to leadership
+                // re-proves rather than resumes.
+                if verdict.term.is_none() {
+                    leader_term = None;
+                    backoff = 0;
+                    api_ns_published = None;
+                }
                 continue;
             }
-            if !was_leader {
-                was_leader = true;
+            if leader_term != verdict.term {
+                leader_term = verdict.term;
                 guards.begin_tenure();
                 // The two "delegation held" incidents are edge-triggered per
                 // WRITER: carrying a previous tenure's flag across a foreign

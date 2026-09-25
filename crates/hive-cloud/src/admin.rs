@@ -55,6 +55,7 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
         .route("/v1/dns/stats", get(dns_stats))
         .route("/v1/host/listeners", get(host_listeners))
         .route("/v1/mesh/discovery", get(mesh_discovery))
+        .route("/v1/mesh/establish", get(mesh_establish))
         .route("/v1/node/restarts", get(node_restarts))
         .route("/v1/mesh/health-guard", get(mesh_health_guard))
         .route("/v1/debug/heap", get(heap_profile))
@@ -580,16 +581,21 @@ async fn mint_token(
     // `account()`/`set_plan()` honor at read AND write time, so it survives
     // every automatic downgrade path (free checkout, Stripe
     // subscription.deleted). Two guards keep this safe inside the mint path:
-    //   * LEADER-ONLY — /v1/token is exempt from leader-forwarding precisely
-    //     because it writes no state, so a follower writing teams/billing here
-    //     would race the leader's replicated snapshot. The leader is on the
+    //   * BILLING WRITER ONLY — /v1/token is exempt from leader-forwarding
+    //     precisely because it writes no state, so any other node writing
+    //     teams/billing here would race the writer's replicated snapshot. The
+    //     gate is the billing store's own single-writer gate
+    //     (`leadership::may_act(BillingMeter)`), never the request-path
+    //     leader test a momentary self-view can pass. The writer is on the
     //     same round-robin and the dashboard re-mints hourly, so the lock
-    //     lands (and replicates) the first time an admin's mint hits the
-    //     leader.
+    //     lands (and replicates) the first time an admin's mint hits it.
     //   * IDEMPOTENT — only write when the floor is not already enterprise, so
     //     the hourly re-mint does not spam the billing ledger with no-op
     //     plan_change entries.
-    if platform_admin && !req.tenant.trim().is_empty() && c.is_control_plane_leader() {
+    if platform_admin
+        && !req.tenant.trim().is_empty()
+        && crate::leadership::may_act(&c, crate::leadership::Job::BillingMeter)
+    {
         let already = c
             .billing
             .account(req.tenant.trim())
@@ -681,8 +687,7 @@ fn build_region_catalog(c: &Arc<CloudState>) -> Value {
 }
 
 async fn region_catalog(State(c): State<Arc<CloudState>>) -> Json<Value> {
-    if !c.is_control_plane_leader() {
-        let leader = c.control_plane_leader();
+    if let Some(leader) = c.leader_forward_target() {
         if let Some(v) = fetch_from_host(&c, &leader, "/v1/regions/catalog", "").await {
             return Json(v);
         }
@@ -709,9 +714,10 @@ async fn project_settings_get(
     // leader, so this branch is skipped there).
     let path = format!("/v1/projects/{project}/settings");
     if !c.is_control_plane_leader() {
-        let leader = c.control_plane_leader();
-        if let Some(v) = fetch_from_host(&c, &leader, &path, &t).await {
-            return Ok(Json(v));
+        if let Some(leader) = c.leader_forward_target() {
+            if let Some(v) = fetch_from_host(&c, &leader, &path, &t).await {
+                return Ok(Json(v));
+            }
         }
         // Leader unreachable: for a project this node never hosted (untagged
         // local row), try the host node before giving up to a possibly-empty
@@ -1871,8 +1877,7 @@ pub fn spawn_domain_verify_loop(cloud: Arc<CloudState>) {
             loop {
                 crate::supervise::beat("domain-verify");
                 tokio::time::sleep(Duration::from_secs(secs)).await;
-                let isolated = cloud.mesh_health().isolated;
-                if cloud.control_plane_leader() != cloud.node_name || isolated {
+                if !crate::leadership::may_act(&cloud, crate::leadership::Job::DomainVerifyPin) {
                     continue;
                 }
                 // Refresh the pinned apex set for verified attachments:
@@ -3289,8 +3294,7 @@ pub(crate) async fn build_get(
             // exact "Deployment started 0s ago…, 0 lines, Waiting for logs…"
             // stuck-forever bug. Mirrors deployment_build's identical fallback
             // (see its comment) for the sibling /v1/deployments/:id/build route.
-            if !c.is_control_plane_leader() {
-                let leader = c.control_plane_leader();
+            if let Some(leader) = c.leader_forward_target() {
                 if let Some(v) = fetch_from_host(&c, &leader, &format!("/v1/builds/{id}"), &t).await
                 {
                     return Ok(Json(v));
@@ -3345,8 +3349,7 @@ pub(crate) async fn build_cancel(
 ) -> Result<Json<Value>, StatusCode> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
     let Some(b) = c.builds.get(&id) else {
-        if !c.is_control_plane_leader() {
-            let leader = c.control_plane_leader();
+        if let Some(leader) = c.leader_forward_target() {
             if let Some(v) = post_to_host(&c, &leader, &format!("/v1/builds/{id}/cancel"), &t).await
             {
                 return Ok(Json(v));
@@ -8014,6 +8017,24 @@ async fn mesh_health(State(c): State<Arc<CloudState>>) -> Json<Value> {
     Json(json!(c.mesh_health()))
 }
 
+/// The transport's connection-ESTABLISHMENT counters
+/// (`hive_p2p::EstablishStats`: `accept_stuck`, `accept_inflight_oldest_ms`,
+/// `last_*_established_ms`, the `*_window` counts over meshwatch's
+/// establishment window, `budget_in_use`/`budget_limit` per class, the top-10
+/// `budget_by_peer`) — the numbers meshwatch's `establishment_wedge` trigger
+/// reads. Operator-only, unlike `/v1/mesh`: to an outsider they are an exact
+/// oracle for the watchdog's arming state and for how close each inbound
+/// budget is to refusing. NODE-LOCAL, like `/v1/mesh/discovery` — query a
+/// node's own admin port (the dashboard's `/ops/*` proxy reads the leader's).
+async fn mesh_establish(
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_operator(claims.as_ref().map(|e| &e.0))?;
+    Ok(Json(json!(hive_p2p::establish_stats(
+        crate::meshwatch::establish_wedge_secs()
+    ))))
+}
+
 /// THIS node's supervised background loops: restart counts + heartbeat age.
 /// Operator-only, and deliberately NODE-LOCAL (no leader proxy): each node
 /// reports its OWN loops — a dead reconciler on node X is only visible by
@@ -11217,7 +11238,7 @@ pub(crate) fn apply_plan_everywhere(c: &Arc<CloudState>, tenant: &str, plan: &st
 /// `set_tier_lock` so no automatic downgrade path (free-plan checkout, Stripe
 /// `customer.subscription.deleted`) can drop it back below enterprise — the
 /// "no matter what" the admin-always-enterprise feature requires. Called from
-/// `mint_token`, leader-only and idempotent (see its guards).
+/// `mint_token`, on the billing writer only and idempotent (see its guards).
 pub(crate) fn apply_admin_enterprise(c: &Arc<CloudState>, tenant: &str) {
     apply_plan_everywhere(c, tenant, "enterprise");
     // The FLOOR is what makes it durable: set_plan alone is overwritten by the
@@ -11927,10 +11948,7 @@ async fn databases_from_leader(c: &Arc<CloudState>, path: &str, team: &str) -> O
     if c.is_control_plane_leader() {
         return None;
     }
-    let leader = c.control_plane_leader();
-    if leader.is_empty() || leader == c.node_name {
-        return None;
-    }
+    let leader = c.leader_forward_target()?;
     fetch_from_host(c, &leader, path, team).await
 }
 
@@ -13301,9 +13319,8 @@ async fn blob_get(
             // round-robin api host, so a PUT lands on the leader and the
             // matching GET lands anywhere — 404 forever, with no sync path that
             // ever heals it. Same leader fallback `build_get` already uses.
-            if !c.is_control_plane_leader() {
+            if let Some(leader) = c.leader_forward_target() {
                 let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-                let leader = c.control_plane_leader();
                 let path = format!("/v1/storage/blob/{bucket}/{key}");
                 if let Some(b) = fetch_bytes_from_host(&c, &leader, &path, &t).await {
                     return Ok(b.into_response());
@@ -13324,9 +13341,8 @@ async fn blob_list_keys(
     let keys = c.databases.blob_list(&nsb);
     // An empty listing on a non-leader almost always means "the objects were
     // PUT on the leader" rather than "the bucket is empty" — see `blob_get`.
-    if keys.is_empty() && !c.is_control_plane_leader() {
+    if let (true, Some(leader)) = (keys.is_empty(), c.leader_forward_target()) {
         let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-        let leader = c.control_plane_leader();
         if let Some(v) =
             fetch_from_host(&c, &leader, &format!("/v1/storage/blob/{bucket}"), &t).await
         {
@@ -13392,9 +13408,8 @@ async fn queue_depth(
     // `queue_push`/`queue_pop` are mutations and so run on the leader, while
     // this read serves locally — so every non-leader node reports 0 no matter
     // how deep the real queue is.
-    if depth == 0 && !c.is_control_plane_leader() {
+    if let (0, Some(leader)) = (depth, c.leader_forward_target()) {
         let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-        let leader = c.control_plane_leader();
         // NOTE: depth is served by GET on the queue route itself
         // (`/v1/storage/queue/:queue`) — there is no `/depth` sub-route.
         if let Some(v) =
@@ -14153,7 +14168,16 @@ async fn forward_mutation_to_leader(
     path: &str,
     body: &Value,
 ) -> Result<Json<Value>, (StatusCode, String)> {
-    let leader = c.control_plane_leader();
+    // No other owner to forward to (a configured chain dark in this node's
+    // view, or this node owns but may not serve — isolated): a retryable 503,
+    // never a local apply — the write belongs to a serving owner.
+    let Some(leader) = c.leader_forward_target() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no serving control-plane leader is resolvable from this node right now — retry shortly"
+                .into(),
+        ));
+    };
     let admin = c.node_admins.read().get(&leader).cloned();
     let Some(admin) = admin else {
         return Err((
@@ -14231,7 +14255,7 @@ async fn incident_open(
         )
         .await;
     }
-    let inc = c.incidents.open(req);
+    let inc = c.incidents.open_new(req);
     crate::persist::persist(&c);
     crate::webhooks::dispatch(
         &c.webhooks,
@@ -15222,17 +15246,15 @@ async fn identity_sync(
 
 // ============================ Billing & compute credits ============================
 
-/// The single node currently metering usage into `BillingStore` (mirrors
-/// `spawn_billing_meter_loop`'s own election EXACTLY: the manual
-/// `HIVE_BILLING_COORDINATOR_NODE` pin if set, else the control-plane leader) —
+/// The single node currently metering usage into `BillingStore` — the SAME
+/// designation `spawn_billing_meter_loop`'s gate uses
+/// (`leadership::job_owner(BillingMeter)`: the strict chain owner, or on a
+/// chain-less mesh the `HIVE_BILLING_COORDINATOR_NODE` pin / the election) —
 /// every OTHER node's local `BillingStore` is stale/empty for live reads (only
 /// ever bootstrapped from a peer snapshot at boot, never kept live-current).
-fn billing_authority_node(c: &Arc<CloudState>) -> String {
-    std::env::var("HIVE_BILLING_COORDINATOR_NODE")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| c.control_plane_leader())
+/// `None` while no owner is resolvable (the caller serves its local copy).
+fn billing_authority_node(c: &Arc<CloudState>) -> Option<String> {
+    crate::leadership::job_owner(c, crate::leadership::Job::BillingMeter)
 }
 
 /// Proxy a billing GET to the authority node when this node isn't it — fixes the
@@ -15241,7 +15263,7 @@ fn billing_authority_node(c: &Arc<CloudState>) -> String {
 /// the SAME tenant). Falls back to serving this node's own (possibly stale)
 /// local value if the proxy is unreachable, rather than erroring the page.
 async fn proxy_billing_read(c: &Arc<CloudState>, path: &str, team: &str) -> Option<Value> {
-    let authority = billing_authority_node(c);
+    let authority = billing_authority_node(c)?;
     if authority == c.node_name {
         return None; // we ARE authoritative; caller serves its own local read
     }

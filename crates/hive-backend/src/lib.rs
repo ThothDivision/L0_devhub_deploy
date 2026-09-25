@@ -13,6 +13,7 @@
 //! * [`firecracker::FirecrackerBackend`] — a cell is a real aarch64 Firecracker
 //!   microVM, intended to run inside a Lima VM with nested virtualization.
 
+pub mod cell_orphans;
 pub mod container_cli;
 pub mod firecracker;
 pub mod litebox;
@@ -30,6 +31,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
+pub use cell_orphans::{orphan_reap_ran, reap_orphaned_cells, set_cell_owner, ReapReport};
 pub use hive_core::FunctionLaunch;
 pub use runtime_artifact::{
     materialize_runtime_artifact_package, reopen_sealed_runtime_artifact,
@@ -1022,6 +1024,14 @@ pub(crate) async fn podman_run_container(
             .env("PATH", path_env)
             .output()
             .await;
+        // One writer per tenant volume: a still-live cell of THIS node from
+        // another process boot on this volume is removed before this one
+        // starts, and the launch fails (a node fault) if it survives (see
+        // `cell_orphans`). Podman cells only: Apple `container` cells carry no
+        // labels and are not covered (`orphan_reap_ran` stays false on macOS).
+        if !apple {
+            crate::cell_orphans::guard_volume_single_writer(bin, path_env, vname, &name).await?;
+        }
     }
     // Idempotently create the per-deployment network (podman: DNS-LESS, no
     // aardvark → no :53 collision with Seer DNS; Apple's `container` has no
@@ -1110,6 +1120,13 @@ pub(crate) async fn podman_run_container(
         "-e".into(),
         format!("PORT={}", primary.container_port),
     ];
+    // Ownership labels: which cell, which node identity (`hive.owner`), which
+    // hive-cloud process boot. Owner + boot let the next boot of THIS node tell
+    // its predecessor's orphans from its own cells and from another
+    // co-hosted process's (`cell_orphans`).
+    if !apple {
+        base.extend(crate::cell_orphans::cell_label_args(cell_id.as_str()));
+    }
     for (k, v) in env {
         base.push("-e".into());
         base.push(format!("{k}={v}"));

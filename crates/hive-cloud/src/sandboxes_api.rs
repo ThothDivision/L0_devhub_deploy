@@ -260,10 +260,7 @@ async fn read_target(c: &Arc<CloudState>, project: &str, sandbox_id: &str) -> Op
     if let Some(owner) = remote_owner(c, project, sandbox_id).await {
         return Some(owner);
     }
-    if c.is_control_plane_leader() {
-        return None;
-    }
-    Some(c.control_plane_leader())
+    c.leader_forward_target()
 }
 
 /// Cross-node fallback for sandbox READS (the `fetch_from_host` precedent):
@@ -510,10 +507,9 @@ pub(crate) async fn list_sandboxes(
         .list_sandboxes(&project)
         .await
         .map_err(sandbox_err)?;
-    if local.is_empty() && !c.is_control_plane_leader() {
+    if let (true, Some(leader)) = (local.is_empty(), c.leader_forward_target()) {
         // The leader adopts a copy of every record (delegated or not), so it
         // is the one node whose list is complete.
-        let leader = c.control_plane_leader();
         if let Some(v) = proxy_read(
             &c,
             &leader,
@@ -1456,9 +1452,18 @@ async fn open_shell(
     };
 
     // Owner resolution: the record's `owner_node` first; an empty field is a
-    // pre-field record, which the leader-placement rule owned.
+    // pre-field record, which the leader-placement rule owned. With no
+    // resolvable leader such a record cannot be placed: a retryable 503.
     let owner = if rec.owner_node.is_empty() {
-        c.control_plane_leader()
+        let Some(leader) = c.control_plane_leader() else {
+            tracing::info!(project = %project, sandbox = %sandbox_id, tenant = %t, "sandbox shell upgrade refused: legacy record owned by the leader, and no leader is resolvable from this node");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no control-plane leader is resolvable from this node right now — retry shortly"
+                    .into(),
+            ));
+        };
+        leader
     } else {
         rec.owner_node.clone()
     };

@@ -193,17 +193,24 @@ pub fn export_json() -> Value {
     json!({ "teams": teams })
 }
 
-/// Drop all replicated peer rosters (called at the start of each gossip cycle).
-pub fn clear_peer_cache() {
-    peer_cache().lock().unwrap().clear();
+/// Replace the replicated peer rosters with the union of `exports` (each one
+/// peer's [`export_json`]). The gossip loop calls this once per round with
+/// every live peer's latest export — including a peer whose sync is still in
+/// flight, which contributes its previous one — so revocations converge, and
+/// the cache is swapped whole so a reader never sees it half rebuilt.
+pub fn set_peer_exports<'a>(exports: impl IntoIterator<Item = &'a Value>) {
+    let mut next: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for v in exports {
+        merge_peer_export(&mut next, v);
+    }
+    *peer_cache().lock().unwrap() = next;
 }
 
-/// Merge one peer's [`export_json`] output into the peer roster cache.
-pub fn ingest_peer_export(v: &Value) {
+/// Merge one peer's [`export_json`] output into `pc`.
+fn merge_peer_export(pc: &mut HashMap<String, Vec<(String, String)>>, v: &Value) {
     let Some(teams) = v.get("teams").and_then(|x| x.as_object()) else {
         return;
     };
-    let mut pc = peer_cache().lock().unwrap();
     for (team, members) in teams {
         let Some(arr) = members.as_array() else {
             continue;

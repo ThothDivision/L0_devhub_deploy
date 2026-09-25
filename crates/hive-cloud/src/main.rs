@@ -12,6 +12,7 @@ mod app_discovery;
 mod audit;
 mod auth;
 mod billing;
+mod bounded_round;
 mod browser_admission;
 mod browser_artifacts;
 mod browser_db;
@@ -47,6 +48,7 @@ mod git;
 mod github_app_auth;
 mod gitops;
 mod gossip;
+mod gossip_round;
 mod gpu_pool;
 mod guardian;
 mod health;
@@ -57,6 +59,7 @@ mod incidents;
 mod inference;
 mod integrations;
 mod integrity_signer;
+mod leadership;
 mod lease;
 mod listener_audit;
 mod memwatch;
@@ -98,6 +101,7 @@ mod sqlite_pool;
 mod state;
 mod storage_api;
 mod storage_broker;
+mod store_follower;
 mod store_sync;
 mod supervise;
 mod svcgraph;
@@ -205,6 +209,10 @@ pub(crate) enum RestartReason {
     MemoryPressure = 1,
     MeshIsolation = 2,
     MeshDegradation = 3,
+    /// meshwatch's `establishment_wedge` trigger: the endpoint stopped
+    /// forming new connections in either direction while the fleet stayed
+    /// audible over warm trunks.
+    EstablishmentWedge = 4,
 }
 
 impl RestartReason {
@@ -213,8 +221,70 @@ impl RestartReason {
             1 => Some(Self::MemoryPressure),
             2 => Some(Self::MeshIsolation),
             3 => Some(Self::MeshDegradation),
+            4 => Some(Self::EstablishmentWedge),
             _ => None,
         }
+    }
+
+    /// The reason's name in `restart_history.json` (`RestartRecord::reason`)
+    /// — what per-reason restart rate caps count.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::MemoryPressure => "memory_pressure",
+            Self::MeshIsolation => "mesh_isolation",
+            Self::MeshDegradation => "mesh_degradation",
+            Self::EstablishmentWedge => "establishment_wedge",
+        }
+    }
+
+    /// The per-reason restart policy: at most `(cap, window_ms)` restarts for
+    /// this reason, counted from `restart_history.json`; `None` = uncapped.
+    /// Memory pressure is uncapped because the kernel ends that process
+    /// anyway. The isolation and degradation triggers each re-arm only after
+    /// the NEW process converged (or saw a peer, or ran its boot budget), so
+    /// their own guards already space them; the establishment trigger has no
+    /// such re-arming state, so the cap is its loop guard.
+    fn rate_cap(self) -> Option<(usize, u64)> {
+        match self {
+            Self::MemoryPressure | Self::MeshIsolation | Self::MeshDegradation => None,
+            Self::EstablishmentWedge => Some((1, 6 * 60 * 60 * 1000)),
+        }
+    }
+
+    /// Whether an automatic restart for this reason may happen NOW — the gates
+    /// every trigger shares, checked in the one chokepoint
+    /// ([`ControlledRestart::request`]) so no current or future trigger can
+    /// skip them. `Err` names the first that holds it back.
+    ///
+    /// 1. The cell-orphan interlock (every reason but memory pressure, which
+    ///    ends the process whatever is decided here): until
+    ///    `hive_backend::orphan_reap_ran()` confirms this boot's reap, a
+    ///    restart adds one more concurrent writer per stateful tenant volume
+    ///    (the reap runs at the NEXT boot only for cells it can attribute).
+    ///    False on macOS by design and when `HIVE_CELL_ORPHAN_REAP=0`, so
+    ///    those nodes only WARN.
+    /// 2. The reason's [`rate_cap`](Self::rate_cap), which fails CLOSED when
+    ///    the persisted history cannot be trusted
+    ///    (`restart_audit::controlled_restarts_within`).
+    pub(crate) fn admissible(self) -> Result<(), String> {
+        if !matches!(self, Self::MemoryPressure) && !hive_backend::orphan_reap_ran() {
+            return Err(
+                "interlock: the cell-orphan reaper has not confirmed this boot clean".into(),
+            );
+        }
+        if let Some((cap, window_ms)) = self.rate_cap() {
+            match restart_audit::controlled_restarts_within(self.as_str(), window_ms) {
+                Ok(n) if n < cap => {}
+                Ok(n) => {
+                    return Err(format!(
+                        "rate cap: {n} restart(s) for this reason within the last {} h",
+                        window_ms / 3_600_000
+                    ))
+                }
+                Err(why) => return Err(format!("rate cap cannot be verified ({why})")),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -241,7 +311,33 @@ impl ControlledRestart {
         }
     }
 
+    /// Request the controlled exit-17 for `reason`. `false` when refused —
+    /// by [`RestartReason::admissible`] (with a WARN at most once per 5 min
+    /// per reason) or because another reason already won the latch — and
+    /// the caller keeps watching.
     pub(crate) fn request(&self, reason: RestartReason) -> bool {
+        if let Err(blocker) = reason.admissible() {
+            use std::sync::atomic::AtomicU64;
+            static LAST_WARN_MS: [AtomicU64; 5] = [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ];
+            let last = &LAST_WARN_MS[reason as usize];
+            let now = hive_core::now_ms();
+            if now.saturating_sub(last.load(std::sync::atomic::Ordering::Relaxed)) >= 300_000 {
+                last.store(now, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    reason = reason.as_str(),
+                    held_by = %blocker,
+                    "controlled restart REFUSED: a restart trigger fired but a shared gate holds \
+                     it back; the node keeps running and the trigger keeps watching"
+                );
+            }
+            return false;
+        }
         if self
             .inner
             .reason
@@ -255,6 +351,10 @@ impl ControlledRestart {
         {
             return false;
         }
+        // Persist the reason before the graceful tail starts: the next boot's
+        // restart record carries it, so per-reason rate caps count restarts
+        // across the very process boundaries they limit.
+        restart_audit::note_controlled_restart(reason.as_str());
         self.inner.notify.notify_one();
         true
     }
@@ -649,6 +749,46 @@ async fn async_main() -> anyhow::Result<()> {
     };
     let backend_name = backend_name.to_string();
 
+    // Cell-orphan reap, started BEFORE anything can launch or route to a
+    // cell. With `KillMode=process` every tenant cell survives a hive-cloud
+    // restart and nothing ever adopted it, so each restart left one more running
+    // instance of every stateful project on the same named volume (fc-sanjose:
+    // 511 leaked cells, 64 on one minecraft volume). This process holds zero
+    // cells yet, so every `hive-cell-*` of THIS node (`hive.owner`) from another
+    // boot is an orphan — never a co-hosted process's cell — see
+    // `hive_backend::cell_orphans`. Boot waits (below, right before Fluid can
+    // launch anything) only for the reap's URGENT half — listing plus the
+    // SIGKILL of duplicate writers on a shared volume — and at most
+    // `CELL_REAP_BOOT_WAIT`; geolocation runs meanwhile, and the graceful stops,
+    // removals and confirming re-list finish in the background. Until they do,
+    // `orphan_reap_ran()` is false and every volume-mounting launch runs the
+    // per-volume guard. `HIVE_CELL_ORPHAN_REAP=0` opts out.
+    hive_backend::set_cell_owner(&args.name, &crate::persist::data_dir());
+    let reap_urgent = if std::env::var("HIVE_CELL_ORPHAN_REAP")
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true)
+    {
+        let path_env = git::podman_path_env();
+        let (urgent_tx, urgent_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let report = hive_backend::reap_orphaned_cells(
+                hive_backend::container_cli::bin(false),
+                &path_env,
+                urgent_tx,
+            )
+            .await;
+            log_cell_reap(&report, started.elapsed());
+        });
+        Some(urgent_rx)
+    } else {
+        tracing::warn!(
+            "cell orphan reap: disabled (HIVE_CELL_ORPHAN_REAP=0) -- cells leaked by earlier \
+             boots keep running beside this one's; orphan_reap_ran() stays false"
+        );
+        None
+    };
+
     // Auto-detect this node's real-world location (IP geolocation) so it reports
     // its true position for the regions map + the function-region picker.
     let geo = geolocate().await;
@@ -664,6 +804,18 @@ async fn async_main() -> anyhow::Result<()> {
     } else {
         args.region.clone()
     };
+
+    // The reap's urgent half (see above) before Fluid can cold-start anything.
+    if let Some(urgent) = reap_urgent {
+        if tokio::time::timeout(CELL_REAP_BOOT_WAIT, urgent).await.is_err() {
+            tracing::warn!(
+                wait_s = CELL_REAP_BOOT_WAIT.as_secs(),
+                "cell orphan reap: listing + duplicate-writer kills still running -- booting on; \
+                 the reap finishes in the background and the per-volume launch guard covers \
+                 every volume-mounting launch until it is confirmed"
+            );
+        }
+    }
 
     // Serving (Fluid) + builds (Hive control plane).
     let fluid = Fluid::start(backend.clone(), FluidConfig::default());
@@ -1715,12 +1867,10 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Billing meter loop: periodically converts measured fleet compute usage into
     // charges (usage → rate card → ledger → invoice). Runs whether Stripe is
-    // configured or not (mock or real). Web3 decentralization: the loop is spawned
-    // on EVERY node, and each tick the acting meter is ELECTED from live membership
-    // (lowest healthy cryptographic iroh identity — see `Cluster::billing_leader`)
-    // with automatic failover; no hardcoded privileged node. A 2-tick stability
-    // window keeps a flapping health view from double-charging during transitions.
-    // `HIVE_BILLING_COORDINATOR_NODE` remains as an explicit manual PIN override.
+    // configured or not (mock or real). Spawned on EVERY node; each tick only the
+    // node `leadership::may_act(BillingMeter)` admits meters (strict chain owner,
+    // tenure, voter quorum), so a flapping view can never double-charge.
+    // `HIVE_BILLING_COORDINATOR_NODE` remains a manual pin on chain-less meshes.
     spawn_billing_meter_loop(cloud.clone());
 
     spawn_promotion_reconcile_loop(cloud.clone());
@@ -1728,6 +1878,8 @@ async fn async_main() -> anyhow::Result<()> {
     // Relational mirror: teams/members/deployments + full billing backfill into
     // the fleet-replicated SQL view (see spawn_relational_mirror_loop's doc).
     spawn_relational_mirror_loop(cloud.clone());
+    // Follower pull of the owner's stores — DB-free, never behind a SQL await.
+    store_follower::spawn(cloud.clone());
 
     // Web-push + SMS delivery for the notification inbox — leader-only inside
     // the loop, tenant-scoped by construction (see `push::spawn_push_dispatcher`).
@@ -1860,7 +2012,9 @@ async fn async_main() -> anyhow::Result<()> {
     // fc-virginia:28126/:28127 were found by the cloud provider's scanner, not
     // by the platform (2026-08-27 ticket). Detects and reports only; never
     // kills. See `listener_audit`.
-    listener_audit::spawn(cloud.clone(), |c| c.is_control_plane_leader());
+    listener_audit::spawn(cloud.clone(), |c| {
+        leadership::may_act(c, leadership::Job::ListenerAudit)
+    });
     spawn_deletion_reconcile_loop(cloud.clone());
 
     // Restart-audit heartbeat. Writes the marker the NEXT boot classifies
@@ -2112,8 +2266,7 @@ async fn async_main() -> anyhow::Result<()> {
                                     // pipeline LE never reaches (adversarial
                                     // finding, both re-reviews). Unknown token
                                     // everywhere = flat 404, no existence leak.
-                                    let leader = cloud.control_plane_leader();
-                                    if leader != cloud.node_name {
+                                    if let Some(leader) = cloud.leader_forward_target() {
                                         if let Some(ip) = cloud
                                             .registry
                                             .nodes()
@@ -2665,11 +2818,12 @@ pub(crate) fn leader_client(ip: &str, api_host: &str) -> Option<reqwest::Client>
 /// Ordered (node name, dialable IP) candidates for a leader forward.
 ///
 /// WHY THIS IS A LIST AND NOT ONE ADDRESS. `control_plane_leader()` resolves the
-/// owner from the CALLING node's own registry health view, and a health verdict
-/// is per-observer (AGENTS.md, "a health verdict is per-OBSERVER"). One missed
-/// probe against the real owner makes this node fall through
-/// `HIVE_CP_OWNER_CHAIN` to the next entry — which does NOT agree it is the
-/// owner and answers the forwarded write with `not control-plane leader`. That
+/// owner from the CALLING node's own registry view, and that view is
+/// per-observer (AGENTS.md, "a health verdict is per-OBSERVER"). Ownership now
+/// keys on gossip presence rather than the observer's health verdict, but a
+/// 30 s gossip gap still makes this node fall through `HIVE_CP_OWNER_CHAIN` to
+/// the next entry — which does NOT agree it is the owner and answers the
+/// forwarded write with `not control-plane leader`. That
 /// dead-ends a write the fleet was perfectly able to accept: measured live
 /// 2026-08-05, every follower logged 6–9 owner changes in 3h (cp epoch 86,591)
 /// while the leader itself logged ZERO, i.e. the transitions were the observers'
@@ -3461,6 +3615,52 @@ fn spawn_lease_loop(cloud: Arc<CloudState>) {
     });
 }
 
+/// How long boot waits for the cell-orphan reap's urgent half (listing +
+/// SIGKILL of duplicate writers of a shared volume) before serving anyway.
+const CELL_REAP_BOOT_WAIT: Duration = Duration::from_secs(20);
+
+/// The boot reap's one journal line (`cell orphan reap: reaped=N
+/// per_volume={..}`), WARN whenever anything was removed, skipped, left
+/// behind or left uncovered.
+fn log_cell_reap(report: &hive_backend::ReapReport, elapsed: Duration) {
+    if let Some(reason) = &report.skipped {
+        tracing::warn!(
+            reason = %reason,
+            "cell orphan reap: SKIPPED -- nothing was removed and orphan_reap_ran() stays false; \
+             every volume-mounting launch keeps running the per-volume guard"
+        );
+        return;
+    }
+    let quiet = report.stale == 0
+        && report.confirmed
+        && report.foreign == 0
+        && report.legacy_kept == 0
+        && report.gap.is_none();
+    if quiet {
+        tracing::info!(
+            listed = report.listed,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "cell orphan reap: reaped=0 per_volume={{}} (no cell of this node from another boot)"
+        );
+        return;
+    }
+    tracing::warn!(
+        listed = report.listed,
+        stale = report.stale,
+        killed = report.killed,
+        stopped = report.stopped,
+        foreign_untouched = report.foreign,
+        legacy_kept = report.legacy_kept,
+        confirmed = report.confirmed,
+        survivors = ?report.survivors,
+        gap = report.gap.as_deref().unwrap_or(""),
+        elapsed_ms = elapsed.as_millis() as u64,
+        "cell orphan reap: reaped={} per_volume={:?}",
+        report.reaped,
+        report.per_volume
+    );
+}
+
 fn spawn_cluster_loop(cloud: Arc<CloudState>) {
     tokio::spawn(async move {
         loop {
@@ -3471,6 +3671,10 @@ fn spawn_cluster_loop(cloud: Arc<CloudState>) {
             // fleet's fencing tokens converge on the max witnessed.
             let _ = cloud.control_plane_leader();
             cloud.registry.set_self_cp_epoch(cloud.cluster.epoch());
+            // Sample every leader-only job's ownership continuity so the
+            // `may_act` tenure is measured at this cadence, not only when a
+            // slow job happens to ask.
+            leadership::observe(&cloud);
         }
     });
 }
@@ -3524,7 +3728,7 @@ fn spawn_guardian_reap_loop(cloud: Arc<CloudState>) {
         // departure from an incomplete local view.
         tokio::time::sleep(Duration::from_secs(300)).await;
         loop {
-            if cloud.is_control_plane_leader() {
+            if leadership::may_act(&cloud, leadership::Job::GuardianReap) {
                 let (reaped, withheld) = crate::guardian::reap_departed_node_snapshots().await;
                 if reaped > 0 {
                     tracing::warn!(
@@ -3623,10 +3827,12 @@ fn spawn_cron_loop(cloud: Arc<CloudState>) {
     });
 }
 
-/// Loop-local partials returned by one peer's gossip sync, merged after the
-/// concurrent `join_all` (the direct cloud.* store writes already happened inside
-/// the task via internally-synchronized stores).
-#[derive(Default)]
+/// Loop-local partials returned by one peer's gossip sync, merged by whichever
+/// gossip round receives it (the direct cloud.* store writes already happened
+/// inside the task via internally-synchronized stores). The loop keeps each
+/// target's last ANSWERED sync so it can stand in while the next one is still
+/// in flight — see [`round_contributions`].
+#[derive(Default, Clone)]
 struct PeerSync {
     /// (host, route) pairs learned from this peer's serve-hosts.
     routes: Vec<(String, crate::state::PeerRoute)>,
@@ -3636,15 +3842,69 @@ struct PeerSync {
     holders: Vec<(String, String)>,
     /// The peer's node id, if it was reached this round (drives the route TTL merge).
     seen: Option<String>,
+    /// The node id the peer's own roster entry carried (its `NodeInfo.id`).
+    identity: Option<String>,
+    /// The peer's public zkauth roster export.
+    #[cfg(feature = "zkauth")]
+    zk_roster: Option<serde_json::Value>,
+    /// The target answered at least one gossip request this round (drives the
+    /// dead-target backoff in `gossip_round`).
+    reached: bool,
+}
+
+impl PeerSync {
+    /// The node this sync describes: its self-reported id, else the node its
+    /// serve-hosts or fleet-deployments answer named.
+    fn node(&self) -> Option<&str> {
+        self.identity
+            .as_deref()
+            .or(self.seen.as_deref())
+            .or(self.fleet.as_ref().map(|(n, _)| n.as_str()))
+    }
+}
+
+/// The syncs one gossip round merges. `answers` holds each target's newest
+/// ANSWERED sync (with the round it was dispatched in); a target contributes
+/// it when it landed this round, or when its next sync is still in flight and
+/// its node is still in the registry (`alive`, the fleet-deployments carry
+/// rule) — a live peer whose sync outlasts the deadline is late, not absent,
+/// so its holders, routes, deployments and zkauth roster never drop out of
+/// the per-round rebuilds on a slow round. A target that failed contributes
+/// nothing, as before. One sync per NODE, newest round first (ties: lowest
+/// target key): a seed is gossiped under both `seed:<eid>` and `<eid>`, and
+/// the two answers can come from different rounds.
+fn round_contributions<'a>(
+    answers: &'a std::collections::HashMap<String, (u64, PeerSync)>,
+    landed: &std::collections::HashSet<String>,
+    in_flight: &std::collections::HashSet<String>,
+    alive: &std::collections::HashSet<String>,
+) -> Vec<&'a PeerSync> {
+    let mut by_node: std::collections::HashMap<&str, (u64, &str, &PeerSync)> =
+        std::collections::HashMap::new();
+    for (target, (round, sync)) in answers {
+        let node = sync.node().unwrap_or(target.as_str());
+        if !landed.contains(target) && !(in_flight.contains(target) && alive.contains(node)) {
+            continue;
+        }
+        let newer = by_node
+            .get(node)
+            .is_none_or(|(r, t, _)| *round > *r || (*round == *r && target.as_str() < *t));
+        if newer {
+            by_node.insert(node, (*round, target.as_str(), sync));
+        }
+    }
+    by_node.into_values().map(|(_, _, sync)| sync).collect()
 }
 
 /// Sync ONE peer: announce ourselves, learn its nodes/routes/deployments, and
-/// converge zkauth/enterprise/lease state. All cloud.* writes go through
+/// converge enterprise/lease state. All cloud.* writes go through
 /// internally-synchronized stores so many of these run concurrently safely;
-/// loop-local data is returned as a [`PeerSync`] to merge after `join_all`.
+/// loop-local data (zkauth roster included) is returned as a [`PeerSync`]
+/// merged by whichever gossip round receives it (the round does not wait past
+/// its deadline).
 async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) -> PeerSync {
     let mut out = PeerSync::default();
-    let _ = gossip::fetch(
+    let announce = gossip::fetch_outcome(
         &cloud,
         &peer,
         hive_p2p::GOSSIP_POST,
@@ -3652,6 +3912,8 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
         &me_bytes,
     )
     .await;
+    let announce_unreachable = matches!(announce, gossip::FetchOutcome::Unreachable);
+    let announced = matches!(announce, gossip::FetchOutcome::Answered(_));
     let t0 = now_ms();
     let mut rtt = 0u64;
     let mut nodes_bytes =
@@ -3662,7 +3924,13 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
     // HMAC(secret, OUR endpoint id) — over the dedicated join stream; on admission
     // the reply is the peer's full node roster, consumed exactly like /v1/nodes.
     // The dial is by KEY (the eid/seed mapping in peer_iroh); no IP involved.
-    if nodes_bytes.is_none() {
+    //
+    // Never when the announce's own DIAL failed this round: the join dials the
+    // same key through the same `acquire`, so against a dead seed it only doubled
+    // the round's cost (fc-bangkok, powered off: 4 serial 5 s dial timeouts per
+    // round, two for the announce and two more for the join). A trust refusal
+    // happens AFTER the connection is up, so it never reads as `Unreachable`.
+    if nodes_bytes.is_none() && !announce_unreachable {
         if let Ok(secret) = std::env::var("HIVE_JWT_SECRET") {
             if !secret.trim().is_empty() {
                 let me_id = cloud.registry.me().peer_id;
@@ -3719,6 +3987,7 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
                 }
             }
             let peer_self_id = peer_self.as_ref().map(|n| n.id.clone());
+            out.identity = peer_self_id.clone();
             let peer_endpoint_id = peer_self
                 .as_ref()
                 .and_then(|n| n.peer_id.clone())
@@ -3878,7 +4147,14 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
             // independently) and marks it locally cold instead. See health.rs.
             crate::health::demote(&cloud.registry, &id, "gossip round: fetch failed", None);
         }
+        // Reached by nothing (announce, roster, join): the reads below go to
+        // the same target through the same (now evicted) mapping, and for a
+        // URL target each would spend its own 4 s HTTP timeout failing.
+        if !announced {
+            return out;
+        }
     }
+    out.reached = true;
     if let Some(bytes) =
         gossip::fetch(&cloud, &peer, hive_p2p::GOSSIP_GET, "/v1/serve-hosts", &[]).await
     {
@@ -3960,7 +4236,7 @@ async fn sync_one_peer(cloud: Arc<CloudState>, peer: String, me_bytes: Vec<u8>) 
     .await
     {
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            crate::zkauth::ingest_peer_export(&v);
+            out.zk_roster = Some(v);
         }
     }
     if let Some(bytes) = gossip::fetch(
@@ -4008,6 +4284,14 @@ fn spawn_gossip_loop(
         // Content hash of the last roster replicated into GuardianDB, so the
         // (5s-cadence) loop only writes the replicated doc when it CHANGES.
         let mut roster_hash: u64 = 0;
+        // Per-target syncs run as their own tasks (`bounded_round`), so a round
+        // can end at its deadline while a slow target finishes in the
+        // background; its result lands in whichever round receives it.
+        let mut fanout = crate::bounded_round::BoundedRound::<PeerSync>::new();
+        let mut rounds = crate::gossip_round::Rounds::new(now_ms());
+        // Each target's newest ANSWERED sync and the round it was dispatched in:
+        // it stands in for the target while its next sync is in flight.
+        let mut answers: HashMap<String, (u64, PeerSync)> = HashMap::new();
         loop {
             // Re-assert the bootstrap seeds into peer_iroh each round: the gossip
             // timeout+evict drops a stale/dead target's entry, but seeds are
@@ -4094,10 +4378,6 @@ fn spawn_gossip_loop(
             let mut fleet: HashMap<String, Vec<fluid_core::DeploymentInfo>> = HashMap::new();
             // Container holders, seeded with this node's own container deployments.
             let mut holders: HashMap<String, Vec<String>> = HashMap::new();
-            // Rebuild replicated zkauth rosters from scratch each cycle (so peer
-            // revocations converge); each peer's export is merged in below.
-            #[cfg(feature = "zkauth")]
-            crate::zkauth::clear_peer_cache();
             for key in cloud.gw.container_projects() {
                 holders
                     .entry(key)
@@ -4105,32 +4385,102 @@ fn spawn_gossip_loop(
                     .push(cloud.node_name.clone());
             }
             // Announce + learn each peer's view CONCURRENTLY. The per-peer cloud.* writes
-            // (registry, peer_iroh, node_admins, trusted ids, enterprise, leases, zkauth)
+            // (registry, peer_iroh, node_admins, trusted ids, enterprise, leases)
             // all go through internally-synchronized stores, so they're race-free across
-            // tasks; only the loop-local maps are merged from the returned partials. This
-            // overlaps the network waits so one slow peer no longer serializes the rest.
+            // tasks; only the loop-local maps are merged from the returned partials.
+            //
+            // The round waits for its targets only until `gossip_round::deadline()`
+            // (8 s): it used to `join_all` every target, so it lasted as long as its
+            // slowest — a dead seed stretched every round to 25-33 s, and each relayed
+            // `last_seen_ms` this node holds is only as fresh as its round is short.
+            // A target still syncing at the deadline keeps running under its in-flight
+            // flag (never dispatched twice at once; `bounded_round`), and a target
+            // nobody has heard from for 10 min — while other targets answer — is
+            // dialed on a 1 -> 3 min backoff (`gossip_round::Rounds`).
+            rounds.begin_round();
+            let round_deadline = tokio::time::Instant::now() + crate::gossip_round::deadline();
+            // Stragglers of earlier rounds that finished since: their flags are
+            // already clear, so they are dispatched again below.
+            let mut landed = fanout.begin();
             let me = cloud.registry.me();
             let me_bytes = serde_json::to_vec(&me).unwrap_or_default();
-            let partials = futures::future::join_all(
-                targets
-                    .iter()
-                    .map(|peer| sync_one_peer(cloud.clone(), peer.clone(), me_bytes.clone())),
-            )
-            .await;
-            for pr in partials {
-                if let Some(n) = pr.seen {
-                    seen_nodes.insert(n);
+            let mut dispatched = 0usize;
+            for peer in &targets {
+                if fanout.in_flight(peer) {
+                    rounds.note_in_flight();
+                    continue;
                 }
-                for (h, route) in pr.routes {
-                    routes.entry(h).or_default().push(route);
+                let heard_ms = gossip_target_heard_ms(&cloud, peer, rounds.identity(peer));
+                if !rounds.admit(peer, heard_ms, now_ms()) {
+                    continue;
                 }
-                if let Some((nid, list)) = pr.fleet {
-                    fleet.insert(nid, list);
-                }
-                for (k, nid) in pr.holders {
-                    holders.entry(k).or_default().push(nid);
+                let (cloud, target, me_bytes) = (cloud.clone(), peer.clone(), me_bytes.clone());
+                if fanout.spawn(peer, sync_one_peer(cloud, target, me_bytes)) {
+                    dispatched += 1;
                 }
             }
+            let collect_started = std::time::Instant::now();
+            let (more, stragglers) = fanout.collect(round_deadline).await;
+            let collect_ms = (dispatched > 0).then(|| collect_started.elapsed().as_millis() as u64);
+            landed.extend(more);
+            // Results arrive in order, so a target's later result replaces its earlier
+            // one; a target that failed drops its stand-in.
+            let mut landed_now: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for (rid, t, pr) in landed {
+                rounds.finished(&t, pr.reached, pr.node().map(str::to_string), now_ms());
+                if pr.reached {
+                    landed_now.insert(t.clone());
+                    answers.insert(t, (rid, pr));
+                } else {
+                    landed_now.remove(&t);
+                    answers.remove(&t);
+                }
+            }
+            let resumed = rounds.round_done(
+                &targets,
+                fanout.in_flight_keys(),
+                collect_ms,
+                stragglers,
+                now_ms(),
+            );
+            crate::health::note_gossip_round(&cloud.registry, resumed);
+            {
+                let in_flight = fanout.in_flight_keys();
+                let dialed: std::collections::HashSet<&str> =
+                    targets.iter().map(String::as_str).collect();
+                answers.retain(|t, _| dialed.contains(t.as_str()) || in_flight.contains(t));
+            }
+            // Registry-live node names: carries an in-flight target's last answer
+            // here, and an unreached node's deployments below.
+            let alive: std::collections::HashSet<String> = cloud
+                .registry
+                .nodes()
+                .into_iter()
+                .flat_map(|n| [n.id, n.name])
+                .collect();
+            let contributions =
+                round_contributions(&answers, &landed_now, fanout.in_flight_keys(), &alive);
+            for pr in &contributions {
+                if let Some(n) = &pr.seen {
+                    seen_nodes.insert(n.clone());
+                }
+                for (h, route) in &pr.routes {
+                    routes.entry(h.clone()).or_default().push(route.clone());
+                }
+                if let Some((nid, list)) = &pr.fleet {
+                    fleet.insert(nid.clone(), list.clone());
+                }
+                for (k, nid) in &pr.holders {
+                    holders.entry(k.clone()).or_default().push(nid.clone());
+                }
+            }
+            // Replicated zkauth rosters are rebuilt from scratch each cycle (so peer
+            // revocations converge) and swapped whole.
+            #[cfg(feature = "zkauth")]
+            crate::zkauth::set_peer_exports(
+                contributions.iter().filter_map(|pr| pr.zk_roster.as_ref()),
+            );
             // #24: TTL-merge routes so a route from a peer we briefly couldn't reach
             // this round survives (up to ROUTE_TTL_MS) instead of vanishing and
             // 404-ing the deployment; reached peers' routes are still authoritative.
@@ -4149,8 +4499,6 @@ fn spawn_gossip_loop(
             // gossip fetch to a peer must NOT wipe its projects from the dashboard's
             // workflows/runs/deployments views. Carry forward an alive-but-unreached
             // node's deployments; drop only nodes that have aged out of the registry.
-            let alive: std::collections::HashSet<String> =
-                cloud.registry.nodes().into_iter().map(|n| n.name).collect();
             let merged_deps = {
                 let prev = cloud.peer_deployments.read().clone();
                 crate::state::merge_deployments_ttl(&prev, fleet, &alive)
@@ -4294,9 +4642,28 @@ fn spawn_gossip_loop(
                     async move { crate::guardian::seed_known_peers(&guardian_addrs).await },
                 );
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(crate::gossip_round::ROUND_SLEEP).await;
         }
     });
+}
+
+/// Newest gossiped `last_seen_ms` the registry holds for a gossip target
+/// (0 = unknown), resolved through the target's transport mapping, the
+/// endpoint id a key-addressed target IS, and `known` — the node id the target
+/// answered as on its last sync, which is all a `--peer` URL target has left
+/// once a failed fetch evicted its mapping. Stale records count: the question
+/// is "has anyone heard it recently", for the dead-target backoff.
+fn gossip_target_heard_ms(cloud: &CloudState, target: &str, known: Option<&str>) -> u64 {
+    let mapped = cloud.peer_iroh.read().get(target).map(|(id, _)| id.clone());
+    let key = target.strip_prefix("seed:").unwrap_or(target);
+    mapped
+        .iter()
+        .map(String::as_str)
+        .chain(known)
+        .chain(std::iter::once(key))
+        .filter_map(|id| cloud.registry.peer_last_seen_ms(id))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Parse a positive-u64 env var with a default (clamped to >= 1).
@@ -4736,17 +5103,48 @@ fn spawn_promotion_reconcile_loop(cloud: Arc<CloudState>) {
         let cloud = cloud.clone();
         async move {
             let mut tick = tokio::time::interval(interval);
-            let mut was_leader = false;
+            // Once per OWNERSHIP term. This is the preamble to taking writes,
+            // so it keys on the same authority `admin_ingress` serves
+            // mutations on (`is_control_plane_leader`: authoritative owner and
+            // not isolated) — never on `leadership::may_act`, whose tenure and
+            // quorum terms would delay it past the first accepted write and
+            // flip on every quorum blip. It fires on the first tick that
+            // authority holds, then again only after ownership ended or the
+            // authority lapsed for `leadership::TERM_LAPSE` or longer (long
+            // enough for another node to have become the owner and taken
+            // writes). A shorter isolation blip on a steady owner is not a
+            // promotion, and re-running the reconcile then could adopt
+            // followers' stale wholesale copies over writes accepted since.
+            let mut reconciled_this_term = false;
+            let mut lapse_since: Option<std::time::Instant> = None;
             loop {
                 tick.tick().await;
                 crate::supervise::beat("promotion-reconcile");
-                let cp_leader = cloud.control_plane_leader() == cloud.node_name
-                    && !cloud.mesh_health().isolated;
-                let just_promoted = cp_leader && !was_leader;
-                was_leader = cp_leader;
-                if just_promoted {
-                    store_sync::reconcile_on_promotion(&cloud).await;
+                let owner = cloud
+                    .control_plane_leader_with_source()
+                    .is_some_and(|(owner, source)| {
+                        source.is_authority() && owner == cloud.node_name
+                    });
+                if !owner {
+                    reconciled_this_term = false;
+                    lapse_since = None;
+                    continue;
                 }
+                if cloud.mesh_health().isolated {
+                    lapse_since.get_or_insert_with(std::time::Instant::now);
+                    continue;
+                }
+                if lapse_since
+                    .take()
+                    .is_some_and(|since| since.elapsed() >= leadership::TERM_LAPSE)
+                {
+                    reconciled_this_term = false;
+                }
+                if reconciled_this_term {
+                    continue;
+                }
+                reconciled_this_term = true;
+                store_sync::reconcile_on_promotion(&cloud).await;
             }
         }
     });
@@ -4761,13 +5159,16 @@ fn spawn_promotion_reconcile_loop(cloud: Arc<CloudState>) {
 /// simpfi/thoth-division had project_teams rows but no billing_accounts row).
 ///
 /// Write discipline, per section:
-/// - teams/members + billing backfill: control-plane-leader ONLY (the node
-///   where every admin mutation lands, so its stores are authoritative) —
-///   same single-writer rule as `upsert_billing`'s metering site. The billing
-///   manual pin (`HIVE_BILLING_COORDINATOR_NODE`) is honored for the billing
-///   section so both billing writers always sit on the same node.
+/// - project/team backfill: `leadership::may_act(RelationalLeaderWrites)`
+///   only; billing backfill: `leadership::may_act(BillingMeter)` — the SAME
+///   gate as the metering loop, so both billing writers always sit on the
+///   same node (on a chain-less mesh that includes the
+///   `HIVE_BILLING_COORDINATOR_NODE` pin).
 /// - deployments: EVERY node syncs only its OWN `gw.list()` rows (single
 ///   writer per row by construction — see `relational::sync_deployments`).
+///
+/// A WRITE-ONLY projection: the follower pull of the stores themselves is
+/// `store_follower` (its own loops, never waiting on a SQL await here).
 ///
 /// A content hash per ordinary section skips ticks with no change. Project rows
 /// are deliberately re-asserted every ten leader ticks: that bounded write is
@@ -4803,13 +5204,6 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
             // tenant's change).
             let mut billing_hashes: std::collections::HashMap<String, u64> =
                 std::collections::HashMap::new();
-            let billing_pin = std::env::var("HIVE_BILLING_COORDINATOR_NODE")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let mut last_peer_lookup_warn = std::time::Instant::now()
-                .checked_sub(Duration::from_secs(3600))
-                .unwrap_or_else(std::time::Instant::now);
             loop {
                 tick.tick().await;
                 crate::supervise::beat("relational-mirror");
@@ -4822,9 +5216,7 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                         deps_hash = h;
                     }
                 }
-                let isolated = cloud.mesh_health().isolated;
-                let cp_leader = cloud.control_plane_leader() == cloud.node_name && !isolated;
-                if cp_leader {
+                if leadership::may_act(&cloud, leadership::Job::RelationalLeaderWrites) {
                     project_reconcile_round = (project_reconcile_round + 1) % 10;
                     if project_reconcile_round == 0 {
                         let projects: Vec<(String, String, String, u64)> = cloud
@@ -4843,134 +5235,11 @@ fn spawn_relational_mirror_loop(cloud: Arc<CloudState>) {
                             teams_hash = h;
                         }
                     }
-                } else if !isolated {
-                    // Follower: adopt the leader's node-local stores wholesale. A
-                    // whole CLASS of stores (teams, incidents, apikeys, webhooks,
-                    // databases, domains, integrations, gitops, docs, notifications,
-                    // identity, enterprise) take mutations only on the leader
-                    // (admin_ingress forward) but serve GETs from the local store,
-                    // so a follower's copy otherwise diverges forever -- live-
-                    // witnessed as sj=5 / bkk=4 / va=2 teams (a stale failover
-                    // stand-in then corrupted the teams mirror) and the admin
-                    // incidents page showing nothing on non-leader nodes. Wholesale
-                    // replace (not merge) is correct for that class under the
-                    // single-writer model: the leader IS the authority.
-                    //
-                    // TWO stores are deliberate exceptions and MERGE per key
-                    // instead, because they are written on whichever node the
-                    // browser actually reached rather than only on the leader —
-                    // `browser_presence` and `browser_admissions` (see each one's
-                    // own `adopt`). For those, a wholesale replace silently drops
-                    // every record admitted through another node, which is exactly
-                    // the bug both were fixed for; do not "restore consistency" by
-                    // making them replace again.
-                    //
-                    // `store_sync::REGISTRY` drives every one through the same
-                    // generic path; each entry's `adopt` declines an
-                    // empty/unparsable payload so an unreachable/booting leader can
-                    // never wipe a follower. See `crate::store_sync`.
-                    let leader = cloud.control_plane_leader();
-                    let peer = cloud.registry.nodes().into_iter().find(|n| {
-                        n.name == leader
-                            && !n.is_self
-                            && n.healthy
-                            && n.peer_id.is_some()
-                            && n.iroh_addr.is_some()
-                    });
-                    if let Some(peer) = peer {
-                        let (peer_id, peer_addr) = (
-                            peer.peer_id.clone().unwrap(),
-                            peer.iroh_addr.clone().unwrap(),
-                        );
-                        // FETCH CONCURRENTLY, adopt after. This was a serial
-                        // `for` over the whole registry — ~24 stores today —
-                        // each a mesh round trip with its own 10s budget, so
-                        // one slow store stalled every store behind it and the
-                        // worst case (24 x 10s) overran the loop's own tick
-                        // interval outright, leaving followers silently stale.
-                        // A healthy cross-continent probe on this fleet has
-                        // measured 7462ms (AGENTS.md), so this is not a
-                        // hypothetical tail. `reconcile_on_promotion` already
-                        // fetches this exact way; matching it here.
-                        //
-                        // `adopt` stays OFF the concurrent half deliberately:
-                        // it is synchronous and takes store locks, so it runs
-                        // in a plain loop after the join, preserving the
-                        // existing one-at-a-time apply semantics exactly.
-                        use futures::StreamExt as _;
-                        let futs: Vec<_> = store_sync::REGISTRY
-                            .iter()
-                            .map(|store| {
-                                let (peer_id, peer_addr) = (peer_id.clone(), peer_addr.clone());
-                                let cloud = cloud.clone();
-                                async move {
-                                    let local = (store.snapshot)(&cloud);
-                                    let path = format!("/v1/store-snapshot/{}", store.name);
-                                    let bytes = gossip::request_to(
-                                        &cloud,
-                                        &peer_id,
-                                        &peer_addr,
-                                        hive_p2p::GOSSIP_GET,
-                                        &path,
-                                        &[],
-                                        10,
-                                    )
-                                    .await;
-                                    (store, local, bytes)
-                                }
-                            })
-                            .collect();
-                        let bounded = futures::stream::iter(futs)
-                            .buffer_unordered(
-                                std::env::var("HIVE_STORE_SYNC_CONCURRENCY")
-                                    .ok()
-                                    .and_then(|v| v.parse().ok())
-                                    .filter(|v| *v > 0)
-                                    .unwrap_or(8),
-                            )
-                            .collect::<Vec<_>>()
-                            .await;
-                        let mut adopted_store = false;
-                        for (store, local, bytes) in bounded {
-                            let Some(bytes) = bytes else { continue };
-                            // Raw byte-compare change-gate: `snapshot` is
-                            // deterministic, so equal bytes = no change. Skip
-                            // empties (an old leader without this arm returns []).
-                            if !bytes.is_empty() && bytes != local {
-                                if let Some(n) = (store.adopt)(&cloud, &bytes) {
-                                    adopted_store = true;
-                                    tracing::info!(
-                                        leader = %leader,
-                                        store = store.name,
-                                        count = n,
-                                        "store follower-sync: adopted the leader's snapshot"
-                                    );
-                                }
-                            }
-                        }
-                        if adopted_store {
-                            // A follower merge is a real mutation, including
-                            // recovered permanent tombstones. Queue persistence
-                            // now instead of leaving a crash-loss window until
-                            // the unrelated periodic capture.
-                            persist::persist(&cloud);
-                        }
-                    } else if last_peer_lookup_warn.elapsed() >= Duration::from_secs(300) {
-                        tracing::warn!(
-                            leader = %leader,
-                            "store follower-sync: no healthy, addressable registry entry for \
-                             the control-plane leader -- this node cannot pull \
-                             store_sync::REGISTRY snapshots and its local copies \
-                             (projects/teams/billing/etc.) will silently drift stale until \
-                             this resolves"
-                        );
-                        last_peer_lookup_warn = std::time::Instant::now();
-                    }
                 }
-                let billing_authority = match &billing_pin {
-                    Some(pin) => pin == &cloud.node_name && !isolated,
-                    None => cp_leader,
-                };
+                // Same writer as the billing meter itself (one gate, one
+                // designation): the relational billing projection is written
+                // only where metering runs.
+                let billing_authority = leadership::may_act(&cloud, leadership::Job::BillingMeter);
                 if billing_authority {
                     let (accounts, _) = cloud.billing.snapshot();
                     // Per-tenant (ledger, invoices, checkouts) fetched ONCE up
@@ -5058,52 +5327,20 @@ fn spawn_billing_meter_loop(cloud: Arc<CloudState>) {
     );
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
-        // Election state: how many consecutive ticks THIS node has been the elected
-        // meter, and whether it acted last tick (for transition logging).
-        let mut leader_ticks: u32 = 0;
-        let mut was_acting = false;
-        let manual_pin = std::env::var("HIVE_BILLING_COORDINATOR_NODE")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
         loop {
             tick.tick().await;
-            // Who should meter this tick? Manual pin wins when set; otherwise the
-            // CONTROL-PLANE OWNER — same resolution as admin mutations, ACME and
-            // DNS (owner chain first, identity election fallback), so all four
-            // single-writer roles sit on exactly one designation and cannot
-            // drift apart (proposal step 6).
-            let elected = match &manual_pin {
-                Some(pin) => Some(pin.clone()),
-                None => Some(cloud.control_plane_leader()),
-            };
-            // Isolation gate (same rationale as is_control_plane_leader): a node
-            // that can't see its expected peers must never self-elect as the
-            // metering coordinator from that blind view — another node with a
-            // live mesh view is (or will be) charging; charging twice is worse
-            // than charging one tick late.
-            let am_leader = elected.as_deref() == Some(cloud.node_name.as_str())
-                && !cloud.mesh_health().isolated;
-            leader_ticks = if am_leader {
-                leader_ticks.saturating_add(1)
-            } else {
-                0
-            };
-            // Stability window: act only after 2 consecutive leader ticks, so two
-            // nodes with briefly divergent health views can't both charge a delta.
-            let acting = am_leader && leader_ticks >= 2;
-            if acting != was_acting {
-                tracing::info!(
-                    elected = elected.as_deref().unwrap_or("none"),
-                    acting,
-                    "billing meter leadership changed (elected coordinator, auto-failover)"
-                );
-                was_acting = acting;
-            }
-            if !acting {
+            // Who meters this tick: the shared leader-only job gate. Owner (the
+            // strict chain owner; the election or the
+            // `HIVE_BILLING_COORDINATOR_NODE` pin only on a chain-less mesh),
+            // not isolated, 120 s of continuous ownership (replacing the old
+            // per-loop 2-tick window) and a direct voter majority — charging
+            // twice is worse than charging a tick late, and a missed tick is
+            // caught up by the next delta.
+            // Transitions are logged by the gate itself.
+            if !leadership::may_act(&cloud, leadership::Job::BillingMeter) {
                 continue;
             }
-            // Ephemeral ledger checkpoint pruning — SAME leader-elected `acting`
+            // Ephemeral ledger checkpoint pruning — SAME `may_act(BillingMeter)`
             // gate above, no separate election mechanism. Runs every tick
             // regardless of fleet-wide usage activity: a tenant with a
             // finalized, durable, grace-period-elapsed checkpoint is prune-
@@ -5358,18 +5595,38 @@ fn spawn_memory_pressure_alarm() {
     });
 }
 
+/// One probe's outcome. `Default` (empty name) is what a probe task that
+/// panicked or was dropped reports: no verdict either way.
+#[derive(Default)]
+struct ProbeOutcome {
+    name: String,
+    endpoint_id: String,
+    observed_last_seen_ms: u64,
+    rtt: Option<u64>,
+}
+
 fn spawn_health_loop(cloud: Arc<CloudState>) {
-    let interval = Duration::from_secs(env_u64("HIVE_HEALTH_INTERVAL", 5));
-    let timeout = Duration::from_secs(env_u64("HIVE_HEALTH_TIMEOUT", 2));
+    let interval = crate::health::probe_interval();
+    let timeout = crate::health::probe_timeout();
+    let deadline = crate::health::probe_deadline();
     let threshold = env_u64("HIVE_HEALTH_FAIL_THRESHOLD", 2) as u32;
     tracing::info!(
         ?interval,
         ?timeout,
+        ?deadline,
         threshold,
         "active health probing (public nodes)"
     );
     tokio::spawn(async move {
         let mut misses: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        // Each probe runs in its own task and a round waits for them only until
+        // `health::probe_deadline()` (`bounded_round`). Under `join_all` one
+        // failing peer's probe — two samples at the dial-fallback ceiling, ~28 s —
+        // held every round, so every other peer's verdict, the restore hysteresis
+        // and the misses counters all ran at ~33 s instead of the interval. A probe
+        // still running at the deadline stays in flight (never probed twice at
+        // once) and its verdict lands in whichever round receives it.
+        let mut fanout = crate::bounded_round::BoundedRound::<ProbeOutcome>::new();
         loop {
             tokio::time::sleep(interval).await;
             // No mesh transport bound yet → skip the round (never false-flag a peer).
@@ -5393,11 +5650,13 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                     ))
                 })
                 .collect();
-            if targets.is_empty() {
+            // Nothing to probe and no probe still running (a landed straggler keeps
+            // its flag until drained): skip the round, as before.
+            if targets.is_empty() && fanout.in_flight_keys().is_empty() {
                 continue;
             }
-            // Probe ALL targets concurrently — a dead/slow peer must not delay the rest.
-            //
+            let round_deadline = tokio::time::Instant::now() + deadline;
+            let mut landed = fanout.begin();
             // Budget is per-target, not fleet-wide. The fast `timeout` (2s) is the
             // right STEADY-STATE check — "is the warm trunk still alive" — but it is
             // shorter than `connect_budget` alone, so a target needing a fresh dial
@@ -5410,37 +5669,51 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
             // dropped from client DNS and placement, so this silently shrank the
             // fleet. Once a target is already failing, give it the full
             // dial_fallback_ceiling so discovery gets a genuine chance to recover it.
-            let results = futures::future::join_all(targets.into_iter().map(
-                |(name, endpoint_id, addr, observed_last_seen_ms)| {
-                    let cloud = cloud.clone();
-                    let failing = *misses.get(&endpoint_id).unwrap_or(&0) >= threshold;
-                    let budget = if failing {
-                        hive_p2p::dial_fallback_ceiling()
-                    } else {
-                        timeout
-                    };
-                    async move {
-                        // TWO samples per round, pass on EITHER (tau's multi-ping
-                        // liveness): a single lost datagram train on a lossy
-                        // cross-continent path counted as a full round miss, and
-                        // at threshold=2 two unlucky rounds withdrew a healthy
-                        // peer. The samples run sequentially so the second only
-                        // spends budget when the first genuinely failed (which
-                        // also gives `probe`'s trunk-eviction from the first
-                        // failure a fresh-dial chance within the same round).
-                        let first = gossip::probe(&cloud, &endpoint_id, &addr, budget).await;
-                        let rtt = match first {
-                            Some(ms) => Some(ms),
-                            None => gossip::probe(&cloud, &endpoint_id, &addr, budget).await,
-                        };
-                        (name, endpoint_id, observed_last_seen_ms, rtt)
-                    }
-                },
-            ))
-            .await;
             let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for (name, endpoint_id, observed_last_seen_ms, rtt) in results {
+            for (name, endpoint_id, addr, observed_last_seen_ms) in targets {
                 live.insert(endpoint_id.clone());
+                let failing = *misses.get(&endpoint_id).unwrap_or(&0) >= threshold;
+                let budget = if failing {
+                    hive_p2p::dial_fallback_ceiling()
+                } else {
+                    timeout
+                };
+                let cloud = cloud.clone();
+                let key = endpoint_id.clone();
+                fanout.spawn(&key, async move {
+                    // TWO samples per round, pass on EITHER (tau's multi-ping
+                    // liveness): a single lost datagram train on a lossy
+                    // cross-continent path counted as a full round miss, and
+                    // at threshold=2 two unlucky rounds withdrew a healthy
+                    // peer. The samples run sequentially so the second only
+                    // spends budget when the first genuinely failed (which
+                    // also gives `probe`'s trunk-eviction from the first
+                    // failure a fresh-dial chance within the same round).
+                    let first = gossip::probe(&cloud, &endpoint_id, &addr, budget).await;
+                    let rtt = match first {
+                        Some(ms) => Some(ms),
+                        None => gossip::probe(&cloud, &endpoint_id, &addr, budget).await,
+                    };
+                    ProbeOutcome {
+                        name,
+                        endpoint_id,
+                        observed_last_seen_ms,
+                        rtt,
+                    }
+                });
+            }
+            let (more, _) = fanout.collect(round_deadline).await;
+            landed.extend(more);
+            for (_, _, outcome) in landed {
+                let ProbeOutcome {
+                    name,
+                    endpoint_id,
+                    observed_last_seen_ms,
+                    rtt,
+                } = outcome;
+                if name.is_empty() {
+                    continue; // the probe task died: no verdict
+                }
                 let prev = *misses.get(&endpoint_id).unwrap_or(&0);
                 let (next, write) = health_decision(prev, rtt.is_some(), threshold);
                 misses.insert(endpoint_id.clone(), next);
@@ -5481,8 +5754,11 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
                      this node's mesh transport is failing against live peers"
                 );
             }
-            // Forget miss-counters for endpoint identities no longer in the probe set.
-            misses.retain(|endpoint_id, _| live.contains(endpoint_id));
+            // Forget miss-counters for endpoint identities no longer in the probe set
+            // (never one whose probe is still running).
+            misses.retain(|endpoint_id, _| {
+                live.contains(endpoint_id) || fanout.in_flight(endpoint_id)
+            });
         }
     });
 }

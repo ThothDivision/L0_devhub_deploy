@@ -830,7 +830,7 @@ pub fn spawn_reconcile(cloud: Arc<CloudState>) {
             }
 
             // Leader slice: env injection for every inference project.
-            if cloud.is_control_plane_leader() {
+            if crate::leadership::may_act(&cloud, crate::leadership::Job::InferenceEnv) {
                 for (p, _spec) in &desired {
                     let Some(coord) = coordinator_for(&cloud, p) else {
                         continue;

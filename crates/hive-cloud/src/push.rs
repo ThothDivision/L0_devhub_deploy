@@ -370,8 +370,8 @@ impl PushStore {
     }
 
     /// Generate the VAPID keypair if absent. LEADER-ONLY — the single caller is
-    /// `ensure_vapid_on_leader`, gated on `is_control_plane_leader`. Returns
-    /// true if it just generated (so the caller persists).
+    /// `ensure_vapid_on_leader`, gated on `leadership::may_act(PushDispatch)`.
+    /// Returns true if it just generated (so the caller persists).
     fn ensure_vapid(&self) -> bool {
         let mut s = self.inner.write();
         if !s.vapid.public_b64.is_empty() {
@@ -393,11 +393,16 @@ impl PushStore {
     }
 }
 
-/// Generate + persist the fleet VAPID keypair, but only when THIS node is the
-/// control-plane leader (a follower would fork the key). Safe to call every
-/// tick — a no-op once the key exists.
+/// Generate + persist the fleet VAPID keypair, but only on the push
+/// dispatcher's writer (`leadership::may_act(PushDispatch)` — a node that
+/// merely believes it leads for a moment would fork the key, stranding every
+/// subscription made against the other one). Safe to call every tick, and from
+/// the key GET handler — a no-op once the key exists.
 pub fn ensure_vapid_on_leader(c: &Arc<CloudState>) {
-    if c.is_control_plane_leader() && c.push.ensure_vapid() {
+    if c.push.vapid().public_b64.is_empty()
+        && crate::leadership::may_act(c, crate::leadership::Job::PushDispatch)
+        && c.push.ensure_vapid()
+    {
         crate::persist::persist(c);
     }
 }
@@ -1193,8 +1198,9 @@ const PUSH_TICK_CAP: usize = 5;
 /// delivery.
 const SEND_CONCURRENCY: usize = 8;
 
-/// Leader-only delivery loop. Followers idle (checked every tick, so a
-/// re-election hands over within one interval); the leader computes each
+/// Leader-only delivery loop, gated on `leadership::may_act(PushDispatch)`.
+/// Followers idle (checked every tick, so a re-election hands over within one
+/// interval plus the job's tenure); the leader computes each
 /// target tenant's live notifications with the SAME `build_notifications` the
 /// inbox bell uses and delivers anything not already delivered (per stable id),
 /// scoped strictly to that tenant.
@@ -1206,7 +1212,7 @@ pub fn spawn_push_dispatcher(c: Arc<CloudState>) {
         let mut sms_sent: BTreeMap<String, Vec<u64>> = BTreeMap::new();
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-            if !c.is_control_plane_leader() {
+            if !crate::leadership::may_act(&c, crate::leadership::Job::PushDispatch) {
                 continue;
             }
             // Generate the fleet VAPID key on the leader if it doesn't exist yet.

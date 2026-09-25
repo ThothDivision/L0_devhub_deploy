@@ -51,8 +51,11 @@
 //! view shows it without logging into anything.
 //!
 //! Nothing here can fail a boot: every read is best-effort, an unreadable or
-//! corrupt marker/history is treated as absent (with a WARN), and no verdict
-//! is ever fabricated from a missing source.
+//! corrupt marker is treated as absent (with a WARN), and no verdict is ever
+//! fabricated from a missing source. An unreadable history is set aside and
+//! treated as absent too — but its restarts are UNKNOWN, not zero, so the
+//! per-reason restart caps counted from it fail closed
+//! ([`controlled_restarts_within`]).
 
 use hive_core::now_ms;
 use serde::{Deserialize, Serialize};
@@ -117,6 +120,13 @@ struct Marker {
     clean_exit: bool,
     #[serde(default)]
     version: String,
+    /// The controlled-restart reason this process requested (`exit(17)`
+    /// paths: memory pressure, mesh watchdog triggers), empty when none.
+    /// Written the moment the restart is REQUESTED, not at exit, so a
+    /// shutdown that dies on its hard deadline still leaves the reason
+    /// behind for the next boot's record.
+    #[serde(default)]
+    restart_reason: String,
 }
 
 /// One boot's verdict. Serialized into the history file and the endpoint.
@@ -145,6 +155,13 @@ pub struct RestartRecord {
     /// Previous RSS as a percentage of the memory ceiling, when both are known.
     #[serde(default)]
     pub prev_rss_pct: Option<u64>,
+    /// The controlled-restart reason the previous process requested, if it
+    /// asked for its own restart (`memory_pressure`, `mesh_isolation`,
+    /// `mesh_degradation`, `establishment_wedge`). What restart rate caps
+    /// count ([`controlled_restarts_within`]), so a cap survives the very
+    /// restarts it limits.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 impl RestartRecord {
@@ -155,6 +172,20 @@ impl RestartRecord {
 
 static STARTED_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_OOM_MS: AtomicU64 = AtomicU64::new(0);
+/// This node's name, for marker writes outside the boot/heartbeat paths.
+static NODE: OnceLock<String> = OnceLock::new();
+/// The controlled-restart reason this process requested (first wins, like
+/// `ControlledRestart`'s own latch).
+static REQUESTED_RESTART: OnceLock<String> = OnceLock::new();
+/// Why this process's persisted restart history cannot be trusted to COUNT
+/// restarts (`None` = trusted); set at boot, never cleared.
+static HISTORY_FAULT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// The latest run-marker write failure (`None` once a write succeeds again).
+static MARKER_FAULT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn lock<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn boot_record() -> &'static OnceLock<RestartRecord> {
     static R: OnceLock<RestartRecord> = OnceLock::new();
@@ -319,16 +350,13 @@ fn kmsg_oom_evidence(_prev_pid: u32) -> (Option<String>, Vec<String>) {
 // boot would be indistinguishable from a crash).
 // ---------------------------------------------------------------------------
 
-fn write_atomic(path: &std::path::Path, bytes: &[u8]) {
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
-        if std::fs::create_dir_all(dir).is_err() {
-            return;
-        }
+        std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
-    }
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
 }
 
 fn read_marker() -> Option<Marker> {
@@ -356,35 +384,54 @@ fn current_marker(node: &str, clean_exit: bool) -> Marker {
         cgroup_oom_kills: cgroup_oom_kills().unwrap_or(0),
         clean_exit,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        restart_reason: REQUESTED_RESTART.get().cloned().unwrap_or_default(),
     }
 }
 
+/// Write the marker; a failure is recorded as a marker fault until the next
+/// write succeeds (see [`controlled_restarts_within`]).
 fn save_marker(m: &Marker) {
-    if let Ok(bytes) = serde_json::to_vec(m) {
-        write_atomic(&marker_path(), &bytes);
-    }
-}
-
-fn load_history() -> Vec<RestartRecord> {
-    std::fs::read_to_string(history_path())
-        .ok()
-        .and_then(|t| serde_json::from_str::<Vec<RestartRecord>>(&t).ok())
-        .map(|mut v| {
-            if v.len() > HISTORY_MAX {
-                // Enforce the cap on LOAD as well as on write, so no on-disk
-                // file can reload past it (the `dns_geo` MAX_ENTRIES rule).
-                let start = v.len() - HISTORY_MAX;
-                v.drain(..start);
+    let result = serde_json::to_vec(m)
+        .map_err(std::io::Error::other)
+        .and_then(|bytes| write_atomic(&marker_path(), &bytes));
+    let mut fault = lock(&MARKER_FAULT);
+    match result {
+        Ok(()) => *fault = None,
+        Err(e) => {
+            if fault.is_none() {
+                tracing::warn!(error = %e, path = %marker_path().display(),
+                    "restart audit: run marker write FAILED — restart rate caps fail closed \
+                     until a marker write succeeds");
             }
-            v
-        })
-        .unwrap_or_default()
+            *fault = Some(format!("run marker write failed: {e}"));
+        }
+    }
 }
 
-fn save_history(records: &[RestartRecord]) {
-    if let Ok(bytes) = serde_json::to_vec(records) {
-        write_atomic(&history_path(), &bytes);
+/// The persisted history. `Err` when a history file EXISTS but cannot be
+/// read or parsed: the restarts it recorded are unknown, which is not the
+/// same as none (an absent file is a genuine empty history).
+fn load_history() -> Result<Vec<RestartRecord>, String> {
+    let path = history_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("restart history unreadable: {e}")),
+    };
+    let mut v = serde_json::from_str::<Vec<RestartRecord>>(&text)
+        .map_err(|e| format!("restart history unparseable: {e}"))?;
+    if v.len() > HISTORY_MAX {
+        // Enforce the cap on LOAD as well as on write, so no on-disk
+        // file can reload past it (the `dns_geo` MAX_ENTRIES rule).
+        let start = v.len() - HISTORY_MAX;
+        v.drain(..start);
     }
+    Ok(v)
+}
+
+fn save_history(records: &[RestartRecord]) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(records).map_err(std::io::Error::other)?;
+    write_atomic(&history_path(), &bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -412,6 +459,7 @@ fn classify(prev: &Marker, now_boot_id: Option<&str>, suspect_pct: u64) -> Resta
         prev_rss_bytes: prev.rss_bytes,
         mem_limit_bytes: limit,
         prev_rss_pct: pct,
+        reason: (!prev.restart_reason.is_empty()).then(|| prev.restart_reason.clone()),
     };
 
     if prev.clean_exit {
@@ -488,6 +536,7 @@ fn classify(prev: &Marker, now_boot_id: Option<&str>, suspect_pct: u64) -> Resta
 /// file I/O and cannot fail the boot.
 pub fn audit_boot(node: &str) -> Value {
     STARTED_MS.store(now_ms(), Ordering::Relaxed);
+    let _ = NODE.set(node.to_string());
     let suspect_pct = env_u64("HIVE_OOM_SUSPECT_PCT", 90).min(100);
     let now_boot = boot_id();
 
@@ -504,16 +553,38 @@ pub fn audit_boot(node: &str) -> Value {
             prev_rss_bytes: 0,
             mem_limit_bytes: mem_limit_bytes().unwrap_or(0),
             prev_rss_pct: None,
+            reason: None,
         },
     };
 
-    let mut hist = load_history();
+    let mut hist = match load_history() {
+        Ok(hist) => hist,
+        Err(why) => {
+            // Set aside for forensics rather than overwritten, and this
+            // process's rate caps fail closed: the restarts the file held
+            // are unknown, not zero.
+            let aside = history_path().with_extension(format!("corrupt-{}", now_ms()));
+            let _ = std::fs::rename(history_path(), &aside);
+            tracing::warn!(reason = %why, moved_to = %aside.display(),
+                "restart audit: restart history could not be loaded — restart rate caps fail \
+                 closed for this process");
+            *lock(&HISTORY_FAULT) = Some(why);
+            Vec::new()
+        }
+    };
     hist.push(rec.clone());
     if hist.len() > HISTORY_MAX {
         let start = hist.len() - HISTORY_MAX;
         hist.drain(..start);
     }
-    save_history(&hist);
+    if let Err(e) = save_history(&hist) {
+        // This boot's record is not on disk, so the next process cannot count
+        // it; nor can this one trust what it counts.
+        tracing::warn!(error = %e, path = %history_path().display(),
+            "restart audit: restart history write FAILED — restart rate caps fail closed for \
+             this process");
+        lock(&HISTORY_FAULT).get_or_insert_with(|| format!("restart history write failed: {e}"));
+    }
     let (restarts_24h, oom_24h, min_uptime) = window_stats(&hist);
     if let Some(ms) = hist.iter().filter(|r| r.is_oom()).map(|r| r.ts_ms).max() {
         LAST_OOM_MS.store(ms, Ordering::Relaxed);
@@ -616,6 +687,51 @@ pub fn last_oom_ms() -> Option<u64> {
 /// single cheapest fleet-visible signal that it is cycling.
 pub fn started_ms() -> u64 {
     STARTED_MS.load(Ordering::Relaxed)
+}
+
+/// Record that this process REQUESTED a controlled restart for `reason`, and
+/// stamp it into the run marker at once: the next boot's history record then
+/// carries it whatever happens to the graceful tail (a clean exit, the hard
+/// deadline's forced exit, a SIGKILL). Called by the shared
+/// `ControlledRestart::request` — every automatic restart path records its
+/// reason in one place, so a rate cap can count them across restarts.
+pub fn note_controlled_restart(reason: &str) {
+    if REQUESTED_RESTART.set(reason.to_string()).is_err() {
+        return;
+    }
+    if CLEAN_EXIT_MARKED.load(Ordering::SeqCst) {
+        return;
+    }
+    let node = NODE.get().cloned().unwrap_or_default();
+    save_marker(&current_marker(&node, false));
+}
+
+/// How many restarts this node took for controlled-restart `reason` within
+/// the last `window_ms`, from the persisted history (so it counts restarts
+/// of EARLIER processes — the one thing an in-memory counter cannot).
+///
+/// FAILS CLOSED: `Err(why)` when the count cannot be trusted — the history
+/// file existed but could not be read or parsed at boot, this boot's record
+/// could not be written (a full or read-only data dir: the next process
+/// would count zero), or the latest run-marker write failed (a restart
+/// requested now would leave no reason behind). A cap that fails open is a
+/// restart loop on exactly the node whose disk is already in trouble. What it
+/// cannot see: a rollback to a binary predating `RestartRecord::reason`
+/// rewrites the history without it, so after the roll-forward earlier
+/// restarts count as none — at most one extra capped restart, once.
+pub fn controlled_restarts_within(reason: &str, window_ms: u64) -> Result<usize, String> {
+    if let Some(why) = lock(&HISTORY_FAULT).clone() {
+        return Err(why);
+    }
+    if let Some(why) = lock(&MARKER_FAULT).clone() {
+        return Err(why);
+    }
+    let cutoff = now_ms().saturating_sub(window_ms);
+    Ok(history()
+        .read()
+        .iter()
+        .filter(|r| r.ts_ms >= cutoff && r.reason.as_deref() == Some(reason))
+        .count())
 }
 
 /// Stamp the marker as a GRACEFUL shutdown. Called from the SIGTERM/SIGINT

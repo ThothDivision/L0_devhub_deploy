@@ -1,5 +1,236 @@
 # Changelog
 
+## 2026-09-24 — CS-7 gossip rounds never wait on dead peers
+
+fc-virginia's gossip round was `join_all` over every target, so it lasted as
+long as its slowest: the powered-off fc-bangkok seed cost 4 serial 5 s dial
+timeouts per round (the announce twice, then the mesh join twice) and the
+round ran 25-33 s. Every relayed `last_seen_ms` is only as fresh as the
+round is short, so fc-sanjose — which fc-virginia could not dial, but three
+other nodes heard throughout — aged past `GOSSIP_ALIVE_MS` (25 s) and was
+demoted 57 times in a day, each time handing fc-virginia a different
+control-plane owner.
+
+- **Round deadline** (`HIVE_GOSSIP_ROUND_DEADLINE_MS`, default 8000): each
+  target syncs in its own task; the round merges what arrived by the
+  deadline. A straggler keeps running under a per-target in-flight flag (not
+  re-dispatched until it finishes) and its result lands in whichever round
+  receives it. The task reports through a drop guard, so a panicking sync
+  cannot leave its target flagged forever.
+- **One bounded fan-out for both round loops.** The deadline, the in-flight
+  flags and the drop guard are one primitive, `bounded_round::BoundedRound`,
+  and the health prober runs on it too: a failing peer's probe (two samples
+  at the dial-fallback ceiling, ~28 s) no longer holds every probe round, the
+  restore hysteresis and every other peer's verdict. A probe round waits
+  `health::probe_deadline()` (2 × `HIVE_HEALTH_TIMEOUT` + 1 s). A round never
+  waits for an earlier round's straggler, so one peer that is slow every time
+  cannot pin every round to the deadline.
+- **A slow peer is late, never absent.** The gossip loop keeps each target's
+  last answered sync and folds it while the next one is in flight and the
+  node is still in the registry, so container holders (the lease HRW set),
+  routes, fleet deployments and the zkauth peer roster (now swapped whole by
+  `zkauth::set_peer_exports` instead of cleared at round start) keep a live
+  peer whose sync outlasts the deadline. Contributions are deduplicated per
+  node, newest round first (a seed is both `seed:<eid>` and `<eid>`). A
+  target that failed contributes nothing, as before.
+- **Dead-target backoff, from a fresh view only.** A target with no
+  successful sync AND no gossip of it in the registry for 10 min is
+  dispatched on a 1 → 3 min backoff instead of every round; any answer clears
+  it. The backoff only runs while this node itself reached some target within
+  the last 60 s: an isolated node sees every target silent, seeds included,
+  so it keeps dialing all of them every round, and the first answer after a
+  blind stretch clears every backoff. The 3 min cap matches the mesh's bound
+  on anything being undialable. A peer another node still hears is never
+  backed off (a `--peer` URL target resolves that through the node id it last
+  answered as), and `PeerPool::acquire` is untouched.
+- **One dial per dead target per round.** `gossip::fetch_outcome` classifies
+  a failed fetch; the mesh join is skipped when the announce's own dial
+  failed (budget elapsed, connect-phase `DeadPeerTimeout`, `PeerRefused`),
+  and a target reached by nothing (announce, roster, join) skips its
+  remaining reads instead of paying a 4 s HTTP timeout per read.
+- **Round telemetry.** Every 10 min: `gossip rounds (last 10 min)` with the
+  start-to-start round period p50/p99, the collect phase and the per-target
+  resync interval p50/p99, deadline hits, stragglers and backed-off targets;
+  a WARN when `GOSSIP_ALIVE_MS < 2 × p99 round period +
+  health::probe_period_bound()`. The collect phase is capped by the deadline,
+  so it is reported but never used for the margin. The same figures are
+  `gossip_rounds` in `GET /v1/mesh/health-guard`.
+- **Two consecutive stale rounds before a withdrawal.** The gossip loop
+  counts, per peer, the consecutive round ends at which its gossip was stale
+  (`health::note_gossip_round`); `health::demote` writes `healthy=false` only
+  at `DEMOTE_STALE_ROUNDS` (2) — before that the new `PeerDemotion::Deferred`
+  outcome marks the peer cold and nothing more (`deferred_stale` counter).
+  The registry evaluates the gate under the same write lock as the verdict
+  (`NodeRegistry::demote_if_gossip_stale_gated`). While the gossip loop has
+  stopped ending rounds (before its first round, a whole-runtime freeze,
+  measured on a monotonic clock) demotion HOLDS, because every peer looks
+  stale from a registry nobody refreshes; the first round after a stall
+  restarts the count.
+
+Verify: on fc-virginia, `deadline_hits` and the round-period p99 stay low
+enough that the margin WARN is silent, `backed_off_targets` names only
+fc-bangkok-like dead seeds, 0 `peer marked UNHEALTHY ... fc-sanjose` over
+24 h, and sj's `last_seen_ms` age in fc-virginia's `/v1/nodes` under 20 s.
+Once the CS-3 control-plane lease has shipped, that margin is what allows
+lowering `HIVE_CP_LEASE_TTL_SECS` to 60.
+
+## 2026-09-24 — CS-2 transport liveness and budgets: a wedged endpoint can no longer refuse the fleet for hours
+
+The wedge behind three incidents in 12 days (fc-virginia 09-12 and 09-18,
+fc-sanjose 09-24): iroh's layer above noq stops completing connection setup,
+warm trunks keep serving, and every peer-count watchdog stays quiet. hive-p2p
+held each inbound budget permit across that unbounded await, so the budget
+filled with permits of dead connections and the endpoint refused the whole
+fleet (335,055 refusals on sj in a day) until an operator restarted it.
+
+- **Accept deadline** (`HIVE_P2P_ACCEPT_DEADLINE_MS`, default the 30 s QUIC
+  idle timeout + 10 s): an accept whose handshake + iroh registration
+  outlives it is CLOSED with the overload code — releasing its budget slot,
+  and making the dialer back off instead of holding a trunk that never
+  serves a stream — and counted as `accept_stuck` (WARN at most once per
+  10 s). Above the idle timeout, a handshake the remote abandoned ends as a
+  handshake error and is never counted. In-flight accepts are tracked so
+  `accept_inflight_oldest_ms` is reportable.
+- **Budget by negotiated ALPN.** A ClientHello that does not fit the first
+  Initial — every hybrid X25519MLKEM768 dial — is no longer charged to the
+  128-slot browser budget: it holds a `pending` slot
+  (`HIVE_P2P_PENDING_MAX_CONNS`, 256) across the bounded handshake, then
+  `conn.alpn()` moves it to its real budget or closes it with the overload
+  code. Fleet connections are capped per remote endpoint
+  (`HIVE_P2P_MAX_CONNS_PER_ENDPOINT`, 16) at admission; established trunks
+  are never evicted. Budget-exhausted and per-endpoint-cap WARNs are
+  rate-limited and carry counts and the remote.
+- **Streamed gossip responses.** The response length is read under the 15 s
+  first-byte budget and the body in 64 KiB reads each under the 45 s idle
+  budget (gossip and join), instead of the whole frame inside 15 s — which at
+  ~170 KB/s per trunk made any snapshot over ~2.5 MB impossible to fetch.
+  Replies of 256 KiB or more go out below the default stream priority, so
+  probes on the same trunk are not starved behind a snapshot.
+- **The follower pull is its own DB-free loops** (`store_follower`):
+  `store-follower-sync` pulls small stores concurrently every
+  `HIVE_STORE_SYNC_SECS` (60) and `store-large-lane` pulls large ones (over
+  1 MiB — billing, incidents, audit — or SUSPECT: a batch fetch that ran out
+  its whole budget while others fetched) one at a time in its own task,
+  holding off while the link is down. Neither waits on GuardianDB or the
+  relational mirror any more (they ran after `relational::sync_deployments`).
+  Large stores are pulled at most once per 5 min after a success and retried
+  after 60 s after a failure; any other batch failure retries next tick.
+  One shared transfer primitive (`store_sync::fetch_snapshot` /
+  `fetch_budget`) sizes every snapshot fetch — ≤1 MiB: 10 s / 16 MiB;
+  larger: size + 25 % at 64 KB/s + 30 s, floored at
+  `HIVE_STORE_SYNC_LARGE_TIMEOUT_SECS` (240), 64 MiB bound — for the
+  follower pull and `reconcile_on_promotion` alike; promotion now pulls
+  large stores one store at a time under that budget and never adopts a
+  wholesale store whose local copy changed during its fetch. A pull that
+  outlived the owner it was resolved for is not adopted.
+- **Refused-dial backoff and wrong-identity hints.** A refused dial opens a
+  per-endpoint 1 s → 30 s window in which `acquire` fails at once with
+  `PeerRefused` (not a dead-peer signal) instead of re-dialing into the
+  refusal; a round-tripped request clears it. A pre-handshake refusal from a
+  hint's direct addresses opens it only once the relay (else fresh
+  discovery) confirms it — it names no identity. A dial that fails
+  `UnknownIssuer` suspends every direct address of that hint for the peer
+  (10 min) and retries through its relay at once — only while the hint has
+  a relay; the dial set is never emptied.
+- **Establishment stats and the `establishment_wedge` watchdog.**
+  `hive_p2p::establish_stats` (accept stuck/in-flight, last fresh inbound and
+  outbound establishment, windowed attempt/initial/refusal counts, per-class
+  budget use, top-10 budget holders) is served on operator-only
+  `GET /v1/mesh/establish` (`/v1/mesh` keeps its public shape). meshwatch's
+  new trigger fires the controlled exit-17 on evidence no remote can forge:
+  no fresh connection either way for `HIVE_MESH_ESTABLISH_WEDGE_SECS` (300)
+  while dials from here to two or more directly-heard peers timed out, or 3+
+  stuck accepts with none succeeding corroborated by dead outbound setup;
+  refusals and negative-discovery short-circuits never count, and stuck
+  accepts alone only WARN. Also: 10 min uptime, an audible fleet, the node's
+  stagger. `HIVE_MESH_ESTABLISH_WEDGE_RESTART=0` makes it WARN-only.
+- **One restart chokepoint.** `ControlledRestart::request` refuses every
+  automatic restart but memory pressure until the cell-orphan reap confirmed
+  this boot (all mesh triggers, not only the new one — WARN-only on macOS and
+  with `HIVE_CELL_ORPHAN_REAP=0`), and applies each reason's rate cap
+  (`establishment_wedge`: 1 per 6 h); a refused trigger keeps watching.
+- **Controlled restarts record their reason; the cap fails closed.**
+  `ControlledRestart::request` stamps the reason into the run marker when
+  requested, so the next boot's `restart_history.json` record carries
+  `reason` (`memory_pressure`, `mesh_isolation`, `mesh_degradation`,
+  `establishment_wedge`). When the history could not be read or parsed at
+  boot (it is set aside), or this boot's record or the latest run marker
+  could not be written, the count is unverifiable and the cap is treated as
+  exhausted.
+
+## 2026-09-24 — CS-1 safety floor: one gate for every leader-only job, no self-election, no leaked cells
+
+The fc-virginia instability (three wedges in 12 days; the 2026-09-24 one on
+fc-sanjose) did its damage through local mechanisms that any flap, restart or
+roll could re-trigger. This change set makes the next flap, restart or roll
+harmless; transport liveness, the signed control-plane lease and DB-free
+replication follow as their own change sets.
+
+- **One gate for every leader-only background job** (`leadership.rs`). Node-
+  death relocation, git poll, billing meter (its relational projection and
+  the token-mint enterprise lock), Vercel DNS, ACME DNS-01, custom-domain
+  HTTP-01 (its own designation, the `acme_http01` store's writer), domain
+  verify/pin, push dispatch (and the fleet VAPID keypair), inference env
+  injection, guardian reap, relational backfills, browser admission/presence
+  expiry and listener-audit incidents each carried their own leadership test
+  of different strength. They now all ask `leadership::may_act(cloud, Job)`:
+  owner, a fresh view (a gossip round done since boot), not isolated, and —
+  for a BACKUP chain owner only — direct contact (outbound dial or inbound
+  self-report) with a majority of `HIVE_CP_VOTERS`, all held continuously for
+  the job's minimum tenure (relocate 600 s … others 30 s). The chain head acts
+  on presence, so a head reachable only through relays keeps writing instead
+  of freezing every job fleet-wide. `HIVE_CP_VOTERS` unset under a chain is an
+  ERROR at boot (no derived voters); a chain-less node with a mesh roster
+  HOLDS instead of electing itself. Each ownership run has a term; the DNS
+  reconciler's take-over work keys on it, and the promotion reconcile runs
+  once per continuous request-path ownership — neither re-fires on a quorum
+  or isolation blip. Cron and raw-port allocation stay on their current gates
+  until they have replicated stores.
+- **Presence, not health; HOLD, not election.** With `HIVE_CP_OWNER_CHAIN` set
+  the owner is the first chain entry present in the gossip-fresh set with an
+  identity and a public address; the observer's `healthy` flag is not
+  consulted and the identity-election fallback and the
+  `HIVE_CP_LEADER`/`HIVE_DNS_LEADER_NODE`/`HIVE_BILLING_COORDINATOR_NODE` pins
+  are never used while a chain is set. A chain dark in a node's view is a
+  HOLD. `control_plane_leader()` now returns `Option` and never resolves to
+  the calling node unless it is the real owner; every request-path proxy asks
+  `CloudState::leader_forward_target()` once (local best-effort reads,
+  retryable 503 writes when there is nobody else to ask).
+- **Incidents dedup at the primitive.** `IncidentStore::open` returns (and
+  touches) an unresolved incident with the same title and affected set,
+  atomically; only the operator's `POST /v1/incidents` opens unconditionally
+  (`open_new`). fc-virginia opened 3.4k–12.5k duplicate self-heal incidents a
+  day, and the DNS hold incidents re-armed on every leadership edge.
+- **Node-death self-heal is off by default** (`HIVE_NODE_DEATH_SELF_HEAL=1`
+  opts in). Enabled, it keys on the host's absence from the fleet's gossip
+  for 10 min, measured from this node's first observation made from a fresh
+  view (clocks are discarded while this node is isolated, gossip-blind or
+  short of a voter majority), a 6 h per-(project, host, commit) cooldown and
+  3 relocations per hour per node.
+- **Cell-orphan reap and a per-volume writer guard** (`hive_backend::cell_orphans`).
+  Every cell is labelled `hive.owner` (stable per node + data dir) /
+  `hive.boot` / `hive.cell` / `hive.node`. At boot every cell of THIS node from
+  another boot is removed — never another co-hosted process's cell; label-less
+  legacy cells only under systemd or `HIVE_CELL_ORPHAN_REAP_LEGACY=1`. Duplicate
+  writers of a shared volume are SIGKILLed except the newest, which is
+  stopped gracefully last; boot waits at most 20 s for the listing and the
+  kills, the rest finishes in the background. Until a re-list confirms the
+  reap, each launch mounting a `hive-vol-*` first stops and removes a live
+  (running, paused or still stopping) stale writer of that volume in a
+  detached task and fails with a node fault if one survives. Unparseable
+  podman output skips the reap loudly. `orphan_reap_ran()` (the interlock for
+  restart-based remedies) is true only after that confirmation, never on
+  macOS. `HIVE_CELL_ORPHAN_REAP=0` opts out.
+- **Loud follower pulls, wholesale only from the chain head.** A failed
+  store-snapshot fetch WARNs per (leader, store), opens a deduped incident
+  after 10 consecutive failures (one "every store" incident when the whole
+  link is down) and resolves them on success, on a leader change, or when
+  this node becomes the owner. Wholesale stores are adopted only from the
+  chain head (or the chain-less election); a backup or fallback owner is
+  pulled for merge stores only.
+- **`HIVE_CP_VOTERS` ships through ansible** (`hive-node.service.j2`,
+  `hive_cp_voters` in inventory `[platform:vars]`).
+
 ## 2026-09-22 — the mesh QUIC transport now offers hybrid post-quantum key exchange (X25519MLKEM768)
 
 The mesh transport (`hive_p2p::bind_full`, plus GuardianDB's own separate iroh
