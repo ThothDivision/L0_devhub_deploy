@@ -3001,28 +3001,46 @@ fn validated_direct_entry(
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        let mut components = 0usize;
-        let mut relative = PathBuf::new();
+        // Lexically NORMALIZE `..` rather than refusing it outright: a package
+        // manager resolves its launcher through a symlinked `.bin/<tool>`
+        // whose target legitimately climbs out of the application directory
+        // into a shared store that is still inside the artifact (pnpm:
+        // `apps/web/node_modules/.bin/next` ->
+        // `node_modules/.pnpm/next@<ver>/node_modules/next/bin/next`, i.e.
+        // `../../node_modules/next/dist/bin/next` from the app dir). The entry
+        // here is already the RESOLVED physical path, so lexical normalization
+        // is sound.
+        //
+        // Normalize the JOINED absolute path, never the raw relative one:
+        // popping `..` off a bare relative path starts from nothing, so the
+        // FIRST `..` — exactly the leading climb a pnpm target has — was
+        // refused as an escape (witnessed 2026-09-26, Nodes.WTF: "the direct
+        // runtime entry escapes the validated artifact" for
+        // `../../node_modules/next/dist/bin/next`, which resolves to
+        // `/workspace/node_modules/...` and is plainly inside the artifact).
+        // Seeding with the workdir makes `pop()` mean what it should: stepping
+        // out of a real directory, and only failing when it steps above the
+        // artifact root. `validate_guest_workdir` then re-checks the result.
+        let mut absolute = PathBuf::from(guest_workdir);
         for component in path.components() {
             match component {
                 Component::CurDir => {}
-                Component::Normal(value) => {
-                    components += 1;
-                    relative.push(value);
+                Component::Normal(value) => absolute.push(value),
+                Component::ParentDir => {
+                    anyhow::ensure!(
+                        absolute.pop(),
+                        "{}",
+                        launch_refusal("the direct runtime entry escapes the validated artifact")
+                    );
                 }
-                _ => {
+                Component::RootDir | Component::Prefix(_) => {
                     return Err(launch_refusal(
-                        "the direct runtime entry contains path traversal",
+                        "the direct runtime entry is not artifact-relative",
                     ))
                 }
             }
         }
-        anyhow::ensure!(
-            components > 0,
-            "{}",
-            launch_refusal("the direct runtime entry is not artifact-relative")
-        );
-        Path::new(guest_workdir).join(relative)
+        absolute
     };
     let absolute = absolute.to_str().ok_or_else(|| {
         launch_refusal("the direct runtime entry is not valid UTF-8 after normalization")

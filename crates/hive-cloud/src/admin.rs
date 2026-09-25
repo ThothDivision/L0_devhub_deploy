@@ -7269,7 +7269,16 @@ async fn project_redeploy(
             image_spec.clone(),
             source_ids.clone(),
         );
-        req.repo_url = String::new();
+        // Keep the SAME synthetic `image://…` source URL a fresh prebuilt-image
+        // deploy records (see `git_deploy_public`'s image branch) — never blank
+        // it. A prebuilt-image deploy has no repository to clone, but the
+        // source URL is still the deployment record's source identity and
+        // `validate_deploy_source`/`resolve_build_trust` legitimately parse it:
+        // blanking it made every image redeploy fail at the front door with
+        // "repository URL: repository URL is empty" (witnessed 2026-09-26,
+        // project `minecwaft` -> image://itzg/minecraft-server:latest, HTTP
+        // 409). `image_ref` remains what actually gets deployed.
+        req.repo_url = src.repo_url.clone();
         req.branch = None;
         req.image_ref = Some(image_ref);
         let build_id = crate::git::start_build(c.clone(), req, Some(incarnation), None)

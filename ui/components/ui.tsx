@@ -14,14 +14,21 @@ export function Stat({
   label,
   value,
   hint,
+  icon,
 }: {
   label: string;
   value: React.ReactNode;
   hint?: React.ReactNode;
+  /** Optional leading glyph. Optional (never required) so every existing
+   *  call site keeps compiling unchanged. */
+  icon?: React.ReactNode;
 }) {
   return (
     <Card className="flex flex-col gap-1">
-      <span className="text-xs font-medium uppercase tracking-wide text-muted">{label}</span>
+      <span className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted">
+        {icon}
+        {label}
+      </span>
       <span className="text-3xl font-semibold tabular-nums text-fg">{value}</span>
       {hint ? <span className="text-xs text-secondary">{hint}</span> : null}
     </Card>

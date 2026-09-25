@@ -51,6 +51,15 @@ export default function NetworkPage() {
   const { data: presenceFeed } = usePoll<{ presence: BrowserNode[] }>("/v1/browser/presence", 8000);
   const presence = presenceFeed?.presence ?? [];
   const regions = Array.from(new Set((nodes ?? []).map((n) => n.region))).sort();
+  // Browser nodes are mesh members and count toward the node total exactly
+  // as a fleet node does. They were excluded from this headline while being
+  // drawn on the diagram below, so the number contradicted the picture — an
+  // operator reading "7" above a ring of nine cubes learns not to trust
+  // either. The two kinds are still broken out in the hint, because they are
+  // NOT interchangeable: only fleet nodes host deployments.
+  const fleetCount = nodes ? nodes.length : null;
+  const browserCount = presence.length;
+  const nodeTotal = fleetCount === null ? null : fleetCount + browserCount;
 
   return (
     <div>
@@ -60,7 +69,18 @@ export default function NetworkPage() {
       />
 
       <div className="mb-6 grid grid-cols-2 gap-4 md:grid-cols-4">
-        <Stat icon={<Server className="h-4 w-4" />} label="Nodes" value={nodes?.length ?? "—"} />
+        <Stat
+          icon={<Server className="h-4 w-4" />}
+          label="Nodes"
+          value={nodeTotal ?? "—"}
+          hint={
+            fleetCount === null
+              ? undefined
+              : browserCount > 0
+                ? `${fleetCount} fleet + ${browserCount} browser`
+                : `${fleetCount} fleet`
+          }
+        />
         <Stat icon={<Globe2 className="h-4 w-4" />} label="Regions" value={regions.length || "—"} />
         <Stat icon={<Share2 className="h-4 w-4" />} label="Transport" value="iroh QUIC" />
         <Stat icon={<Database className="h-4 w-4" />} label="State store" value="replicated" />
@@ -77,8 +97,8 @@ export default function NetworkPage() {
                 cubes blue with no legend entry is just an unexplained color. */}
             <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rotate-45 rounded-[2px] bg-[#3b82f6]" /> GPU</span>
             <span className="flex items-center gap-1.5"><span className="inline-block h-2.5 w-2.5 rotate-45 rounded-[2px] bg-[#9ca3af]" /> unhealthy</span>
-            <span className="flex items-center gap-1.5" title="Low-trust volunteer browser peers — the same cube as a fleet node, smaller and teal; never counted as fleet capacity. Named bn-<adjective>-<noun>-<tag>, derived server-side from the peer's proven endpoint id.">
-              <span className="inline-block h-2 w-2 rounded-[2px]" style={{ background: SATELLITE_ONLINE_COLOR }} /> browser node <span className="font-mono text-[10px] opacity-70">bn-*</span>
+            <span className="flex items-center gap-1.5" title="Low-trust volunteer browser peers — the same cube as a fleet node, same size and place on the ring, teal instead of green; counted in the node total but they do not host deployments. Named bn-<adjective>-<noun>-<tag>, derived server-side from the peer's proven endpoint id.">
+              <span className="inline-block h-2.5 w-2.5 rotate-45 rounded-[2px]" style={{ background: SATELLITE_ONLINE_COLOR }} /> browser node <span className="font-mono text-[10px] opacity-70">bn-*</span>
             </span>
             <span className="flex items-center gap-1.5" title="This browser node is eligible to hold small fragments of global platform state (see Storage shards below). Eligibility is server-derived from a platform-admin session — a browser cannot claim it.">
               <span className="inline-block h-2.5 w-2.5 rounded-full border border-dashed" style={{ borderColor: SHARD_HOLDER_COLOR }} /> shard holder
@@ -90,8 +110,8 @@ export default function NetworkPage() {
           Every node runs a gateway + Fluid pool, fully meshed over iroh QUIC. The function tunnel protocol
           rides those streams, so a gateway on one node can serve an instance on any other, anywhere reachable.
           {presence.length > 0 && (
-            <> Orbiting satellites are admitted browser nodes — low-trust edge peers attached over the relay, never fleet capacity.
-            Each carries its own <span className="font-mono">bn-…</span> name, derived server-side from its proven endpoint id and stable across reconnects.</>
+            <> Browser nodes are admitted peers on the same ring — low-trust edge capacity attached over the relay, counted in the node total but never hosting deployments.
+            Each carries its own <span className="font-mono">bn-…</span> name, derived server-side from its proven endpoint id and stable across reconnects. A thin teal line marks the fleet node a peer relays through; the peer itself sits in its own slot.</>
           )}
         </p>
       </Card>
@@ -216,13 +236,42 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
     return <div className="py-20 text-center text-sm text-secondary">Discovering nodes…</div>;
   }
 
-  // Node positions on the circle (start at top, go clockwise). A single node sits
-  // in the center.
-  const pos = nodes.map((_, i) => {
-    if (n === 1) return { x: cx, y: cy };
-    const a = -Math.PI / 2 + (i * 2 * Math.PI) / n;
+  // Browser nodes are drawn as FIRST-CLASS members of this mesh: the SAME
+  // ring, the SAME cube size and the SAME label geometry as a fleet node,
+  // differing only in color (teal). They used to orbit further out at half
+  // size, which read as a lesser object rather than a peer — and, worse,
+  // anchoring each one beside the fleet node it relays THROUGH put a Los
+  // Angeles browser peer visually inside san-jose whenever its relay lived
+  // there, so the diagram answered "where is this peer" with the relay's
+  // answer instead of the peer's. One ring, one geometry, one difference.
+  //
+  // Unlike the geographic /regions map there is no location-sharing
+  // requirement here: this diagram is topological, so a browser that declined
+  // geo sharing is still a member of the p2p network and still gets a slot.
+  // Order is deterministic (fleet in /v1/nodes order, then browser peers in
+  // stable lexical endpoint_id order) so a presence refresh doesn't reshuffle
+  // the ring. Rendered count is honestly capped and the overflow is stated.
+  const MAX_BROWSER_NODES = 60;
+  const sortedPresence = [...presence].sort((a, b) => (a.endpoint_id < b.endpoint_id ? -1 : a.endpoint_id > b.endpoint_id ? 1 : 0));
+  const browserNodes = sortedPresence.slice(0, MAX_BROWSER_NODES);
+  const browserOverflow = sortedPresence.length - browserNodes.length;
+  // A `bn-…` name is ~18 characters at 13px ≈ 118px wide; the ring is
+  // ~2πR ≈ 1260px, so ~10 labels fit without collision and 24 is the point
+  // past which they start overlapping badly. Beyond it the hover title (and
+  // the screen-reader list) carries the name instead.
+  const showBrowserNames = browserNodes.length > 0 && browserNodes.length <= 24;
+
+  // One ring for EVERY member. Fleet nodes occupy the first `n` slots, browser
+  // peers the rest, so both families share one radius and one spacing rule.
+  // Declared before the edge pass below, which reads `pos`.
+  const total = n + browserNodes.length;
+  const ringXY = (i: number) => {
+    if (total === 1) return { x: cx, y: cy };
+    const a = -Math.PI / 2 + (i * 2 * Math.PI) / total;
     return { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) };
-  });
+  };
+  const pos = nodes.map((_, i) => ringXY(i));
+  const browserPos = browserNodes.map((_, k) => ringXY(n + k));
 
   // Full-mesh edges as quadratic Béziers bowed outward from the center, so the
   // overlapping arcs form the "atomic orbit" look.
@@ -257,28 +306,6 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
     }
   }
 
-  // Browser-node satellites: admitted low-trust edge peers from the SEPARATE
-  // presence feed, rendered as small diamonds on an outer orbit — never cubes,
-  // never counted as fleet nodes or capacity. Unlike the geographic /regions
-  // map there is no location-sharing requirement here: this diagram is
-  // topological, so a browser that declined geo sharing is still a member of
-  // the p2p network and still gets a satellite. Placement is deterministic
-  // (stable lexical endpoint_id order) so a presence refresh doesn't reshuffle
-  // the ring: a satellite anchors beside the fleet node whose relay it is
-  // attached through when that relay is identifiable from relay_hint, fans out
-  // in a small arc when several share one relay, and otherwise distributes
-  // evenly around the ring. Rendered count is honestly capped.
-  const SAT_ORBIT = R + 62;
-  const MAX_SATELLITES = 150;
-  const sortedPresence = [...presence].sort((a, b) => (a.endpoint_id < b.endpoint_id ? -1 : a.endpoint_id > b.endpoint_id ? 1 : 0));
-  const satellites = sortedPresence.slice(0, MAX_SATELLITES);
-  const satelliteOverflow = sortedPresence.length - satellites.length;
-  // Name labels sit on the same outer orbit, so their spacing is the orbit
-  // circumference divided by the satellite count. A `bn-…` name is ~18
-  // characters at 9px ≈ 80px wide; the orbit is ~2π(R+62) ≈ 1000px, so ~12
-  // labels fit without collision and 24 is the point past which they start
-  // overlapping badly. Beyond it the hover title carries the name instead.
-  const showSatNames = satellites.length > 0 && satellites.length <= 24;
   // `relay_hint` carries the node's WHOLE connected relay set, comma-joined
   // (the worker publishes `status.relay`, which is `relays.join(",")`), so
   // feeding it straight to `new URL()` always threw and every satellite fell
@@ -291,7 +318,6 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
     try { return new URL(first).hostname; } catch { /* fall through to bare-host */ }
     return /^[a-z0-9.-]+$/i.test(first) ? first : "";
   };
-  const nodeAngle = (i: number) => -Math.PI / 2 + (i * 2 * Math.PI) / n;
   // The fleet's OWN headless browser nodes run ON a specific fleet host, and
   // their `subject` names it (`fleet-browser-node:<node>`, minted server-side
   // through the internal-token path — a browser cannot assert it).
@@ -312,7 +338,7 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
       ? subject.slice(FLEET_BROWSER_SUBJECT.length).trim()
       : "";
   };
-  const anchorOf = satellites.map((p) => {
+  const anchorOf = browserNodes.map((p) => {
     const hostNode = hostNodeOf(p);
     if (hostNode) {
       const byHost = nodes.findIndex((nd) => nd.name === hostNode);
@@ -323,27 +349,6 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
     const hintHost = hostOf(p.relay_hint);
     if (!hintHost) return -1;
     return nodes.findIndex((nd) => hostOf(nd.relay_url) === hintHost || (Boolean(nd.name) && hintHost.includes(nd.name)));
-  });
-  const anchoredTotal = new Map<number, number>();
-  anchorOf.forEach((i) => { if (i >= 0) anchoredTotal.set(i, (anchoredTotal.get(i) ?? 0) + 1); });
-  const anchoredSeen = new Map<number, number>();
-  const unanchoredTotal = anchorOf.filter((i) => i < 0).length;
-  let unanchoredSeen = 0;
-  const satPos = satellites.map((p, k) => {
-    let a: number;
-    const ai = anchorOf[k];
-    if (ai >= 0) {
-      const seen = anchoredSeen.get(ai) ?? 0;
-      anchoredSeen.set(ai, seen + 1);
-      const m = anchoredTotal.get(ai) ?? 1;
-      a = nodeAngle(ai) + (seen - (m - 1) / 2) * 0.14;
-    } else {
-      a = -Math.PI / 2 + ((unanchoredSeen++ + 0.5) * 2 * Math.PI) / Math.max(1, unanchoredTotal);
-    }
-    // `ai` (the anchored relay-node index, or -1 when unanchored) is carried
-    // through so the render pass can draw a connection line from the satellite
-    // to the fleet node it is synced through.
-    return { p, ai, x: cx + SAT_ORBIT * Math.cos(a), y: cy + SAT_ORBIT * Math.sin(a) };
   });
 
   return (
@@ -380,27 +385,31 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
           <path key={i} d={d} className="hive-mesh-wire" style={{ animationDelay: `${-((i * 0.13) % 1.8).toFixed(2)}s` }} />
         ))}
       </g>
-      {/* browser-node → relay links: a thin teal line from each satellite to
+      {/* browser-node → relay links: a thin teal line from each browser peer to
           the fleet node it syncs its relay through. Drawn in the wire layer so
-          the cubes below sit on top; only anchored satellites (ai ≥ 0, i.e. a
-          resolvable relay_hint) get a line — an unanchored one has no known
-          relay to point at. Solid (not the flowing mesh dash) so a browser
-          link reads as a distinct, quieter relationship than the fleet mesh. */}
+          the cubes below sit on top; only relayed peers (ai ≥ 0, i.e. a
+          resolvable subject/relay_hint) get a line — an unresolvable one has no
+          known relay to point at. Solid (not the flowing mesh dash) so a browser
+          link reads as a distinct, quieter relationship than the fleet mesh.
+          These carry TOPOLOGY only: both endpoints now sit on the same ring at
+          their own slot, so the line never implies the peer is AT that node. */}
       <g fill="none" strokeLinecap="round">
-        {satPos.map(({ p, ai, x, y }) =>
-          ai >= 0 ? (
+        {browserNodes.map((p, k) => {
+          const ai = anchorOf[k];
+          if (ai < 0) return null;
+          return (
             <line
               key={p.endpoint_id}
               x1={pos[ai].x}
               y1={pos[ai].y}
-              x2={x}
-              y2={y}
+              x2={browserPos[k].x}
+              y2={browserPos[k].y}
               stroke={p.state === "degraded" || p.state === "suspended" ? SATELLITE_DEGRADED_COLOR : SATELLITE_ONLINE_COLOR}
               strokeWidth={1}
               strokeOpacity={0.5}
             />
-          ) : null,
-        )}
+          );
+        })}
       </g>
       {/* nodes */}
       {nodes.map((node, i) => (
@@ -422,7 +431,19 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
           The name is drawn only while the ring is legible (`showSatNames`);
           past that the hover title still carries it, which is honest about
           the space rather than rendering 150 overlapping labels. */}
-      {satPos.map(({ p, x, y }) => {
+      {/* browser nodes — the SAME isometric cube as a fleet node, at the SAME
+          size (18) and the SAME label geometry, differing only in the shared
+          low-trust teal hue. They occupy their own slot on the same ring, so a
+          peer in Los Angeles renders as a peer in its own position instead of
+          orbiting whichever fleet node it happens to relay through. Degraded /
+          suspended recede to slate.
+
+          Each one is LABELLED with its own node name, exactly as a fleet cube
+          is labelled with `node.name` — a browser peer is a named member of
+          the mesh, not an anonymous dot. Names draw only while the ring stays
+          legible (`showBrowserNames`); past that the hover title and the
+          screen-reader list still carry them. */}
+      {browserNodes.map((p, k) => {
         const degraded = p.state === "degraded" || p.state === "suspended";
         // Light top → mid left → dark right, same lit-solid discipline as the
         // fleet CubeIcon, built around the shared satellite hue so the two cube
@@ -432,16 +453,15 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
           : { top: "#7dd3fc", left: SATELLITE_ONLINE_COLOR, right: "#0ea5e9" };
         const name = browserNodeName(p);
         return (
-          <g key={p.endpoint_id} transform={`translate(${x.toFixed(1)} ${y.toFixed(1)})`}>
+          <g key={p.endpoint_id} transform={`translate(${browserPos[k].x.toFixed(1)} ${browserPos[k].y.toFixed(1)})`}>
             <CubeIcon
               self={false}
               healthy={!degraded}
-              size={9}
               faces={faces}
               ring={p.shard_eligible ? SHARD_HOLDER_COLOR : undefined}
             />
-            {showSatNames && (
-              <text y={30} textAnchor="middle" style={{ fontSize: 9 }} className="fill-neutral-500 dark:fill-neutral-400">
+            {showBrowserNames && (
+              <text y={38} textAnchor="middle" style={{ fontSize: 13 }} className="fill-neutral-700 dark:fill-neutral-200">
                 {name}
               </text>
             )}
@@ -449,9 +469,9 @@ function MeshDiagram({ nodes, presence }: { nodes: NodeInfo[]; presence: Browser
           </g>
         );
       })}
-      {satelliteOverflow > 0 && (
+      {browserOverflow > 0 && (
         <text x={W - 8} y={H - 10} textAnchor="end" style={{ fontSize: 11 }} className="fill-neutral-500 dark:fill-neutral-400">
-          {`+${satelliteOverflow} more browser node${satelliteOverflow === 1 ? "" : "s"} not drawn`}
+          {`+${browserOverflow} more browser node${browserOverflow === 1 ? "" : "s"} not drawn`}
         </text>
       )}
     </svg>
@@ -688,11 +708,23 @@ function Fact({ label, value }: { label: string; value: string }) {
   );
 }
 
-function Stat({ icon, label, value }: { icon: React.ReactNode; label: string; value: React.ReactNode }) {
+function Stat({
+  icon,
+  label,
+  value,
+  hint,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: React.ReactNode;
+  /** Optional sub-line. Optional so every existing call site is unchanged. */
+  hint?: React.ReactNode;
+}) {
   return (
     <Card className="flex flex-col gap-1">
       <span className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-muted">{icon}{label}</span>
       <span className="text-2xl font-semibold text-fg">{value}</span>
+      {hint ? <span className="text-xs text-secondary">{hint}</span> : null}
     </Card>
   );
 }
