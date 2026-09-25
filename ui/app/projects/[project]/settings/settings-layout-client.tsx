@@ -49,7 +49,14 @@ export function SettingsLayout(props: {
   const mine = (deps ?? []).filter((d) => d.project === name);
   const dep = mine.find((d) => d.production) ?? mine.sort((a, b) => b.created_at_ms - a.created_at_ms)[0] ?? null;
   const sections = isContainerDeployment(dep)
-    ? [...baseSections.slice(0, 5), { slug: "container", label: "Container" }, ...baseSections.slice(5)]
+    ? [
+        ...baseSections.slice(0, 5),
+        { slug: "container", label: "Container" },
+        // Game servers ARE containers — the Drive mods sync + version pins +
+        // world snapshots only make sense alongside a persistent volume.
+        { slug: "game", label: "Game" },
+        ...baseSections.slice(5),
+      ]
     : baseSections;
 
   return (

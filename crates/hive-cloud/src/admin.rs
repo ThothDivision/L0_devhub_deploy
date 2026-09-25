@@ -172,6 +172,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             "/v1/projects/:project/container",
             put(project_container_put).delete(project_container_delete),
         )
+        .route(
+            "/v1/projects/:project/game",
+            put(project_game_put).delete(project_game_delete),
+        )
         .route("/v1/projects/:project/env", post(project_env_put))
         .route("/v1/projects/:project/env/:key", delete(project_env_delete))
         .route(
@@ -933,6 +937,62 @@ async fn project_container_delete(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     c.projects.set_container(&project, None);
+    crate::persist::persist(&c);
+    Ok(Json(json!(c.projects.get_masked(&project))))
+}
+
+/// `PUT /v1/projects/:project/game` — dashboard-managed game-server config
+/// (`GameServerSettings`: Drive mods folder + in-volume mods dir, version
+/// pins, world-snapshot toggle). Same "settings apply going forward"
+/// contract as `project_container_put`: nothing already running changes;
+/// git.rs merges it on the NEXT deploy, and the caller follows a save with
+/// `/v1/projects/:project/redeploy` to apply it immediately.
+async fn project_game_put(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+    Json(spec): Json<crate::project_settings::GameServerSettings>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Same unowned-row claim as project_container_put (see its comment).
+    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    c.projects.set_team(&project, &t);
+    // Deploy-input boundary validation (the project_container_put protocol
+    // precedent): reject a subdir that would escape the volume mount now,
+    // with a clear 400, rather than letting the deploy log a skip later.
+    for (field, v) in [
+        ("mods_dest_subdir", spec.mods_dest_subdir.as_deref()),
+        ("world_subdir", spec.world_subdir.as_deref()),
+    ] {
+        if let Some(v) = v.map(str::trim).filter(|s| !s.is_empty()) {
+            if v.starts_with('/')
+                || v.contains('\\')
+                || v.contains('\0')
+                || v.split('/').any(|c| c == "..")
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("{field} {v:?} must be a relative path inside the volume (no leading /, no ..)"),
+                ));
+            }
+        }
+    }
+    c.projects.set_game(&project, Some(spec));
+    crate::persist::persist(&c);
+    Ok(Json(json!(c.projects.get_masked(&project))))
+}
+
+/// `DELETE /v1/projects/:project/game` — clears the dashboard-managed game
+/// config. Changes nothing already deployed; the NEXT deploy stops syncing
+/// mods and snapshotting the world.
+async fn project_game_delete(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    c.projects.set_game(&project, None);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
 }

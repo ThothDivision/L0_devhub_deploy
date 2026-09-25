@@ -184,7 +184,11 @@ impl BuildStore {
             }
         }
     }
-    fn log(&self, id: &str, line: impl Into<String>) {
+    /// Append one line to a build's log. `pub(crate)` so sibling modules whose
+    /// deploy-time work produces tenant-visible diagnostics (e.g.
+    /// `game_mods`'s Drive-sync gaps) can name them in the same build log
+    /// instead of only in the node journal.
+    pub(crate) fn log(&self, id: &str, line: impl Into<String>) {
         if let Some(b) = self.map.lock().get_mut(id) {
             let mut line: String = line.into();
             if line.len() > MAX_BUILD_LOG_LINE_BYTES {
@@ -11002,6 +11006,36 @@ async fn image_container_manifest(
         pids,
         volume_path.as_deref(),
     );
+    // Game-server settings (bn-game-server-mods): version pins land as env on
+    // the container function (never overriding an explicit declaration), and
+    // the Drive mods sync + world snapshot run against the SAME named volume
+    // the manifest just attached, using the just-pulled image as the helper
+    // container. Degrades to logged gaps, never a build failure.
+    let game_spec = cloud
+        .projects
+        .get_exact(project, incarnation)?
+        .game;
+    if let Some(game) = game_spec {
+        if let Some(f) = manifest.functions.first_mut() {
+            if let Some(v) = game.game_version.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                f.env.entry("VERSION".into()).or_insert_with(|| v.to_string());
+            }
+            if let Some(t) = game.server_type.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                f.env.entry("TYPE".into()).or_insert_with(|| t.to_string());
+            }
+        }
+        let team = cloud.projects.team_of(project);
+        crate::game_mods::apply_game_settings(
+            cloud,
+            bid,
+            project,
+            &team,
+            image,
+            &project_volume_name(project, incarnation, None),
+            &game,
+        )
+        .await;
+    }
     // A full multi-port declaration REPLACES the single-port ports list built
     // above (the first entry is still the primary — `start_cmd[2]`/`protocol`
     // above already reflect it, since callers pass the primary as `port`/
