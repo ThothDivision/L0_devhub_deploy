@@ -30,9 +30,9 @@ hive_marketplace_testnet_atomic_split_audited: false
 hive_marketplace_testnet_configuration_reference: ""
 # The private Marketplace gateway remains disabled unless a project and a
 # private Podman-bridge bind address are deliberately configured.
-hive_marketplace_project: ""
+hive_marketplace_project: "neighborhood-marketplace"
 hive_marketplace_gateway_host: "devhub-marketplace.internal"
-hive_marketplace_gateway_listen: ""
+hive_marketplace_gateway_listen: "10.129.136.1:9443"
 hive_marketplace_gateway_tls_cert: "/etc/hive/marketplace-ca/gateway.crt"
 hive_marketplace_gateway_tls_key: "/etc/hive/marketplace-ca/gateway.key"
 hive_marketplace_gateway_ca_cert: "/etc/hive/marketplace-ca/ca.crt"
