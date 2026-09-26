@@ -1,165 +1,133 @@
-// Platform adapter for Cloudflare Worker modules (the
-// `export default { async fetch(request, env, ctx) { ... } }` shape).
-// Staged into the build directory by the platform; never part of the
-// repository.
+// Platform adapter for Cloudflare Worker modules (the `export default {
+// async fetch(request, env, ctx) { ... } }` shape). Staged into the build dir by
+// the platform; never part of the repository.
 //
 // Usage: node [--experimental-strip-types] .hive-worker-launcher.mjs <entry>
-
-import http from 'node:http';
-import { Buffer } from 'node:buffer';
-import { pathToFileURL } from 'node:url';
-import path from 'node:path';
-
-const entry = process.argv[2];
-if (!entry) {
+//
+// WHY THIS EXISTS. A Worker is not a Node server and cannot be started the way
+// its own template starts it: every Cloudflare template's `scripts.start` runs
+// the `wrangler` CLI, which needs the Workers runtime (workerd) and a Cloudflare
+// account. Our substrate runs Node, so launching `wrangler` fails with
+// "command wrangler is not a dir". This adapter instead hosts the SAME handler
+// the Worker exports, on Node: it binds $PORT, converts each inbound Node
+// request into a Fetch API `Request`, calls `fetch(request, env, ctx)`, and
+// writes the returned `Response` back. No workerd, no account, no deploy.
+//
+// WHAT IS AND IS NOT EMULATED — stated honestly, because a silent partial
+// emulation is worse than a named gap:
+//   * `env` is populated from the deployment's real process environment. There
+//     is no bindings layer: KV / D1 / R2 / Queues / Durable Objects / service
+//     bindings are NOT provided. A Worker that dereferences one at request time
+//     gets `undefined` (or its own error) rather than a fabricated stub.
+//   * `ctx.waitUntil` runs the promise in the background but, unlike Workers,
+//     does not extend the platform's request lifetime — the response is flushed
+//     when `fetch` resolves, exactly as with any Node handler.
+//   * `ctx.passThroughOnException` is accepted and ignored: on a thrown handler
+//     this returns 500, it does not proxy to origin.
+//   * `request.cf` is absent (no Cloudflare edge metadata).
+//
+// TypeScript entries run under Node's own type stripping (erasable syntax only).
+const entryArg = process.argv[2];
+if (!entryArg) {
   console.error('[hive-worker-launcher] missing entry argument');
   process.exit(1);
 }
+const { pathToFileURL } = await import('node:url');
+const path = await import('node:path');
+const http = await import('node:http');
+const port = Number(process.env.PORT || 3000);
 
-const port = Number(process.env.PORT);
-if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-  console.error('[hive-worker-launcher] PORT is not a valid port number');
-  process.exit(1);
+const mod = await import(pathToFileURL(path.resolve(entryArg)).href);
+// Worker module shape: `export default { fetch }` (object) or, in the newer
+// "plain" format, `export default fetch` (function). ESM/CJS interop can
+// double-wrap the default export, so unwrap once before inspecting it.
+let exported = mod.default;
+if (exported && typeof exported === 'object' && typeof exported.default !== 'undefined') {
+  exported = exported.default;
 }
+const handler =
+  typeof exported === 'function' ? exported : exported && exported.fetch;
 
-const IMPORT_TIMEOUT_MS = 30_000;
-const REQUEST_TIMEOUT_MS = (() => {
-  const value = Number(process.env.HIVE_MAX_DURATION_MS);
-  return Number.isFinite(value) && value > 0 ? value : 300_000;
-})();
-const MAX_BODY_BYTES = 4_500_000;
-const MAX_RESPONSE_BYTES = 4_500_000;
-
-function withTimeout(promise, ms, message) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
-function unwrapDefault(value) {
-  let current = value;
-  for (let i = 0; i < 5; i += 1) {
-    if (current && typeof current === 'object' && current.default) {
-      current = current.default;
-    } else {
-      break;
-    }
-  }
-  return current;
-}
-
-let moduleNamespace;
-try {
-  moduleNamespace = await withTimeout(
-    import(pathToFileURL(path.resolve(entry)).href),
-    IMPORT_TIMEOUT_MS,
-    `worker module did not finish importing within ${IMPORT_TIMEOUT_MS}ms`,
+if (typeof handler !== 'function') {
+  console.error(
+    '[hive-worker-launcher] entry exported no Worker fetch handler (expected ' +
+      '`export default { fetch }` or `export default fetch`)'
   );
-} catch (error) {
-  console.error('[hive-worker-launcher] worker import failed:', error?.stack || error);
   process.exit(1);
 }
 
-const worker = unwrapDefault(moduleNamespace.default ?? moduleNamespace);
-const fetchHandler =
-  typeof worker === 'object' && worker !== null && typeof worker.fetch === 'function'
-    ? worker.fetch.bind(worker)
-    : typeof moduleNamespace.fetch === 'function'
-      ? moduleNamespace.fetch
-      : null;
-
-if (!fetchHandler) {
-  console.error('[hive-worker-launcher] worker exports no callable fetch handler');
-  process.exit(1);
-}
-
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on('data', (chunk) => {
-      size += chunk.length;
-      if (size > MAX_BODY_BYTES) {
-        req.destroy();
-        reject(Object.assign(new Error('request body exceeds 4500000 bytes'), { statusCode: 413 }));
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', reject);
+function toWebRequest(req, url) {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (Array.isArray(value)) {
+      for (const entry of value) headers.append(name, entry);
+    } else if (value !== undefined) headers.append(name, String(value));
+  }
+  const hasBody = req.method !== 'GET' && req.method !== 'HEAD';
+  return new Request(url, {
+    method: req.method,
+    headers,
+    body: hasBody ? req : undefined,
+    // Node's IncomingMessage is a readable stream, which is a valid BodyInit.
+    duplex: hasBody ? 'half' : undefined,
   });
 }
 
-function envBindings() {
-  return { ...process.env };
+async function writeResponse(res, response) {
+  res.statusCode = response.status;
+  response.headers.forEach((value, name) => {
+    // `content-length` / `transfer-encoding` are owned by Node once we stream.
+    if (name === 'content-length' || name === 'transfer-encoding') return;
+    res.setHeader(name, value);
+  });
+  if (!response.body) {
+    res.end();
+    return;
+  }
+  const reader = response.body.getReader();
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      res.write(value);
+    }
+  } finally {
+    res.end();
+  }
 }
 
 const server = http.createServer(async (req, res) => {
-  const waitUntilTasks = [];
+  const host = req.headers.host || `127.0.0.1:${port}`;
+  const url = new URL(req.url || '/', `http://${host}`);
+  const background = [];
   const ctx = {
     waitUntil(promise) {
-      waitUntilTasks.push(Promise.resolve(promise));
+      // Fire-and-forget with an explicit rejection log: an unhandled rejection
+      // here would otherwise take the whole server down.
+      const tracked = Promise.resolve(promise).catch((error) => {
+        console.error('[hive-worker-launcher] ctx.waitUntil rejected:', error);
+      });
+      background.push(tracked);
     },
-    passThroughOnException() {},
+    passThroughOnException() {
+      // Accepted for API compatibility; not emulated (see the header comment).
+    },
   };
-
   try {
-    const body = req.method === 'GET' || req.method === 'HEAD' ? undefined : await readBody(req);
-    const headers = new Headers();
-    for (const [name, value] of Object.entries(req.headers)) {
-      if (value !== undefined) headers.set(name, Array.isArray(value) ? value.join(', ') : value);
+    const response = await handler(toWebRequest(req, url), process.env, ctx);
+    if (!response || typeof response.status !== 'number') {
+      res.statusCode = 500;
+      res.end('[hive-worker-launcher] handler returned no Response');
+      return;
     }
-    const request = new Request(`http://${req.headers.host || `127.0.0.1:${port}`}${req.url || '/'}`, {
-      method: req.method,
-      headers,
-      body,
-    });
-    const response = await withTimeout(
-      fetchHandler(request, envBindings(), ctx),
-      REQUEST_TIMEOUT_MS,
-      `worker request exceeded ${REQUEST_TIMEOUT_MS}ms`,
-    );
-    if (!(response instanceof Response)) throw new Error('worker fetch did not return a Response');
-
-    const responseHeaders = {};
-    for (const [name, value] of response.headers) responseHeaders[name] = value;
-    res.writeHead(response.status, responseHeaders);
-    let written = 0;
-    if (response.body) {
-      for await (const chunk of response.body) {
-        written += chunk.byteLength;
-        if (written > MAX_RESPONSE_BYTES) throw new Error('response body exceeds 4500000 bytes');
-        if (!res.write(Buffer.from(chunk))) await new Promise((resolve) => res.once('drain', resolve));
-      }
-    }
-    res.end();
+    await writeResponse(res, response);
   } catch (error) {
-    console.error('[hive-worker-launcher] request failed:', error?.stack || error);
-    if (!res.headersSent) res.writeHead(error?.statusCode || 500, { 'content-type': 'text/plain; charset=utf-8' });
-    if (!res.writableEnded) res.end(String(error?.message || error));
-  } finally {
-    await Promise.allSettled(waitUntilTasks);
+    console.error('[hive-worker-launcher] handler threw:', error);
+    if (!res.headersSent) res.statusCode = 500;
+    res.end('[hive-worker-launcher] handler threw');
   }
 });
 
-server.on('clientError', (_error, socket) => {
-  if (socket.writable) socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
-});
-
 server.listen(port, '0.0.0.0', () => {
-  console.log(`[hive-worker-launcher] listening on 0.0.0.0:${port}`);
-});
-
-for (const signal of ['SIGTERM', 'SIGINT']) {
-  process.on(signal, () => {
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 5_000).unref();
-  });
-}
-
-process.on('unhandledRejection', (reason) => {
-  console.error('[hive-worker-launcher] unhandled rejection:', reason);
+  console.log(`[hive-worker-launcher] worker handler listening on :${port}`);
 });
