@@ -14,7 +14,35 @@ tokio = { workspace = true }
 bytes = "1"
 anyhow = { workspace = true }
 tracing = { workspace = true }
-iroh = "1"
+# `tls-aws-lc-rs` alongside the crate's own default `tls-ring` -- NEVER instead
+# of it: both TLS backends must stay compiled in so a plain feature-unification
+# accident elsewhere in the workspace can never silently drop one, and so a
+# classical-only peer (an older binary, or the browser build which stays
+# ring-only) still completes a handshake. Which one an endpoint ACTUALLY uses
+# is decided at runtime by `bind_full`'s explicit `.crypto_provider(...)` call
+# below, never by which feature merely happens to be compiled (see
+# `endpoint/presets.rs`'s own doc comment: with both features on, its presets
+# prefer ring -- silently, with no PQ offered -- which is exactly the trap
+# `docs/pqc-migration-scope.md` names as "feature unification re-enables ring").
+iroh = { version = "1", features = ["tls-aws-lc-rs"] }
+# Direct dependency, not inherited transitively: `noq` (iroh's QUIC/TLS glue)
+# requests plain `rustls` with `default-features = false` (see its own
+# Cargo.toml, `[dependencies.rustls]`), so this workspace must NOT rely on
+# some other crate's default feature set to bring in `aws_lc_rs` +
+# `prefer-post-quantum` -- verified 2026-09-22 by reading noq 1.0.1's and
+# rustls 0.23.40's own Cargo.toml `[features]` tables directly, not assumed.
+# Resolves to the SAME locked 0.23.40 instance iroh/noq already use (one
+# rustls per binary; Cargo unifies by semver-compatible version).
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "prefer-post-quantum", "tls12", "std"] }
+# `noq` is iroh's QUIC/TLS implementation; `iroh::endpoint::Connection::
+# handshake_data()` returns `Box<dyn Any>` boxing THIS EXACT concrete type
+# (`iroh/Cargo.toml`'s own `[dependencies.noq]` unconditionally requests
+# `features = ["rustls"]`, so `crypto::rustls::HandshakeData` is always
+# compiled regardless of the ring/aws-lc-rs choice) — a direct dependency
+# here, pinned to the SAME locked version, is required for the downcast in
+# `record_kex_telemetry` to type-check at all (a mismatched/duplicate `noq`
+# instance would make it silently always return `None`, not fail to build).
+noq = { version = "=1.0.1", default-features = false, features = ["rustls"] }
 # Public mainline-DHT (pkarr/BEP-44) address lookup — see `src/dht.rs` for what
 # becomes publicly resolvable and how it is gated. `iroh-mainline-address-lookup`
 # 0.4 depends on iroh ^1.0 / iroh-dns ^1.0, matching the pins above; it does NOT

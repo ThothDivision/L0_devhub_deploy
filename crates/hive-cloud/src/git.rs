@@ -2316,7 +2316,8 @@ async fn run_build(
             // `run_build`), collapsing the deploy to the primary region only —
             // while a STATELESS multi-region fanout proceeds on every target
             // exactly as before.
-            let mut ok = fanout_remote(cloud, bid, &req, &project, incarnation, &remote, true).await;
+            let mut ok =
+                fanout_remote(cloud, bid, &req, &project, incarnation, &remote, true).await;
             // DISPATCH FALLBACK. `nothing_ran` means every placed target was
             // UNREACHABLE — the request never arrived anywhere, so nothing is
             // known about the app and no node holds a half-finished build.
@@ -3937,8 +3938,7 @@ async fn run_build(
     {
         let ingested_early = find_workflow_manifest(&build_dir).is_some();
         let py_wdk = crate::world_queue::vercel_json_declares_workflow_worker(&build_dir);
-        let opted_out =
-            crate::world_queue::workflow_world_opted_out(cloud, &project, &build_dir);
+        let opted_out = crate::world_queue::workflow_world_opted_out(cloud, &project, &build_dir);
         tracing::info!(
             %project,
             ingested_early,
@@ -4023,16 +4023,17 @@ async fn run_build(
                 // `manifest.functions[].env` earlier in the pipeline, well
                 // before this block runs.
                 if let Ok(fresh) = cloud.projects.get_exact(&project, incarnation) {
-                    let queue_env: Vec<(String, String)> = ["HIVE_QUEUE_ENDPOINT", "HIVE_QUEUE_TOKEN"]
-                        .into_iter()
-                        .filter_map(|key| {
-                            fresh
-                                .env
-                                .iter()
-                                .find(|e| e.key == key)
-                                .map(|value| (key.to_string(), value.value.clone()))
-                        })
-                        .collect();
+                    let queue_env: Vec<(String, String)> =
+                        ["HIVE_QUEUE_ENDPOINT", "HIVE_QUEUE_TOKEN"]
+                            .into_iter()
+                            .filter_map(|key| {
+                                fresh
+                                    .env
+                                    .iter()
+                                    .find(|e| e.key == key)
+                                    .map(|value| (key.to_string(), value.value.clone()))
+                            })
+                            .collect();
                     for f in manifest.functions.iter_mut() {
                         for (k, v) in &queue_env {
                             f.env.insert(k.clone(), v.clone());
@@ -6539,7 +6540,9 @@ fn direct_launch_entry(start_cmd: &[String]) -> Option<String> {
         && path
             .components()
             .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
-        && path.components().any(|component| matches!(component, Component::Normal(_)));
+        && path
+            .components()
+            .any(|component| matches!(component, Component::Normal(_)));
     plain_relative.then(|| candidate.clone())
 }
 
@@ -6615,7 +6618,12 @@ async fn preflight_direct_entries(
                 let mut names = Vec::new();
                 while let Ok(Some(entry)) = entries.next_entry().await {
                     let mut name = entry.file_name().to_string_lossy().into_owned();
-                    if entry.file_type().await.map(|kind| kind.is_dir()).unwrap_or(false) {
+                    if entry
+                        .file_type()
+                        .await
+                        .map(|kind| kind.is_dir())
+                        .unwrap_or(false)
+                    {
                         name.push('/');
                     }
                     names.push(name);
@@ -11158,10 +11166,12 @@ pub fn spawn_git_poll_reconcile(cloud: Arc<CloudState>) {
             loop {
                 tick.tick().await;
                 crate::supervise::beat("git-poll-reconcile");
-                // LEADER ONLY: exactly one node polls + deploys, mirroring every other
-                // reconciler's control-plane gate — otherwise each node would start the
-                // same build for the same push.
-                if !cloud.is_control_plane_leader() {
+                // LEADER ONLY: exactly one node polls + deploys — otherwise each
+                // node would start the same build for the same push. The shared
+                // background-job gate (tenure + voter quorum), never the bare
+                // request-path leader test: a flapping follower ran 21 poll
+                // cycles and deployed on 2026-09-24.
+                if !crate::leadership::may_act(&cloud, crate::leadership::Job::GitPoll) {
                     continue;
                 }
                 git_poll_cycle(&cloud).await;

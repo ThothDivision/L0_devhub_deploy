@@ -4,10 +4,52 @@
 // Focuses on iroh-blobs (storage) and iroh-gossip (pubsub).
 // Uses discovery via Pkarr/DNS/mDNS.
 
-use iroh::EndpointId as NodeId;
+use iroh::{EndpointId as NodeId, address_lookup::UserData};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use zeroize::{Zeroize, Zeroizing};
+
+const MDNS_AUTH_CONTEXT: &str = "hive guardian-db mdns membership v1";
+const MDNS_AUTH_PREFIX: &str = "hive-gdb-mdns-v1:";
+
+#[derive(Clone)]
+pub struct MdnsDiscoveryAuth {
+    key: Arc<Zeroizing<[u8; 32]>>,
+}
+
+impl std::fmt::Debug for MdnsDiscoveryAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MdnsDiscoveryAuth")
+            .field("key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl MdnsDiscoveryAuth {
+    pub fn from_key_material(mut root: [u8; 32]) -> Self {
+        let key = blake3::derive_key(MDNS_AUTH_CONTEXT, &root);
+        root.zeroize();
+        Self {
+            key: Arc::new(Zeroizing::new(key)),
+        }
+    }
+
+    pub(crate) fn user_data(&self, endpoint_id: NodeId) -> Result<UserData, String> {
+        format!(
+            "{MDNS_AUTH_PREFIX}{}",
+            blake3::keyed_hash(&self.key, endpoint_id.as_bytes()).to_hex()
+        )
+        .parse()
+        .map_err(|error| format!("invalid mDNS membership tag: {error}"))
+    }
+
+    pub(crate) fn authenticates(&self, endpoint_id: NodeId, user_data: &UserData) -> bool {
+        self.user_data(endpoint_id)
+            .is_ok_and(|expected| expected == *user_data)
+    }
+}
 
 /// Complete configuration for the Iroh client.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +72,10 @@ pub struct ClientConfig {
     /// Enables discovery via mDNS (local network).
     pub enable_discovery_mdns: bool,
 
+    /// Fleet credential used to authenticate passively discovered mDNS peers.
+    #[serde(skip)]
+    pub mdns_discovery_auth: Option<MdnsDiscoveryAuth>,
+
     /// Iroh networking settings.
     pub network: NetworkConfig,
 
@@ -47,8 +93,9 @@ impl Default for ClientConfig {
             data_store_path: Some(PathBuf::from("./iroh_data")),
             port: 0, // Random port.
             known_peers: vec![],
-            enable_discovery_n0: true,   // Discovery via Pkarr/DNS.
-            enable_discovery_mdns: true, // Local discovery.
+            enable_discovery_n0: true,    // Discovery via Pkarr/DNS.
+            enable_discovery_mdns: false, // Authenticated local discovery is explicit.
+            mdns_discovery_auth: None,
             network: NetworkConfig::default(),
             storage: StorageConfig::default(),
             gossip: GossipConfig::default(),
@@ -64,8 +111,9 @@ impl ClientConfig {
             data_store_path: Some("./tmp/iroh_dev".into()),
             port: 0, // Random port.
             known_peers: vec![],
-            enable_discovery_n0: false,  // Disabled for local dev.
-            enable_discovery_mdns: true, // Local discovery only.
+            enable_discovery_n0: false,   // Disabled for local dev.
+            enable_discovery_mdns: false, // Requires an explicit shared credential.
+            mdns_discovery_auth: None,
             network: NetworkConfig::development(),
             storage: StorageConfig::development(),
             gossip: GossipConfig::development(),
@@ -77,10 +125,11 @@ impl ClientConfig {
         Self {
             enable_pubsub: true,
             data_store_path: Some("/var/lib/iroh".into()),
-            port: 4001,                  // Fixed port for production.
-            known_peers: vec![],         // Would be populated with peers.
-            enable_discovery_n0: true,   // Global discovery via n0.computer.
-            enable_discovery_mdns: true, // Local discovery as well.
+            port: 4001,                   // Fixed port for production.
+            known_peers: vec![],          // Would be populated with peers.
+            enable_discovery_n0: true,    // Global discovery via n0.computer.
+            enable_discovery_mdns: false, // Requires an explicit shared credential.
+            mdns_discovery_auth: None,
             network: NetworkConfig::production(),
             storage: StorageConfig::production(),
             gossip: GossipConfig::production(),
@@ -96,6 +145,7 @@ impl ClientConfig {
             known_peers: vec![],
             enable_discovery_n0: false,
             enable_discovery_mdns: false,
+            mdns_discovery_auth: None,
             network: NetworkConfig::testing(),
             storage: StorageConfig::testing(),
             gossip: GossipConfig::testing(),
@@ -146,6 +196,16 @@ impl ClientConfig {
             && path.as_os_str().is_empty()
         {
             return Err("Storage path cannot be empty".to_string());
+        }
+
+        if self.enable_discovery_mdns && self.mdns_discovery_auth.is_none() {
+            return Err(
+                "mDNS discovery requires an explicit MdnsDiscoveryAuth credential".to_string(),
+            );
+        }
+
+        if self.network.max_peers_per_session == 0 {
+            return Err("Maximum peers per session cannot be zero".to_string());
         }
 
         // Validate the storage settings.
@@ -358,7 +418,7 @@ mod tests {
         let config = ClientConfig::default();
         assert!(config.enable_pubsub);
         assert!(config.enable_discovery_n0);
-        assert!(config.enable_discovery_mdns);
+        assert!(!config.enable_discovery_mdns);
         assert!(config.validate().is_ok());
     }
 
@@ -367,7 +427,7 @@ mod tests {
         let config = ClientConfig::development();
         assert!(config.enable_pubsub);
         assert!(!config.enable_discovery_n0); // Disabled for dev.
-        assert!(config.enable_discovery_mdns);
+        assert!(!config.enable_discovery_mdns);
         assert_eq!(config.port, 0); // Random port.
     }
 
@@ -376,7 +436,7 @@ mod tests {
         let config = ClientConfig::production();
         assert!(config.enable_pubsub);
         assert!(config.enable_discovery_n0);
-        assert!(config.enable_discovery_mdns);
+        assert!(!config.enable_discovery_mdns);
         assert_eq!(config.port, 4001); // Fixed port.
     }
 

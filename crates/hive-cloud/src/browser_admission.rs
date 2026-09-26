@@ -2645,7 +2645,7 @@ pub fn roll_call(cloud: &Arc<CloudState>) -> RollCall {
         started_ms,
         took_ms: hive_core::now_ms().saturating_sub(started_ms),
         node: cloud.node_name.clone(),
-        leader: cloud.control_plane_leader(),
+        leader: cloud.control_plane_leader().unwrap_or_default(),
         is_leader: cloud.is_control_plane_leader(),
         interval_secs: roll_call_interval_secs(),
         admitted: admissions.len(),
@@ -2786,8 +2786,7 @@ async fn list_admissions(State(cloud): State<Arc<CloudState>>, claims: Claims) -
     let claims = claims_required(claims)?;
     let tenant = crate::admin::norm(&claims.tenant).to_string();
     let local = cloud.browser_admissions.list(&tenant, hive_core::now_ms());
-    if local.is_empty() && !cloud.is_control_plane_leader() {
-        let leader = cloud.control_plane_leader();
+    if let (true, Some(leader)) = (local.is_empty(), cloud.leader_forward_target()) {
         if let Some(value) =
             crate::admin::fetch_from_host(&cloud, &leader, "/v1/browser/admissions", &tenant).await
         {
@@ -2810,8 +2809,7 @@ async fn get_admission(
     {
         return Ok(Json(json!({ "admission": record })));
     }
-    if !cloud.is_control_plane_leader() {
-        let leader = cloud.control_plane_leader();
+    if let Some(leader) = cloud.leader_forward_target() {
         let path = format!("/v1/browser/admissions/{endpoint_id}");
         if let Some(value) = crate::admin::fetch_from_host(&cloud, &leader, &path, &tenant).await {
             return Ok(Json(value));
@@ -3025,7 +3023,7 @@ pub async fn revoke_team(cloud: &Arc<CloudState>, tenant: &str) -> usize {
 }
 
 pub fn snapshot_bytes(cloud: &Arc<CloudState>) -> Vec<u8> {
-    if cloud.is_control_plane_leader() {
+    if crate::leadership::may_act(cloud, crate::leadership::Job::BrowserExpiry) {
         let expired = cloud.browser_admissions.expire(hive_core::now_ms());
         for record in expired {
             cloud.gw.remove_browser_endpoint(&record.endpoint_id);
@@ -3134,7 +3132,9 @@ pub async fn endpoint_admitted(cloud: &Arc<CloudState>, endpoint_id: &str) -> bo
         tracing::warn!(endpoint_id, "browser admission leader fallback saturated");
         return false;
     };
-    let leader = cloud.control_plane_leader();
+    let Some(leader) = cloud.leader_forward_target() else {
+        return false;
+    };
     let path = format!("/v1/browser/admissions/accept/{endpoint_id}");
     crate::admin::fetch_from_host(cloud, &leader, &path, "")
         .await

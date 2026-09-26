@@ -1306,12 +1306,19 @@ impl LiteboxBackend {
         // process owns every litebox cell on the node and none may be running,
         // so any surviving runner is definitionally stale.
         Self::reap_orphaned_runners(&cfg.runner_bin);
-        // The guest network stack services ONE inbound connection at a time
-        // (single-listener serial re-arm); overlapping tunnel connects were
-        // accept-closed as "function closed before headers". Queue them at the
-        // tunnel's connect gate instead — a request waits microseconds rather
-        // than failing. Process-wide is correct: a node runs exactly one
-        // backend, and every function on a litebox node is a litebox guest.
+        // Litebox's own TCP accept backlog is real (up to 8 truly concurrent
+        // pending connections, litebox/src/net/mod.rs) — live packet-capture
+        // testing on fc-sanjose (2026-09-17) found the actual "function
+        // closed before headers" trigger elsewhere: the guest network stack
+        // drops its just-written response if the app closes the connection
+        // (as ours did, unconditionally, via `Connection: close`) before its
+        // poll loop flushes pending TX data to the TUN device -- fixed at the
+        // source in fluid_tunnel::server::proxy_local, which no longer asks
+        // the guest to close. This gate stays at 1 as a conservative default,
+        // not because concurrency is unsafe; raising it is a separate,
+        // deliberately unstarted follow-up (PRD `litebox-raise-connect-permits`).
+        // Process-wide is correct: a node runs exactly one backend, and every
+        // function on a litebox node is a litebox guest.
         fluid_tunnel::set_local_connect_permits(1);
         LiteboxBackend {
             cfg,
@@ -1331,6 +1338,25 @@ impl LiteboxBackend {
     /// and must never be swept. Identification is by `/proc/<pid>/exe` against
     /// the configured runner path (never by name substring, which could match
     /// a tenant process), and this process's own children cannot exist yet.
+    ///
+    /// **Must survive a runner BINARY swap, not just a hive-cloud restart.**
+    /// Every deploy of `/usr/local/bin/litebox-runner` (the ansible role, or
+    /// `mv -f` onto the running path — there is no other way to replace an
+    /// in-use executable on Linux, which refuses in-place overwrite with
+    /// `ETXTBSY`) unlinks the OLD inode while an old orphan still maps it, so
+    /// the kernel appends `" (deleted)"` to that orphan's `/proc/<pid>/exe`
+    /// readlink from then on — confirmed live (`cp`+`mv -f` over a running
+    /// `sleep`, va, 2026-09-22): `/tmp/x/a.bin` reads back as
+    /// `/tmp/x/a.bin (deleted)`, which string-equality with the canonical
+    /// path silently stops matching. Witnessed for real: two fc-phoenix
+    /// runners from an earlier hive-cloud incarnation survived TWO restarts
+    /// of the fixed-binary-path reaper above — each one immediately after a
+    /// runner binary swap — burning ~48% of a core apiece for nearly an hour
+    /// until killed by hand. `strip_deleted_exe_suffix` undoes exactly that
+    /// kernel annotation before comparing; it must never strip a REAL literal
+    /// `" (deleted)"` suffix a tenant path could have — `runner_bin` is a
+    /// platform-controlled config value, never tenant input, so there is no
+    /// path here for that ambiguity to matter.
     fn reap_orphaned_runners(runner_bin: &Path) {
         #[cfg(target_os = "linux")]
         {
@@ -1347,7 +1373,9 @@ impl LiteboxBackend {
                 if pid == std::process::id() {
                     continue;
                 }
-                let exe = std::fs::read_link(entry.path().join("exe")).ok();
+                let exe = std::fs::read_link(entry.path().join("exe"))
+                    .ok()
+                    .map(|p| strip_deleted_exe_suffix(&p));
                 let matches = match (&exe, &canonical) {
                     (Some(exe), Some(canonical)) => exe == canonical || exe.as_path() == runner_bin,
                     (Some(exe), None) => exe.as_path() == runner_bin,
@@ -2079,18 +2107,23 @@ impl LiteboxBackend {
                 "litebox artifact GC refuses a reference with a mismatched filename: {}",
                 name.to_string_lossy()
             );
+            // Presence, never content: this loop used to SHA-256 every archive
+            // every reference names, on every publish, under `artifact_lock` --
+            // ~125 references x ~400 MB = ~50 GB, measured at ~163 s per publish
+            // on fc-sanjose (2026-09-20), so a shim change (which invalidates
+            // every app's runtime archive) queued each app's cold start behind
+            // ~2.7 minutes of hashing apiece. Content is verified where it is
+            // USED (`verify_immutable_open` at launch and at publication).
             let app_name = Self::app_archive_name(&reference.app_archive_sha256);
-            verify_immutable_open(&directories.apps, &app_name, &reference.app_archive_sha256)
-                .await?;
+            directories.apps.open_regular(&app_name).with_context(|| {
+                format!("litebox artifact GC: referenced app archive missing for {}", reference.image)
+            })?;
             keep_apps.insert(app_name);
             for runtime in reference.runtimes.values() {
                 let runtime_name = Self::runtime_archive_name(&runtime.archive_sha256);
-                verify_immutable_open(
-                    &directories.runtimes,
-                    &runtime_name,
-                    &runtime.archive_sha256,
-                )
-                .await?;
+                directories.runtimes.open_regular(&runtime_name).with_context(|| {
+                    format!("litebox artifact GC: referenced runtime archive missing for {}", reference.image)
+                })?;
                 keep_runtimes.insert(runtime_name);
             }
         }
@@ -2500,6 +2533,19 @@ fn sha256_parts(parts: &[&[u8]]) -> String {
         hasher.update(part);
     }
     hex_sha256(&hasher.finalize())
+}
+
+/// Undoes the kernel's `" (deleted)"` annotation on a `/proc/<pid>/exe`
+/// readlink target whose backing inode was unlinked while still mapped —
+/// see `reap_orphaned_runners`'s doc comment for why this fires on every
+/// ordinary runner-binary deploy, not just a crash.
+#[cfg(target_os = "linux")]
+fn strip_deleted_exe_suffix(path: &Path) -> PathBuf {
+    const SUFFIX: &str = " (deleted)";
+    match path.to_str() {
+        Some(s) if s.ends_with(SUFFIX) => PathBuf::from(&s[..s.len() - SUFFIX.len()]),
+        _ => path.to_path_buf(),
+    }
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -2955,28 +3001,46 @@ fn validated_direct_entry(
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        let mut components = 0usize;
-        let mut relative = PathBuf::new();
+        // Lexically NORMALIZE `..` rather than refusing it outright: a package
+        // manager resolves its launcher through a symlinked `.bin/<tool>`
+        // whose target legitimately climbs out of the application directory
+        // into a shared store that is still inside the artifact (pnpm:
+        // `apps/web/node_modules/.bin/next` ->
+        // `node_modules/.pnpm/next@<ver>/node_modules/next/bin/next`, i.e.
+        // `../../node_modules/next/dist/bin/next` from the app dir). The entry
+        // here is already the RESOLVED physical path, so lexical normalization
+        // is sound.
+        //
+        // Normalize the JOINED absolute path, never the raw relative one:
+        // popping `..` off a bare relative path starts from nothing, so the
+        // FIRST `..` — exactly the leading climb a pnpm target has — was
+        // refused as an escape (witnessed 2026-09-26, Nodes.WTF: "the direct
+        // runtime entry escapes the validated artifact" for
+        // `../../node_modules/next/dist/bin/next`, which resolves to
+        // `/workspace/node_modules/...` and is plainly inside the artifact).
+        // Seeding with the workdir makes `pop()` mean what it should: stepping
+        // out of a real directory, and only failing when it steps above the
+        // artifact root. `validate_guest_workdir` then re-checks the result.
+        let mut absolute = PathBuf::from(guest_workdir);
         for component in path.components() {
             match component {
                 Component::CurDir => {}
-                Component::Normal(value) => {
-                    components += 1;
-                    relative.push(value);
+                Component::Normal(value) => absolute.push(value),
+                Component::ParentDir => {
+                    anyhow::ensure!(
+                        absolute.pop(),
+                        "{}",
+                        launch_refusal("the direct runtime entry escapes the validated artifact")
+                    );
                 }
-                _ => {
+                Component::RootDir | Component::Prefix(_) => {
                     return Err(launch_refusal(
-                        "the direct runtime entry contains path traversal",
+                        "the direct runtime entry is not artifact-relative",
                     ))
                 }
             }
         }
-        anyhow::ensure!(
-            components > 0,
-            "{}",
-            launch_refusal("the direct runtime entry is not artifact-relative")
-        );
-        Path::new(guest_workdir).join(relative)
+        absolute
     };
     let absolute = absolute.to_str().ok_or_else(|| {
         launch_refusal("the direct runtime entry is not valid UTF-8 after normalization")
@@ -3787,6 +3851,7 @@ fn append_litebox_runtime_augmentation_blocking(
     _deps: &[PathBuf],
     _identity: Option<&RuntimeArtifactIdentity>,
     _runtime_bin: Option<&Path>,
+    _extra_entries: &[(PathBuf, Vec<u8>)],
 ) -> anyhow::Result<()> {
     anyhow::bail!("descriptor-relative tar augmentation requires Linux openat2")
 }
@@ -3854,8 +3919,21 @@ const SHELL_GUEST_PROGRAMS: &[&str] = &[
 /// runner exit 101, measured 2026-09-02) instead of the silent ENOENT a
 /// missing directory gives. `HISTFILE` is cleared for the same reason.
 const SHELL_RC_GUEST_PATH: &str = "/usr/share/hive/shellrc";
+/// `litebox-shellrc.sh`: the stderr move above PLUS a no-fork "command not
+/// found" guard. Interactive bash forks BEFORE it looks a command up (so the
+/// error can be redirected), and under the litebox fork emulation that child
+/// dies `Fatal error: glibc detected an invalid stdio handle`, after which the
+/// session prints nothing (witnessed 2026-09-22 with `ifconfig` in a dashboard
+/// sandbox terminal on fc-sanjose). The rc installs an `extdebug` DEBUG trap
+/// that checks the command word with `command -v` in the PARENT and answers
+/// `sh: <cmd>: command not found` there. Known limits, all deliberate: a
+/// skipped command leaves `$?` at 0 (`extdebug` semantics), commands whose
+/// first word is quoted/expanded (`"$x"`, `$EDITOR`) are not checked, and it
+/// does nothing for `sh -c` runs (no rc is read) or for any second EXTERNAL
+/// command that DOES exist (the separate fork bug in `litebox-fork-child-
+/// corruption`).
 #[cfg(target_os = "linux")]
-const SHELL_RC_BYTES: &[u8] = b"exec 2>&1\n";
+const SHELL_RC_BYTES: &[u8] = include_bytes!("litebox-shellrc.sh");
 
 const SHELL_GUEST_OPTIONAL_PROGRAMS: &[&str] = &[
     "/usr/bin/uname",

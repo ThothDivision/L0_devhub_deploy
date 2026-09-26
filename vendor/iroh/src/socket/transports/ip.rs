@@ -267,6 +267,13 @@ pub(super) struct IpNetworkChangeSender {
 }
 
 impl IpNetworkChangeSender {
+    /// Whether the last rebind left this socket unbound (see `netwatch`'s
+    /// `SocketState::rebind`: it drops the old socket FIRST, so a failed bind
+    /// leaves the transport closed until someone rebinds again).
+    pub(super) fn is_closed(&self) -> bool {
+        self.socket.is_closed()
+    }
+
     pub(super) fn rebind(&self) -> io::Result<()> {
         let old_addr = self.local_addr.get();
         self.socket.rebind()?;

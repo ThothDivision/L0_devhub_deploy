@@ -917,9 +917,8 @@ fn owner_candidates(cloud: &Arc<CloudState>, hosts: &[String]) -> Vec<String> {
         .filter(|n| *n != &cloud.node_name)
         .cloned()
         .collect();
-    if !cloud.is_control_plane_leader() {
-        let leader = cloud.control_plane_leader();
-        if leader != cloud.node_name && !out.contains(&leader) {
+    if let Some(leader) = cloud.leader_forward_target() {
+        if !out.contains(&leader) {
             out.push(leader);
         }
     }
@@ -946,7 +945,13 @@ async fn fetch_artifact_from_host(
             .header("x-hive-team", team)
             .timeout(std::time::Duration::from_secs(15));
         if crate::auth::enforced() {
-            if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+            if let Ok(tok) = crate::auth::issue(
+                "mesh-internal",
+                team,
+                "service",
+                false,
+                crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+            ) {
                 rb = rb.bearer_auth(tok);
             }
         }

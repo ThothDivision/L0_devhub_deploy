@@ -17,7 +17,7 @@ use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash as IrohHash, HashAndFormat};
 use iroh_docs::protocol::Docs;
 use iroh_gossip::net::Gossip;
-use iroh_mdns_address_lookup::MdnsAddressLookup;
+use iroh_mdns_address_lookup::{DiscoveryEvent as MdnsDiscoveryEvent, MdnsAddressLookup};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -27,7 +27,7 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, watch};
 use tracing::{debug, info, warn};
 // Main modules.
 pub mod blobs;
@@ -36,6 +36,161 @@ pub mod gossip;
 pub mod key_synchronizer;
 pub mod networking_metrics;
 pub mod ticket_exchange;
+
+const GUARDIAN_MDNS_SERVICE_NAME: &str = "hive-gdb-v1";
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PeerProvenance {
+    explicit: bool,
+    authenticated: bool,
+    mdns: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PeerRegistry {
+    peers: Arc<RwLock<HashMap<NodeId, PeerProvenance>>>,
+    generation: Arc<watch::Sender<u64>>,
+}
+
+impl Default for PeerRegistry {
+    fn default() -> Self {
+        let (generation, _) = watch::channel(0);
+        Self {
+            peers: Arc::new(RwLock::new(HashMap::new())),
+            generation: Arc::new(generation),
+        }
+    }
+}
+
+impl PeerRegistry {
+    fn from_explicit(peers: impl IntoIterator<Item = NodeId>) -> Self {
+        let peers = peers
+            .into_iter()
+            .map(|peer| {
+                (
+                    peer,
+                    PeerProvenance {
+                        explicit: true,
+                        ..PeerProvenance::default()
+                    },
+                )
+            })
+            .collect();
+        let (generation, _) = watch::channel(0);
+        Self {
+            peers: Arc::new(RwLock::new(peers)),
+            generation: Arc::new(generation),
+        }
+    }
+
+    fn changed(&self) {
+        self.generation.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
+    }
+
+    fn subscribe(&self) -> watch::Receiver<u64> {
+        self.generation.subscribe()
+    }
+
+    pub(crate) async fn admit_explicit(&self, peer: NodeId) {
+        let changed = {
+            let mut peers = self.peers.write().await;
+            let provenance = peers.entry(peer).or_default();
+            let changed = !provenance.explicit;
+            provenance.explicit = true;
+            changed
+        };
+        if changed {
+            self.changed();
+        }
+    }
+
+    pub(crate) async fn admit_mdns(&self, peer: NodeId) -> bool {
+        let (newly_admitted, changed) = {
+            let mut peers = self.peers.write().await;
+            let provenance = peers.entry(peer).or_default();
+            let newly_admitted =
+                !provenance.explicit && !provenance.authenticated && !provenance.mdns;
+            let changed = !provenance.mdns;
+            provenance.mdns = true;
+            (newly_admitted, changed)
+        };
+        if changed {
+            self.changed();
+        }
+        newly_admitted
+    }
+
+    pub(crate) async fn expire_mdns(&self, peer: NodeId) -> bool {
+        let was_mdns = {
+            let mut peers = self.peers.write().await;
+            let Some(provenance) = peers.get_mut(&peer) else {
+                return false;
+            };
+            let was_mdns = provenance.mdns;
+            provenance.mdns = false;
+            if !provenance.explicit && !provenance.authenticated {
+                peers.remove(&peer);
+            }
+            was_mdns
+        };
+        if was_mdns {
+            self.changed();
+        }
+        was_mdns
+    }
+
+    pub(crate) async fn mark_authenticated(&self, peer: NodeId) {
+        let changed = {
+            let mut peers = self.peers.write().await;
+            let provenance = peers.entry(peer).or_default();
+            let changed = !provenance.authenticated;
+            provenance.authenticated = true;
+            changed
+        };
+        if changed {
+            self.changed();
+        }
+    }
+
+    pub(crate) async fn is_admitted(&self, peer: NodeId) -> bool {
+        self.peers
+            .read()
+            .await
+            .get(&peer)
+            .is_some_and(|provenance| {
+                provenance.explicit || provenance.authenticated || provenance.mdns
+            })
+    }
+
+    async fn candidates(&self) -> Vec<NodeId> {
+        let mut peers: Vec<_> = self
+            .peers
+            .read()
+            .await
+            .iter()
+            .filter_map(|(peer, provenance)| {
+                (provenance.explicit || provenance.authenticated || provenance.mdns)
+                    .then_some(*peer)
+            })
+            .collect();
+        peers.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        peers
+    }
+
+    async fn clear(&self) {
+        let changed = {
+            let mut peers = self.peers.write().await;
+            let changed = !peers.is_empty();
+            peers.clear();
+            changed
+        };
+        if changed {
+            self.changed();
+        }
+    }
+}
 
 /// Ceiling on any single blob this process will materialise in memory.
 ///
@@ -982,6 +1137,27 @@ async fn run_guardian_gc_once(
     Ok(finish(report))
 }
 
+/// GuardianDB's own iroh endpoint's TLS crypto provider: aws-lc-rs with
+/// `X25519MLKEM768` (hybrid classical+ML-KEM-768) first in the key-exchange
+/// list, so it is the group offered in the initial ClientHello. Mirrors
+/// `hive_p2p::pq_hybrid_crypto_provider` (crates/hive-p2p/src/lib.rs)
+/// bit-for-bit — same reasoning (presets prefer plain ring whenever both
+/// `tls-ring`/`tls-aws-lc-rs` are compiled in, which they are workspace-wide;
+/// an explicit list rather than trusting `default_provider()`'s own ordering,
+/// which depends on rustls's `prefer-post-quantum` cargo feature happening to
+/// be feature-unified on). A peer that cannot speak `X25519MLKEM768` still
+/// completes a handshake via automatic classical fallback (X25519).
+fn guardian_pq_hybrid_crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![
+        rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+        rustls::crypto::aws_lc_rs::kx_group::X25519,
+        rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+        rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+    ];
+    std::sync::Arc::new(provider)
+}
+
 /// Build a self-hosted relay map from `HIVE_RELAY_URLS` (comma-separated relay
 /// URLs). Returns `None` when unset/empty, in which case the caller keeps
 /// n0's default relay behavior. Mirrors hive-p2p's identical
@@ -1223,8 +1399,12 @@ pub struct IrohBackend {
     key_synchronizer: Arc<crate::p2p::network::core::key_synchronizer::KeySynchronizer>,
     /// Registry of `DocTicket` providers per store address (secure automatic exchange).
     ticket_registry: crate::p2p::network::core::ticket_exchange::TicketRegistry,
-    /// Peers we have already connected to (candidates for requesting tickets).
-    known_peers: Arc<RwLock<std::collections::HashSet<NodeId>>>,
+    /// Coherent admission state for explicit, authenticated, and current-mDNS peers.
+    peer_registry: PeerRegistry,
+    /// Cooperative stop for the passive mDNS observer.
+    mdns_shutdown: tokio_util::sync::CancellationToken,
+    /// Retained so shutdown proves the observer has terminated.
+    mdns_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Serializes whole GC passes against pre-commit blob protection windows.
     gc_gate: Arc<RwLock<()>>,
     /// Health of Guardian's supervised blob collector.
@@ -1955,7 +2135,9 @@ impl IrohBackend {
                 crate::p2p::network::core::key_synchronizer::KeySynchronizer::new(config).await?,
             ),
             ticket_registry: crate::p2p::network::core::ticket_exchange::new_registry(),
-            known_peers: Arc::new(RwLock::new(std::collections::HashSet::new())),
+            peer_registry: PeerRegistry::from_explicit(config.known_peers.iter().copied()),
+            mdns_shutdown: tokio_util::sync::CancellationToken::new(),
+            mdns_task: Arc::new(Mutex::new(None)),
             gc_gate: Arc::new(RwLock::new(())),
             gc_health: Arc::new(RwLock::new(GcHealth::default())),
             gc_shutdown: tokio_util::sync::CancellationToken::new(),
@@ -2085,8 +2267,18 @@ impl IrohBackend {
         // `bind_full()` (crates/hive-p2p/src/lib.rs) — n0's DNS + Pkarr discovery stays active
         // (unaffected by `.relay_mode()`), so peer address resolution is unchanged; only the
         // relayed-data-path / hole-punch-assist fallback moves onto hive's own mesh relays.
-        let mut endpoint_builder =
-            Endpoint::builder(iroh::endpoint::presets::N0).secret_key(self.secret_key.clone());
+        let mut endpoint_builder = Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(self.secret_key.clone())
+            // Explicit provider override, same reasoning and same construction
+            // as `hive_p2p::pq_hybrid_crypto_provider` (crates/hive-p2p/src/
+            // lib.rs) -- the `N0` preset above already picked plain `ring`
+            // (classical-only key exchange) the moment it ran, because both
+            // `tls-ring` and `tls-aws-lc-rs` are compiled in workspace-wide;
+            // this call is the only thing that actually selects aws-lc-rs
+            // with `X25519MLKEM768` offered first. Kept as a duplicated few
+            // lines rather than a cross-crate call: guardian-db is vendored
+            // and does not otherwise depend on hive-p2p.
+            .crypto_provider(guardian_pq_hybrid_crypto_provider());
         let raw_relay_env = std::env::var("HIVE_RELAY_URLS").ok();
         tracing::info!(raw_relay_env = ?raw_relay_env, "guardian init: about to bind endpoint");
         if let Some(map) = hive_relay_map_from_env() {
@@ -2097,22 +2289,82 @@ impl IrohBackend {
                 "guardian: using self-hosted iroh relays (HIVE_RELAY_URLS)"
             );
         }
+
+        let mut mdns_observer = None;
+        if self.config.enable_discovery_mdns {
+            let auth = self.config.mdns_discovery_auth.clone().ok_or_else(|| {
+                GuardianError::Other(
+                    "mDNS discovery enabled without an authentication credential".to_string(),
+                )
+            })?;
+            let user_data = auth
+                .user_data(self.secret_key.public())
+                .map_err(GuardianError::Other)?;
+            let discovery_auth = auth.clone();
+            let mdns = MdnsAddressLookup::builder()
+                .service_name(GUARDIAN_MDNS_SERVICE_NAME)
+                .user_data(user_data)
+                .discovery_filter(move |peer, user_data| {
+                    user_data.is_some_and(|user_data| discovery_auth.authenticates(peer, user_data))
+                })
+                .max_peers(self.config.network.max_peers_per_session)
+                .build(self.secret_key.public())
+                .map_err(|error| {
+                    GuardianError::Other(format!("Could not start local mDNS discovery: {error}"))
+                })?;
+            let events = mdns.subscribe().await;
+            endpoint_builder = endpoint_builder.address_lookup(mdns);
+            mdns_observer = Some((events, auth));
+        }
+
         let endpoint = endpoint_builder
             .bind()
             .await
             .map_err(|e| GuardianError::Other(format!("Error initializing Endpoint: {}", e)))?;
         tracing::info!("guardian init: endpoint bind() returned");
 
-        // mDNS discovery on the local network (LAN), equivalent to the former discovery_local_network().
-        match MdnsAddressLookup::builder().build(endpoint.id()) {
-            Ok(mdns) => match endpoint.address_lookup() {
-                Ok(services) => {
-                    services.add(mdns);
-                    debug!("Local mDNS discovery (LAN) enabled");
+        if let Some((mut events, auth)) = mdns_observer {
+            let peer_registry = self.peer_registry.clone();
+            let mdns_shutdown = self.mdns_shutdown.clone();
+            let task = tokio::spawn(async move {
+                use futures::StreamExt;
+
+                loop {
+                    tokio::select! {
+                        _ = mdns_shutdown.cancelled() => break,
+                        event = events.next() => {
+                            let Some(event) = event else { break };
+                            match event {
+                                MdnsDiscoveryEvent::Discovered { endpoint_info, .. } => {
+                                    let peer = endpoint_info.endpoint_id;
+                                    let valid = endpoint_info
+                                        .data
+                                        .user_data()
+                                        .is_some_and(|user_data| auth.authenticates(peer, user_data));
+                                    if valid {
+                                        if peer_registry.admit_mdns(peer).await {
+                                            info!(peer = %peer.fmt_short(), "Peer authenticated via mDNS");
+                                        }
+                                    } else {
+                                        if peer_registry.expire_mdns(peer).await {
+                                            info!(peer = %peer.fmt_short(), "Peer mDNS admission revoked");
+                                        }
+                                        debug!(peer = %peer.fmt_short(), "Ignoring unauthenticated mDNS peer");
+                                    }
+                                }
+                                MdnsDiscoveryEvent::Expired { endpoint_id } => {
+                                    if peer_registry.expire_mdns(endpoint_id).await {
+                                        debug!(peer = %endpoint_id.fmt_short(), "Authenticated mDNS peer expired");
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                 }
-                Err(e) => warn!("Address lookup unavailable for mDNS: {}", e),
-            },
-            Err(e) => warn!("Could not start local mDNS discovery: {}", e),
+            });
+            *self.mdns_task.lock().await = Some(task);
+            debug!("Authenticated local mDNS discovery enabled");
         }
 
         // Store the endpoint.
@@ -2215,9 +2467,12 @@ impl IrohBackend {
         }
 
         // Configure the Router with Gossip, Blobs, Docs and the ticket exchange protocol.
-        let ticket_handler = crate::p2p::network::core::ticket_exchange::TicketProtocolHandler::new(
-            self.ticket_registry.clone(),
-        );
+        let ticket_handler =
+            crate::p2p::network::core::ticket_exchange::TicketProtocolHandler::with_admission(
+                self.ticket_registry.clone(),
+                self.peer_registry.clone(),
+                self.config.network.connection_timeout,
+            );
         let accepting_work = self.accepting_work.clone();
         let incoming_filter: iroh::protocol::IncomingFilter = Arc::new(move |_| {
             if accepting_work.load(Ordering::Acquire) {
@@ -2288,11 +2543,14 @@ impl IrohBackend {
 
         let mut errors = Vec::new();
 
+        // Signal every supervised actor before awaiting either one.
+        self.gc_shutdown.cancel();
+        self.mdns_shutdown.cancel();
+
         // Cooperative cancellation is observed by the worker, which aborts and
         // retains its active pass until join. Await by mutable reference while the
         // handle remains in `gc_task`: if this shutdown future is cancelled, a
         // later shutdown resumes supervision instead of detaching the task.
-        self.gc_shutdown.cancel();
         {
             let mut gc_task = self.gc_task.lock().await;
             if let Some(task) = gc_task.as_mut() {
@@ -2318,6 +2576,28 @@ impl IrohBackend {
             }
             gc_task.take();
         }
+
+        {
+            let mut mdns_task = self.mdns_task.lock().await;
+            if let Some(task) = mdns_task.as_mut() {
+                match tokio::time::timeout(self.config.network.connection_timeout, &mut *task).await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(join_error)) => errors.push(format!(
+                        "Guardian mDNS observer terminated with failure: {join_error}"
+                    )),
+                    Err(_) => {
+                        task.abort();
+                        let _ = (&mut *task).await;
+                        errors.push(
+                            "Guardian mDNS observer exceeded its shutdown deadline".to_string(),
+                        );
+                    }
+                }
+            }
+            mdns_task.take();
+        }
+        self.peer_registry.clear().await;
 
         // Router::shutdown stops the accept loop, awaits every protocol handler
         // (including Docs), and closes the Endpoint. Guardian's Docs wrapper then
@@ -2527,115 +2807,140 @@ impl IrohBackend {
         self.ticket_registry.write().await.insert(address, provider);
     }
 
-    /// Registers a peer we have connected to (a candidate for requesting tickets).
-    pub async fn note_known_peer(&self, peer: NodeId) {
-        self.known_peers.write().await.insert(peer);
+    async fn candidate_peers(&self) -> Vec<NodeId> {
+        let self_id = self.secret_key.public();
+        let mut peers = self.peer_registry.candidates().await;
+        peers.retain(|peer| *peer != self_id);
+        peers.truncate(self.config.network.max_peers_per_session);
+        peers
     }
 
-    /// Requests the `DocTicket` for `address` from each known peer, returning the first granted one.
-    ///
-    /// Used by iroh-docs stores when opening without a ticket: it tries to join the shared
-    /// namespace of a peer that already holds it (and authorizes this node), instead of creating
-    /// an isolated namespace.
-    pub async fn request_ticket_from_known_peers(&self, address: &str) -> Option<String> {
-        let peers: Vec<NodeId> = {
-            let kp = self.known_peers.read().await;
-            kp.iter().copied().collect()
-        };
+    async fn stable_candidate_peers(&self, quiet: Duration) -> Vec<NodeId> {
+        let mut changes = self.peer_registry.subscribe();
+        loop {
+            let generation = *changes.borrow_and_update();
+            if tokio::time::timeout(quiet, changes.changed()).await.is_ok() {
+                continue;
+            }
+            let peers = self.candidate_peers().await;
+            if *changes.borrow() == generation {
+                return peers;
+            }
+        }
+    }
+
+    pub async fn note_explicit_peer(&self, peer: NodeId) {
+        self.peer_registry.admit_explicit(peer).await;
+    }
+
+    async fn request_ticket_from_peers(
+        &self,
+        address: &str,
+        peers: &[NodeId],
+        timeout: Duration,
+    ) -> Option<String> {
+        use futures::{StreamExt, stream};
+
+        const MAX_PARALLEL_TICKET_REQUESTS: usize = 8;
+
         if peers.is_empty() {
             return None;
         }
-
         let endpoint_arc = self.get_endpoint().await.ok()?;
-        let endpoint_lock = endpoint_arc.read().await;
-        let endpoint = endpoint_lock.as_ref()?.clone();
-        drop(endpoint_lock);
+        let endpoint = endpoint_arc.read().await.as_ref()?.clone();
+        let mut attempts = stream::iter(peers.iter().copied().map(|peer| {
+            let endpoint = endpoint.clone();
+            let address = address.to_string();
+            async move {
+                let result = crate::p2p::network::core::ticket_exchange::request_ticket(
+                    &endpoint, peer, &address, timeout,
+                )
+                .await;
+                (peer, result)
+            }
+        }))
+        .buffer_unordered(MAX_PARALLEL_TICKET_REQUESTS);
 
-        for peer in peers {
-            match crate::p2p::network::core::ticket_exchange::request_ticket(
-                &endpoint, peer, address,
-            )
-            .await
-            {
+        while let Some((peer, result)) = attempts.next().await {
+            match result {
                 Ok(Some(ticket)) => {
-                    info!(peer = %peer.fmt_short(), address, "DocTicket obtained from peer via automatic exchange");
+                    if ticket.parse::<iroh_docs::DocTicket>().is_err() {
+                        warn!(peer = %peer.fmt_short(), address, "Peer returned an invalid DocTicket");
+                        continue;
+                    }
+                    self.peer_registry.mark_authenticated(peer).await;
+                    info!(peer = %peer.fmt_short(), address, "DocTicket obtained from admitted peer");
                     return Some(ticket);
                 }
                 Ok(None) => {
-                    debug!(peer = %peer.fmt_short(), address, "Peer did not provide a ticket (denied/unavailable)");
+                    debug!(peer = %peer.fmt_short(), address, "Peer denied or lacked the requested ticket");
                 }
-                Err(e) => {
-                    debug!(peer = %peer.fmt_short(), address, error = %e, "Failed to request ticket from peer");
+                Err(error) => {
+                    debug!(peer = %peer.fmt_short(), address, %error, "Ticket request failed");
                 }
             }
         }
         None
     }
 
-    /// Resolves a store's shared namespace deterministically, avoiding split-brain
-    /// when multiple nodes open the same store simultaneously.
-    ///
-    /// Rule: the node with the **smallest `EndpointId`** among {self, known peers} is the namespace
-    /// "creator"; the others wait and import its ticket.
-    ///
-    /// - Tries to obtain the ticket immediately (common case: a peer already created and registered it).
-    /// - If no peer provided one and a peer with a smaller id exists (which should be the creator),
-    ///   it makes a few short retries to give it time to create/register.
-    /// - If this node has the smallest id (or no one responded after the retries), returns `None`
-    ///   and the caller creates a new namespace (taking the creator role).
-    pub async fn resolve_shared_ticket(&self, store_key: &str) -> Option<String> {
-        let known_peer_count = self.known_peers.read().await.len();
-        debug!(
-            store_key,
-            known_peer_count, "resolve_shared_ticket: immediate attempt"
+    pub async fn request_ticket_from_known_peers(&self, address: &str) -> Option<String> {
+        let peers = self.candidate_peers().await;
+        self.request_ticket_from_peers(address, &peers, self.config.network.connection_timeout)
+            .await
+    }
+
+    pub async fn resolve_shared_ticket(&self, store_key: &str) -> Result<Option<String>> {
+        let election_timeout = self.config.network.connection_timeout;
+        let settle_quiet = std::cmp::max(election_timeout / 3, Duration::from_millis(500));
+        let attempt_timeout = std::cmp::min(
+            Duration::from_secs(2),
+            std::cmp::max(election_timeout / 6, Duration::from_millis(250)),
         );
-        // Immediate attempt.
-        if let Some(ticket) = self.request_ticket_from_known_peers(store_key).await {
+        let resolve = async {
+            let candidate_peers = if self.config.enable_discovery_mdns {
+                self.stable_candidate_peers(settle_quiet).await
+            } else {
+                self.candidate_peers().await
+            };
+            let known_peer_count = candidate_peers.len();
             debug!(
                 store_key,
-                "resolve_shared_ticket: got ticket on immediate attempt"
+                known_peer_count, "resolve_shared_ticket: stable candidate snapshot"
             );
-            return Some(ticket);
-        }
+            if let Some(ticket) = self
+                .request_ticket_from_peers(store_key, &candidate_peers, attempt_timeout)
+                .await
+            {
+                return Ok(Some(ticket));
+            }
 
-        // Is there any known peer with a smaller EndpointId than ours?
-        let my_id = self.secret_key().public();
-        let lower_peer_exists = {
-            let kp = self.known_peers.read().await;
-            kp.iter().any(|p| p.as_bytes() < my_id.as_bytes())
+            let my_id = self.secret_key().public();
+            let lower_peer_exists = candidate_peers
+                .iter()
+                .any(|peer| peer.as_bytes() < my_id.as_bytes());
+            if !lower_peer_exists {
+                debug!(store_key, %my_id, "resolve_shared_ticket: elected creator");
+                return Ok(None);
+            }
+
+            debug!(store_key, %my_id, "resolve_shared_ticket: waiting for elected creator");
+            loop {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if let Some(ticket) = self
+                    .request_ticket_from_peers(store_key, &candidate_peers, attempt_timeout)
+                    .await
+                {
+                    return Ok(Some(ticket));
+                }
+            }
         };
 
-        if !lower_peer_exists {
-            // We are the node with the smallest id (or have no peers): we take the creator role.
-            debug!(store_key, %my_id, "resolve_shared_ticket: no lower peer -> taking creator role");
-            return None;
+        match tokio::time::timeout(election_timeout, resolve).await {
+            Ok(result) => result,
+            Err(_) => Err(GuardianError::Other(format!(
+                "Shared-ticket election for '{store_key}' timed out; refusing local namespace creation"
+            ))),
         }
-        debug!(store_key, %my_id, "resolve_shared_ticket: lower peer exists -> retrying for ticket");
-
-        // There is a peer that should be the creator — give it time to create/register and try again.
-        const MAX_RETRIES: u32 = 10;
-        const RETRY_DELAY: Duration = Duration::from_millis(300);
-        for attempt in 1..=MAX_RETRIES {
-            tokio::time::sleep(RETRY_DELAY).await;
-            if let Some(ticket) = self.request_ticket_from_known_peers(store_key).await {
-                debug!(
-                    store_key,
-                    attempt, "DocTicket obtained from the creator after a retry"
-                );
-                return Some(ticket);
-            }
-        }
-        debug!(
-            store_key,
-            "resolve_shared_ticket: exhausted all retries, falling back to local cache/create"
-        );
-
-        // Fallback: the creator did not respond in time; we take the namespace to avoid blocking.
-        warn!(
-            store_key,
-            "Expected creator did not provide the ticket in time; creating a local namespace (possible split-brain)"
-        );
-        None
     }
 
     /// Returns a reference to the Gossip if available.
@@ -3069,72 +3374,86 @@ impl IrohBackend {
         }
     }
 
-    /// Pull a blob this node is missing from the peers it is currently connected
-    /// to, using iroh-blobs' verified downloader.
-    ///
-    /// Providers come from the durable process-local known-peer roster rather
-    /// than only currently-open connections: downloader discovery can establish
-    /// a fresh path to a peer whose prior connection is no longer pooled. Since
-    /// iroh-blobs verifies the BLAKE3 tree on arrival, broadening candidates does
-    /// not let a peer substitute different content.
-    ///
-    /// Best-effort by design. An error here means "still missing", which the
-    /// caller surfaces exactly as it did before this path existed.
+    /// Pull a missing blob from admitted peers under one deadline per peer.
     async fn fetch_blob_from_peers(&self, hash: IrohHash) -> Result<()> {
         use futures::StreamExt;
 
         let endpoint_arc = self.get_endpoint().await?;
-        let endpoint = {
-            let endpoint_lock = endpoint_arc.read().await;
-            endpoint_lock.as_ref().cloned().ok_or_else(|| {
-                GuardianError::Other("Endpoint not available for P2P blob fetch".to_string())
-            })?
-        };
-
-        let providers: Vec<NodeId> = {
-            let peers = self.known_peers.read().await;
-            peers.iter().copied().collect()
-        };
+        let endpoint = endpoint_arc.read().await.as_ref().cloned().ok_or_else(|| {
+            GuardianError::Other("Endpoint not available for P2P blob fetch".to_string())
+        })?;
+        let providers = self.candidate_peers().await;
         if providers.is_empty() {
             return Err(GuardianError::Other(
-                "no known peers to fetch missing blob from".to_string(),
+                "no admitted peers to fetch missing blob from".to_string(),
             ));
         }
-
-        let store = {
-            let store_guard = self.store.read().await;
-            match store_guard.as_ref() {
-                Some(StoreType::Fs(store)) => store.clone(),
-                None => {
-                    return Err(GuardianError::Other(
-                        "Iroh store not initialized".to_string(),
-                    ));
-                }
+        let store = match self.store.read().await.as_ref() {
+            Some(StoreType::Fs(store)) => store.clone(),
+            None => {
+                return Err(GuardianError::Other(
+                    "Iroh store not initialized".to_string(),
+                ));
             }
         };
+        let timeout = self.config.network.connection_timeout;
+        let mut failures = Vec::new();
 
-        let downloader = store.downloader(&endpoint);
-        let mut stream = downloader
-            .download(hash, providers)
-            .stream()
-            .await
-            .map_err(|e| GuardianError::Other(format!("P2P blob fetch failed to start: {e}")))?;
-        while let Some(item) = stream.next().await {
-            match &item {
-                iroh_blobs::api::downloader::DownloadProgressItem::Error(e) => {
-                    return Err(GuardianError::Other(format!("P2P blob fetch error: {e}")));
+        for provider in providers {
+            let attempt = async {
+                let downloader = store.downloader(&endpoint);
+                let mut stream = downloader
+                    .download(hash, vec![provider])
+                    .stream()
+                    .await
+                    .map_err(|error| {
+                        GuardianError::Other(format!("download failed to start: {error}"))
+                    })?;
+                while let Some(item) = stream.next().await {
+                    match item {
+                        iroh_blobs::api::downloader::DownloadProgressItem::Error(error) => {
+                            return Err(GuardianError::Other(format!("download failed: {error}")));
+                        }
+                        iroh_blobs::api::downloader::DownloadProgressItem::DownloadError => {
+                            return Err(GuardianError::Other("download failed".to_string()));
+                        }
+                        _ => {}
+                    }
                 }
-                iroh_blobs::api::downloader::DownloadProgressItem::DownloadError => {
-                    return Err(GuardianError::Other("P2P blob fetch failed".to_string()));
+                if !store
+                    .blobs()
+                    .has(hash)
+                    .await
+                    .map_err(IrohBackend::map_iroh_error)?
+                {
+                    return Err(GuardianError::Other(
+                        "download completed without storing the blob".to_string(),
+                    ));
                 }
-                _ => {}
+                Ok(())
+            };
+
+            match tokio::time::timeout(timeout, attempt).await {
+                Ok(Ok(())) => {
+                    self.peer_registry.mark_authenticated(provider).await;
+                    info!(peer = %provider.fmt_short(), hash = %hash.to_hex(), "Recovered missing blob from admitted peer");
+                    return Ok(());
+                }
+                Ok(Err(error)) => {
+                    debug!(peer = %provider.fmt_short(), %error, "P2P blob provider failed");
+                    failures.push(format!("{}: {error}", provider.fmt_short()));
+                }
+                Err(_) => {
+                    debug!(peer = %provider.fmt_short(), "P2P blob provider timed out");
+                    failures.push(format!("{}: timed out", provider.fmt_short()));
+                }
             }
         }
-        info!(
-            "recovered missing blob {} from a connected peer",
-            hash.to_hex()
-        );
-        Ok(())
+
+        Err(GuardianError::Other(format!(
+            "P2P blob fetch failed from every admitted peer: {}",
+            failures.join("; ")
+        )))
     }
 
     pub async fn cat(&self, hash_str: &str) -> Result<Pin<Box<dyn AsyncRead + Send>>> {
@@ -4228,22 +4547,17 @@ impl IrohBackend {
         Some((pick(0.95), pick(0.99)))
     }
 
-    /// Peers we have learned about (via connection/ticket exchange) that are **not**
-    /// currently in the active connection pool (C3, honest version).
-    ///
-    /// Note: iroh 1.0 exposes no passive enumeration of *discovery-only* peers, so
-    /// this is the set of previously-known peers minus the live connections — an
-    /// observed view, not the full discovery table.
+    /// Configured, previously-connected, or currently mDNS-discovered peers that
+    /// are not in the active connection pool.
     pub async fn discovered_not_connected(&self) -> Vec<NodeId> {
         let connected: std::collections::HashSet<NodeId> = {
             let pool = self.connection_pool.read().await;
             pool.keys().copied().collect()
         };
-        let known = self.known_peers.read().await;
-        known
-            .iter()
-            .filter(|p| !connected.contains(*p))
-            .copied()
+        self.candidate_peers()
+            .await
+            .into_iter()
+            .filter(|peer| !connected.contains(peer))
             .collect()
     }
 

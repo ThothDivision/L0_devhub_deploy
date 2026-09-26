@@ -260,10 +260,7 @@ async fn read_target(c: &Arc<CloudState>, project: &str, sandbox_id: &str) -> Op
     if let Some(owner) = remote_owner(c, project, sandbox_id).await {
         return Some(owner);
     }
-    if c.is_control_plane_leader() {
-        return None;
-    }
-    Some(c.control_plane_leader())
+    c.leader_forward_target()
 }
 
 /// Cross-node fallback for sandbox READS (the `fetch_from_host` precedent):
@@ -423,8 +420,7 @@ async fn internal_hop_inner(
     let sep = if path.contains('?') { '&' } else { '?' };
     let p = format!("{path}{sep}{}", crate::admin::mesh_team_qs(team));
     let body_bytes = serde_json::to_vec(body).unwrap_or_default();
-    match crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &p, &body_bytes, 20)
-        .await
+    match crate::gossip::request_to(c, &id, &addr, hive_p2p::GOSSIP_POST, &p, &body_bytes, 20).await
     {
         None => Hop::Unreachable(format!("mesh request to {node} failed or timed out")),
         Some(b) if b.is_empty() => Hop::Unreachable(format!(
@@ -511,12 +507,16 @@ pub(crate) async fn list_sandboxes(
         .list_sandboxes(&project)
         .await
         .map_err(sandbox_err)?;
-    if local.is_empty() && !c.is_control_plane_leader() {
+    if let (true, Some(leader)) = (local.is_empty(), c.leader_forward_target()) {
         // The leader adopts a copy of every record (delegated or not), so it
         // is the one node whose list is complete.
-        let leader = c.control_plane_leader();
-        if let Some(v) =
-            proxy_read(&c, &leader, &format!("/v1/projects/{project}/sandboxes"), &t).await
+        if let Some(v) = proxy_read(
+            &c,
+            &leader,
+            &format!("/v1/projects/{project}/sandboxes"),
+            &t,
+        )
+        .await
         {
             return Ok(Json(v));
         }
@@ -691,8 +691,7 @@ async fn create_sandbox(
     // The leader holds an adopted copy of every record of this project, so
     // the name-uniqueness check is authoritative HERE, not only on whichever
     // owner ends up provisioning.
-    if c
-        .sandboxes
+    if c.sandboxes
         .list_sandboxes(&project)
         .await
         .map_err(sandbox_err)?
@@ -743,7 +742,9 @@ async fn create_sandbox(
     for peer in &candidates {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            tried.push(format!("{peer}: not tried (total delegation budget exhausted)"));
+            tried.push(format!(
+                "{peer}: not tried (total delegation budget exhausted)"
+            ));
             continue;
         }
         let budget = per_peer.min(remaining);
@@ -1042,8 +1043,14 @@ async fn delete_sandbox(
         // The owner tore the cell down and tombstoned its record; drop the
         // metadata copy here so the name is free and quotas are right.
         c.sandboxes.forget_record(&project, &sandbox_id);
-        c.audit
-            .record(&t, "user", "delete", "sandbox", &sandbox_id, &format!("owner: {owner}"));
+        c.audit.record(
+            &t,
+            "user",
+            "delete",
+            "sandbox",
+            &sandbox_id,
+            &format!("owner: {owner}"),
+        );
         crate::persist::persist(&c);
         return Ok(Json(v));
     }
@@ -1076,8 +1083,14 @@ async fn stop_sandbox(
         let v = forward_owner_op(&c, &owner, &t, &req, owner_op_budget()).await?;
         let rec: SandboxRecord = owner_reply_field(&v, "sandbox", &owner)?;
         c.sandboxes.adopt_record(rec.clone());
-        c.audit
-            .record(&t, "user", "stop", "sandbox", &sandbox_id, &format!("owner: {owner}"));
+        c.audit.record(
+            &t,
+            "user",
+            "stop",
+            "sandbox",
+            &sandbox_id,
+            &format!("owner: {owner}"),
+        );
         crate::persist::persist(&c);
         return Ok(Json(json!(masked_sandbox(rec))));
     }
@@ -1259,8 +1272,7 @@ pub(crate) async fn get_command_logs(
     Path((project, sandbox_id, command_id)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let t = require(&c, &headers, &claims, &project)?;
-    let path =
-        format!("/v1/projects/{project}/sandboxes/{sandbox_id}/commands/{command_id}/logs");
+    let path = format!("/v1/projects/{project}/sandboxes/{sandbox_id}/commands/{command_id}/logs");
     if let Some(owner) = remote_owner(&c, &project, &sandbox_id).await {
         if let Some(v) = proxy_read(&c, &owner, &path, &t).await {
             return Ok(Json(v));
@@ -1440,9 +1452,18 @@ async fn open_shell(
     };
 
     // Owner resolution: the record's `owner_node` first; an empty field is a
-    // pre-field record, which the leader-placement rule owned.
+    // pre-field record, which the leader-placement rule owned. With no
+    // resolvable leader such a record cannot be placed: a retryable 503.
     let owner = if rec.owner_node.is_empty() {
-        c.control_plane_leader()
+        let Some(leader) = c.control_plane_leader() else {
+            tracing::info!(project = %project, sandbox = %sandbox_id, tenant = %t, "sandbox shell upgrade refused: legacy record owned by the leader, and no leader is resolvable from this node");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no control-plane leader is resolvable from this node right now — retry shortly"
+                    .into(),
+            ));
+        };
+        leader
     } else {
         rec.owner_node.clone()
     };
@@ -1491,7 +1512,8 @@ async fn open_shell(
         return Ok(ws.on_upgrade(move |socket| crate::mesh_shell::bridge_client_side(socket, raw)));
     }
 
-    c.audit.record(&t, "user", "open_shell", "sandbox", &sandbox_id, "");
+    c.audit
+        .record(&t, "user", "open_shell", "sandbox", &sandbox_id, "");
 
     let (rx, pty) = c
         .sandboxes

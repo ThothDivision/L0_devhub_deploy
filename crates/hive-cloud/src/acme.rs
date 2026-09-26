@@ -1193,12 +1193,17 @@ fn install_and_record_custom_bundle(
 /// both duplicate-issues against LE's 5/168h duplicate-cert budget (every
 /// node has its own "no local cache" view) and drops its tokens into a
 /// follower store the next store_sync pull wipes mid-order (adversarial
-/// findings). Safe to call from anywhere: it simply no-ops off the leader.
+/// findings). Safe to call from anywhere: it simply no-ops unless
+/// `leadership::may_act(AcmeHttp01)` — the shared single-writer gate, with a
+/// designation that is exactly the `acme_http01` store's writer (the node
+/// followers pull that store from and the port-80 miss proxy targets), so a
+/// chain-less mesh's `HIVE_DNS_LEADER_NODE` pin can never put the tokens on a
+/// node whose store the next pull wipes.
 pub async fn custom_cert_pass(cloud: &Arc<CloudState>) {
     if cloud.ingress == "ngrok" {
         return;
     }
-    if cloud.control_plane_leader() != cloud.node_name || cloud.mesh_health().isolated {
+    if !crate::leadership::may_act(cloud, crate::leadership::Job::AcmeHttp01) {
         return;
     }
     // Per-domain failure streak + backoff (the crash-loop rule from AGENTS.md:
@@ -1390,9 +1395,8 @@ pub fn spawn_custom_cert_loop(cloud: Arc<CloudState>) {
     }
     tokio::spawn(async move {
         loop {
-            if cloud.control_plane_leader() == cloud.node_name && !cloud.mesh_health().isolated {
-                custom_cert_pass(&cloud).await;
-            }
+            // Gated inside the pass (`leadership::may_act(AcmeHttp01)`).
+            custom_cert_pass(&cloud).await;
             tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
         }
     });
@@ -1446,99 +1450,91 @@ pub fn spawn_acme(cloud: Arc<CloudState>) {
             // Jittered interval: 5–7h.
             let jitter = (hive_core::now_ms() % 7200) as u64;
             let sleep = 5 * 3600 + jitter;
-            // Same single-writer resolution as admin mutations and the billing
-            // meter (owner chain first, health+addressability gated; identity
-            // election fallback) — all four roles sit on ONE designation so the
-            // HIVE_CP_LEADER-vs-HIVE_DNS_LEADER_NODE drift class is structurally
-            // closed (proposal step 6). `HIVE_DNS_LEADER_NODE` remains honored
-            // as a deliberate LEGACY split-pin: when set it takes the pref slot
-            // on the fallback path (health-gated, never a raw unguarded check —
-            // an unguarded pin freezes ACME silently until certs expire).
-            let dns_pref = std::env::var("HIVE_DNS_LEADER_NODE")
-                .ok()
-                .filter(|s| !s.trim().is_empty());
-            let chain = crate::cluster::Cluster::owner_chain_from_env();
-            let pref = dns_pref.or_else(|| std::env::var("HIVE_CP_LEADER").ok());
-            let leader = crate::cluster::Cluster::control_plane_owner(
-                &chain,
-                pref.as_deref(),
-                &cloud.registry.nodes(),
-            );
-            if leader.as_deref() == Some(cloud.node_name.as_str()) {
-                for (bundle, names, zone) in bundles(&cloud) {
-                    // One-shot force: a sentinel file `$HIVE_DATA/acme-force-<bundle>`
-                    // makes this pass re-issue the bundle regardless of freshness, then
-                    // is deleted after a successful issue. This is the ONLY reliable way
-                    // to re-issue after a SAN change (e.g. adding admin.) — clearing the
-                    // local/guardian cache doesn't work because cert-sync pulls the old
-                    // bundle back from a peer via mesh_fetch. `touch` it on the leader,
-                    // restart, and the new SANs land in one pass.
-                    let force_path =
-                        crate::persist::data_dir().join(format!("acme-force-{bundle}"));
-                    let forced = std::fs::metadata(&force_path).is_ok();
-                    // Fresh = young enough AND covering every wanted name. The
-                    // coverage check is what makes a SAN ADDITION (a new region's
-                    // `api-<region>` host, a new explicit platform host) reissue
-                    // automatically — before it, the only path was the manual
-                    // force sentinel, and a forgotten sentinel meant a name that
-                    // resolved in DNS but failed TLS until the 60-day renewal.
-                    let fresh = !forced
-                        && load_bundle_local(&bundle)
-                            .map(|b| {
-                                hive_core::now_ms() < b.issued_ms + RENEW_AFTER_MS
-                                    && names.iter().all(|n| b.names.contains(n))
-                            })
-                            .unwrap_or(false);
-                    if fresh {
-                        continue;
+            // The shared leader-only job gate (`leadership::may_act`): the
+            // strict chain owner with tenure, isolation and voter quorum —
+            // the same designation as the DNS writer, billing and every other
+            // single-writer job, so two nodes can never both order the same
+            // bundle against LE's 5-per-168h duplicate window. The
+            // `HIVE_DNS_LEADER_NODE` pin survives only on a chain-less mesh.
+            // Off the gate this loop re-asks every minute instead of sleeping
+            // the 5-7h renewal interval: a node that becomes the writer (or
+            // finishes its boot tenure) must not wait hours to renew.
+            if !crate::leadership::may_act(&cloud, crate::leadership::Job::Acme) {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                continue;
+            }
+            for (bundle, names, zone) in bundles(&cloud) {
+                // One-shot force: a sentinel file `$HIVE_DATA/acme-force-<bundle>`
+                // makes this pass re-issue the bundle regardless of freshness, then
+                // is deleted after a successful issue. This is the ONLY reliable way
+                // to re-issue after a SAN change (e.g. adding admin.) — clearing the
+                // local/guardian cache doesn't work because cert-sync pulls the old
+                // bundle back from a peer via mesh_fetch. `touch` it on the leader,
+                // restart, and the new SANs land in one pass.
+                let force_path = crate::persist::data_dir().join(format!("acme-force-{bundle}"));
+                let forced = std::fs::metadata(&force_path).is_ok();
+                // Fresh = young enough AND covering every wanted name. The
+                // coverage check is what makes a SAN ADDITION (a new region's
+                // `api-<region>` host, a new explicit platform host) reissue
+                // automatically — before it, the only path was the manual
+                // force sentinel, and a forgotten sentinel meant a name that
+                // resolved in DNS but failed TLS until the 60-day renewal.
+                let fresh = !forced
+                    && load_bundle_local(&bundle)
+                        .map(|b| {
+                            hive_core::now_ms() < b.issued_ms + RENEW_AFTER_MS
+                                && names.iter().all(|n| b.names.contains(n))
+                        })
+                        .unwrap_or(false);
+                if fresh {
+                    continue;
+                }
+                tracing::info!(%bundle, ?names, forced, "ACME: issuing/renewing certificate bundle");
+                match issue(
+                    &cloud.http,
+                    &api,
+                    &names,
+                    &zone,
+                    &cloud.acme_challenges,
+                    Some(&cloud.incidents),
+                )
+                .await
+                {
+                    Ok(b) => {
+                        store_bundle_local(&bundle, &b);
+                        if forced {
+                            let _ = std::fs::remove_file(&force_path); // one-shot
+                        }
+                        if let Ok(js) = serde_json::to_vec(&b) {
+                            crate::guardian::put(&guardian_key(&bundle), js).await;
+                        }
+                        if let Err(e) = install_bundle(&b) {
+                            tracing::warn!(error = %e, %bundle, "issued but failed to install locally");
+                        } else {
+                            tracing::info!(%bundle, zones = ?installed_zones(), "certificate installed + replicated");
+                        }
                     }
-                    tracing::info!(%bundle, ?names, forced, "ACME: issuing/renewing certificate bundle");
-                    match issue(
-                        &cloud.http,
-                        &api,
-                        &names,
-                        &zone,
-                        &cloud.acme_challenges,
-                        Some(&cloud.incidents),
-                    )
-                    .await
-                    {
-                        Ok(b) => {
-                            store_bundle_local(&bundle, &b);
-                            if forced {
-                                let _ = std::fs::remove_file(&force_path); // one-shot
-                            }
-                            if let Ok(js) = serde_json::to_vec(&b) {
-                                crate::guardian::put(&guardian_key(&bundle), js).await;
-                            }
-                            if let Err(e) = install_bundle(&b) {
-                                tracing::warn!(error = %e, %bundle, "issued but failed to install locally");
-                            } else {
-                                tracing::info!(%bundle, zones = ?installed_zones(), "certificate installed + replicated");
-                            }
+                    Err(e) => {
+                        // A Let's Encrypt rate-limit is a BUDGET event, not a
+                        // transient: the duplicate-certificate window (5 per
+                        // 168h per exact identifier set) closes the bundle
+                        // until the window opens — live-witnessed 2026-07-29
+                        // after five forced renewals in a week ('retry after
+                        // 2026-07-30 10:06:58 UTC'), which also silently
+                        // disarmed the acme-force sentinel path. Warn alone
+                        // buried that; make it an incident so the operator
+                        // sees the window (and that force-renewals spend it).
+                        if e.to_string().contains("rateLimited") {
+                            cloud.incidents.open(crate::incidents::OpenReq {
+                                title: format!("ACME rate-limited by Let's Encrypt ({bundle})"),
+                                severity: crate::incidents::Severity::Major,
+                                affected: vec!["tls".into(), "acme".into()],
+                                message: format!(
+                                    "Issuance of the {bundle} bundle hit an LE rate limit — the bundle cannot renew (including via the acme-force sentinel) until the window opens. Error: {e}"
+                                ),
+                            });
                         }
-                        Err(e) => {
-                            // A Let's Encrypt rate-limit is a BUDGET event, not a
-                            // transient: the duplicate-certificate window (5 per
-                            // 168h per exact identifier set) closes the bundle
-                            // until the window opens — live-witnessed 2026-07-29
-                            // after five forced renewals in a week ('retry after
-                            // 2026-07-30 10:06:58 UTC'), which also silently
-                            // disarmed the acme-force sentinel path. Warn alone
-                            // buried that; make it an incident so the operator
-                            // sees the window (and that force-renewals spend it).
-                            if e.to_string().contains("rateLimited") {
-                                cloud.incidents.open(crate::incidents::OpenReq {
-                                    title: format!("ACME rate-limited by Let's Encrypt ({bundle})"),
-                                    severity: crate::incidents::Severity::Major,
-                                    affected: vec!["tls".into(), "acme".into()],
-                                    message: format!(
-                                        "Issuance of the {bundle} bundle hit an LE rate limit — the bundle cannot renew (including via the acme-force sentinel) until the window opens. Error: {e}"
-                                    ),
-                                });
-                            }
-                            tracing::warn!(error = %e, %bundle, "ACME issuance failed (will retry next pass)");
-                        }
+                        tracing::warn!(error = %e, %bundle, "ACME issuance failed (will retry next pass)");
                     }
                 }
             }

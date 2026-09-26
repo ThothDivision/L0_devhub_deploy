@@ -2045,6 +2045,48 @@ pub async fn fetch(
     path: &str,
     body: &[u8],
 ) -> Option<Vec<u8>> {
+    fetch_outcome(cloud, peer, method, path, body).await.bytes()
+}
+
+/// What one gossip fetch proved about the TARGET, not just the payload.
+pub enum FetchOutcome {
+    Answered(Vec<u8>),
+    /// The mesh dial itself failed — its budget elapsed, the connect phase
+    /// timed out, or the peer's endpoint refused the connection — and no HTTP
+    /// fallback answered. A second dial to this target in the same gossip
+    /// round (the mesh join) would spend the same budget failing the same way.
+    Unreachable,
+    /// Anything else: connected but refused (e.g. not yet in the peer's
+    /// trust set, which is what the mesh join exists for), HTTP failure, or
+    /// no transport mapping at all.
+    Failed,
+}
+
+impl FetchOutcome {
+    pub fn bytes(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Answered(b) => Some(b),
+            Self::Unreachable | Self::Failed => None,
+        }
+    }
+}
+
+/// A pool error that means the connection was never established.
+fn is_dial_failure(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<hive_p2p::DeadPeerTimeout>()
+        .is_some_and(|d| d.phase == "connect")
+        || e.downcast_ref::<hive_p2p::PeerRefused>().is_some()
+}
+
+/// [`fetch`], classified (see [`FetchOutcome`]).
+pub async fn fetch_outcome(
+    cloud: &Arc<CloudState>,
+    peer: &str,
+    method: u8,
+    path: &str,
+    body: &[u8],
+) -> FetchOutcome {
+    let mut dial_failed = false;
     if iroh_enabled() {
         // Clone out of the locks and DROP the guards before awaiting (parking_lot
         // guards aren't Send and can't be held across `.await`).
@@ -2083,13 +2125,15 @@ pub async fn fetch(
             )
             .await;
             match attempt {
-                Ok(Ok(bytes)) => return Some(bytes),
+                Ok(Ok(bytes)) => return FetchOutcome::Answered(bytes),
                 Ok(Err(e)) => {
                     tracing::debug!(peer, path, error = %e, "iroh gossip failed; falling back to HTTP");
+                    dial_failed = is_dial_failure(&e);
                     cloud.peer_iroh.write().remove(peer);
                 }
                 Err(_) => {
                     tracing::debug!(peer, path, "iroh gossip timed out; falling back to HTTP");
+                    dial_failed = true;
                     cloud.peer_iroh.write().remove(peer);
                 }
             }
@@ -2123,13 +2167,24 @@ pub async fn fetch(
     // (issue() returns Err, so no header is added -- matching dev/single-node
     // behavior exactly as before).
     if method == hive_p2p::GOSSIP_POST {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", "mesh", "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+        if let Ok(tok) = crate::auth::issue(
+            "mesh-internal",
+            "mesh",
+            "service",
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
             req = req.header("authorization", format!("Bearer {tok}"));
         }
     }
-    match req.timeout(Duration::from_secs(4)).send().await {
+    let answered = match req.timeout(Duration::from_secs(4)).send().await {
         Ok(r) if r.status().is_success() => r.bytes().await.ok().map(|b| b.to_vec()),
         _ => None,
+    };
+    match answered {
+        Some(bytes) => FetchOutcome::Answered(bytes),
+        None if dial_failed => FetchOutcome::Unreachable,
+        None => FetchOutcome::Failed,
     }
 }
 

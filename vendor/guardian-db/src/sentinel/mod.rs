@@ -48,12 +48,23 @@ pub const DEFAULT_ADDR: &str = "127.0.0.1:15433";
 pub async fn open_owned(
     data_dir: &std::path::Path,
 ) -> crate::guardian::error::Result<(Arc<GuardianDB>, IrohClient)> {
+    open_owned_with_peering(data_dir, None, Vec::new()).await
+}
+
+pub async fn open_owned_with_peering(
+    data_dir: &std::path::Path,
+    mdns_discovery_auth: Option<crate::p2p::network::config::MdnsDiscoveryAuth>,
+    known_peers: Vec<iroh::EndpointId>,
+) -> crate::guardian::error::Result<(Arc<GuardianDB>, IrohClient)> {
     use crate::guardian::core::NewGuardianDBOptions;
     use crate::p2p::network::config::ClientConfig;
 
+    let enable_discovery_mdns = mdns_discovery_auth.is_some();
     let config = ClientConfig {
         enable_pubsub: true,
-        enable_discovery_mdns: true,
+        enable_discovery_mdns,
+        mdns_discovery_auth,
+        known_peers,
         enable_discovery_n0: true,
         data_store_path: Some(data_dir.join("iroh")),
         ..Default::default()

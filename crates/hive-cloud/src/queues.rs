@@ -465,10 +465,7 @@ impl QueueStore {
         let available: Vec<&QueueMessage> = msgs
             .iter()
             .filter(|m| {
-                m.timestamp_ms <= now
-                    && m.lease
-                        .as_ref()
-                        .is_none_or(|(_, expires)| *expires <= now)
+                m.timestamp_ms <= now && m.lease.as_ref().is_none_or(|(_, expires)| *expires <= now)
             })
             .collect();
         let count = available.len();
@@ -498,10 +495,8 @@ impl QueueStore {
             if leased.len() as u32 >= batch_size {
                 break;
             }
-            let available = m.timestamp_ms <= now
-                && m.lease
-                    .as_ref()
-                    .is_none_or(|(_, exp)| *exp <= now);
+            let available =
+                m.timestamp_ms <= now && m.lease.as_ref().is_none_or(|(_, exp)| *exp <= now);
             if !available {
                 continue;
             }

@@ -526,60 +526,94 @@ fn configured_bool_default_true(name: &str) -> anyhow::Result<bool> {
 }
 
 impl CloudState {
-    /// The current control-plane WRITE authority (owner). Resolution order (see
-    /// `cluster.rs` module doc): the operator-curated `HIVE_CP_OWNER_CHAIN`
-    /// (first healthy+public entry wins — static ownership, no open election),
-    /// falling back to the identity election (with the legacy `HIVE_CP_LEADER`
-    /// pin) only when no chain is configured or every chain entry is dark.
-    /// Returns the owner's node name, or this node when nothing is resolvable
-    /// (single-node / no peers). Every resolution feeds the cluster's
-    /// observed-owner tracker so the fencing epoch bumps exactly on real
-    /// ownership transitions.
-    pub fn control_plane_leader(&self) -> String {
+    /// The control-plane owner as a FORWARDING target, plus where the answer
+    /// came from (see `Cluster::control_plane_owner_with_source`). With
+    /// `HIVE_CP_OWNER_CHAIN` set: the strict chain owner, else the first
+    /// gossip-present chain entry that is not this node (a forwarding guess,
+    /// [`crate::cluster::OwnerSource::Fallback`]), else `None`. Without a chain:
+    /// the identity election, or this node when nothing is electable
+    /// (single-node dev). Never resolves to THIS node unless this node is the
+    /// real owner — the old `unwrap_or(self)` made every node whose chain went
+    /// dark in its own view a self-serving writer.
+    ///
+    /// Every authoritative resolution feeds the cluster's observed-owner
+    /// tracker so the fencing epoch bumps exactly on real ownership
+    /// transitions; a fallback forwarding guess is never observed as an owner.
+    pub fn control_plane_leader_with_source(
+        &self,
+    ) -> Option<(String, crate::cluster::OwnerSource)> {
         let chain = crate::cluster::Cluster::owner_chain_from_env();
         let pref = std::env::var("HIVE_CP_LEADER").ok();
-        let owner = crate::cluster::Cluster::control_plane_owner(
+        let resolved = crate::cluster::Cluster::control_plane_owner_with_source(
             &chain,
             pref.as_deref(),
             &self.registry.nodes(),
+            &self.node_name,
         )
-        .unwrap_or_else(|| self.node_name.clone());
-        self.cluster.observe_owner(&owner);
-        owner
+        .or_else(|| {
+            chain.is_empty().then(|| {
+                (
+                    self.node_name.clone(),
+                    crate::cluster::OwnerSource::Election,
+                )
+            })
+        });
+        if let Some((owner, source)) = &resolved {
+            if source.is_authority() {
+                self.cluster.observe_owner(owner);
+            }
+        }
+        resolved
     }
 
-    /// True when THIS node is the control-plane leader.
+    /// Where request-path code forwards a leader-only read or write: see
+    /// [`Self::control_plane_leader_with_source`]. `None` means no owner is
+    /// resolvable from this node's view (a configured chain is dark here) —
+    /// callers answer a retryable refusal or serve their local best effort,
+    /// never treat themselves as the owner. Background single-writer jobs do
+    /// NOT use this; they ask `leadership::may_act`.
+    pub fn control_plane_leader(&self) -> Option<String> {
+        self.control_plane_leader_with_source()
+            .map(|(owner, _)| owner)
+    }
+
+    /// True when THIS node is the control-plane owner for REQUEST-PATH
+    /// purposes (serve a mutation locally instead of forwarding it).
     ///
-    /// Gated on mesh freshness first: `billing_leader` recomputes the election
-    /// fresh from `self.registry.nodes()` on EVERY call, with no persisted or
-    /// gossiped epoch/term — there is nothing that fences a stale computation
-    /// against a fresher one elsewhere in the mesh. That's fine for a node with
-    /// current gossip data (the common case: it converges within one ~5s
-    /// round). It's dangerous for a node whose OWN view is stale or isolated —
-    /// most concretely, a node in the first moments after a restart, before its
-    /// gossip loop has resynced. Such a node's `registry.nodes()` can still
-    /// show itself as the (or a) healthy lowest-identity candidate purely
-    /// because it hasn't yet learned the rest of the mesh already elected
-    /// someone else — a real, if short (bounded by one gossip round), split-
-    /// brain window on every leader restart. A node that can't currently see
-    /// its expected peers (`mesh_health().isolated`) must never assert
-    /// leadership from that view; `admin_ingress` already fails mutations
-    /// closed (503) when the resolved leader is unreachable, so refusing here
-    /// safely defers rather than risking a stale-data write.
+    /// Gated on mesh freshness first: a node that can't currently see its
+    /// expected peers (`mesh_health().isolated`) must never assert leadership
+    /// from that view; `admin_ingress` already fails mutations closed (503)
+    /// when the resolved leader is unreachable, so refusing here safely defers
+    /// rather than risking a stale-data write. A forwarding guess
+    /// (`OwnerSource::Fallback`) is never this node by construction.
     pub fn is_control_plane_leader(&self) -> bool {
         if self.mesh_health().isolated {
             return false;
         }
-        self.control_plane_leader() == self.node_name
+        matches!(
+            self.control_plane_leader_with_source(),
+            Some((owner, source)) if source.is_authority() && owner == self.node_name
+        )
+    }
+
+    /// THE forwarding decision for a request-path read or write that belongs
+    /// to the control-plane owner: the owner (or forwarding guess) when that is
+    /// ANOTHER node, resolved exactly once per call so the answer cannot flip
+    /// between a "am I the leader" test and a "who is" lookup. `None` = do not
+    /// forward: this node is the resolved owner (isolated or not — a hop to
+    /// itself buys nothing), or no owner is resolvable from this node's view
+    /// (reads serve their local best effort, writes answer a retryable 503).
+    /// Every read proxy and owner-forward uses this, never a hand-rolled pair
+    /// of `is_control_plane_leader()` / `control_plane_leader()` calls.
+    pub fn leader_forward_target(&self) -> Option<String> {
+        self.control_plane_leader()
+            .filter(|leader| !leader.is_empty() && *leader != self.node_name)
     }
 
     /// The leader's [`NodeInfo`] (for its public IP), or None when this node is the
     /// leader or the leader isn't resolvable in the registry.
     pub fn leader_node(&self) -> Option<hive_edge::NodeInfo> {
-        let leader = self.control_plane_leader();
-        if leader == self.node_name {
-            return None;
-        }
+        let leader = self.leader_forward_target()?;
         self.registry.nodes().into_iter().find(|n| n.name == leader)
     }
 
@@ -628,9 +662,8 @@ impl CloudState {
         )
         .unwrap_or_else(|error| panic!("deployment ledger failed closed: {error:#}"));
         let integrity_signer = Arc::new(
-            crate::integrity_signer::IntegritySigner::open_or_create(&node_name).unwrap_or_else(
-                |error| panic!("integrity signing key failed closed: {error:#}"),
-            ),
+            crate::integrity_signer::IntegritySigner::open_or_create(&node_name)
+                .unwrap_or_else(|error| panic!("integrity signing key failed closed: {error:#}")),
         );
         let runtime_artifact_transfer = crate::runtime_artifact_transfer::TransferService::open(
             crate::persist::data_dir().join("runtime-artifacts-v1"),
@@ -888,15 +921,27 @@ impl CloudState {
             .filter_map(|node| node.peer_id.as_deref())
             .filter_map(|id| id.parse().ok())
             .collect();
-        let direct_freshness = std::time::Duration::from_secs(
-            std::env::var("HIVE_MESH_DIRECT_FRESH_SECS")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .filter(|seconds| *seconds > 0)
-                .unwrap_or(120),
-        );
-        let direct: std::collections::HashSet<iroh::EndpointId> = self
-            .mesh
+        let direct = self.direct_reachable_ids();
+        let audible_peers = expected.intersection(&audible).count();
+        let visible_healthy_peers = expected.intersection(&healthy).count();
+        let direct_reachable_peers = expected.intersection(&direct).count();
+        MeshHealth {
+            audible_peers,
+            expected_peers: expected.len(),
+            visible_healthy_peers,
+            direct_reachable_peers,
+            isolated: mesh_isolated(expected.len(), direct_reachable_peers),
+            uptime_ms: hive_core::now_ms().saturating_sub(self.boot_ms),
+        }
+    }
+
+    /// Endpoint ids this node has DIRECT, fresh OUTBOUND transport evidence
+    /// for: a successful dial/trunk inside `HIVE_MESH_DIRECT_FRESH_SECS` (120)
+    /// that is newer than the last failure. Gossip relayed through a third node
+    /// never counts. `mesh_health`'s `direct_reachable_peers` / `isolated`.
+    pub fn direct_reachable_ids(&self) -> std::collections::HashSet<iroh::EndpointId> {
+        let direct_freshness = Self::direct_freshness();
+        self.mesh
             .read()
             .clone()
             .map(|pool| pool.dial_evidence_snapshot())
@@ -911,18 +956,38 @@ impl CloudState {
                 })
             })
             .filter_map(|evidence| evidence.endpoint_id.parse().ok())
-            .collect();
-        let audible_peers = expected.intersection(&audible).count();
-        let visible_healthy_peers = expected.intersection(&healthy).count();
-        let direct_reachable_peers = expected.intersection(&direct).count();
-        MeshHealth {
-            audible_peers,
-            expected_peers: expected.len(),
-            visible_healthy_peers,
-            direct_reachable_peers,
-            isolated: mesh_isolated(expected.len(), direct_reachable_peers),
-            uptime_ms: hive_core::now_ms().saturating_sub(self.boot_ms),
-        }
+            .collect()
+    }
+
+    /// How recent DIRECT evidence (a dial, or a self-report received first
+    /// hand) must be to count: `HIVE_MESH_DIRECT_FRESH_SECS`, 120 s.
+    pub(crate) fn direct_freshness() -> std::time::Duration {
+        std::time::Duration::from_secs(
+            std::env::var("HIVE_MESH_DIRECT_FRESH_SECS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|seconds| *seconds > 0)
+                .unwrap_or(120),
+        )
+    }
+
+    /// [`Self::direct_reachable_ids`] plus every peer whose OWN self-report
+    /// reached this node directly inside the same freshness window (an
+    /// inbound announce or the first entry of a `/v1/nodes` reply —
+    /// `NodeRegistry::gossip_evidence_snapshot`; relayed copies never count).
+    /// The leadership voter quorum: a working inbound link is contact even
+    /// while this node's own outbound dials to that peer are failing.
+    pub fn direct_contact_ids(&self) -> std::collections::HashSet<iroh::EndpointId> {
+        let freshness = Self::direct_freshness();
+        let mut ids = self.direct_reachable_ids();
+        ids.extend(
+            self.registry
+                .gossip_evidence_snapshot()
+                .into_iter()
+                .filter(|evidence| evidence.last_received_ago <= freshness)
+                .filter_map(|evidence| evidence.endpoint_id.parse::<iroh::EndpointId>().ok()),
+        );
+        ids
     }
 
     pub fn record(&self, ev: Event) {

@@ -31,7 +31,11 @@ pub use iroh::Endpoint;
 /// and `GET /v1/mesh/discovery` read it). See the module docs for what becomes
 /// publicly resolvable and every env flag that gates it.
 pub mod dht;
+mod establish;
 pub mod private_path;
+
+pub use establish::{establish_stats, ClassCounts, ClassLimits, EstablishStats, PeerBudget};
+use establish::{ConnClass, ConnectFailure, Event as EstablishEvent};
 
 /// Connection-level QUIC idle timeout for trunked connections.
 ///
@@ -121,6 +125,70 @@ fn max_browser_conns() -> usize {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(128)
+}
+
+/// Concurrent inbound HANDSHAKES whose ClientHello could not be classified
+/// from the first Initial — every hybrid X25519MLKEM768 dial, whose 1216-byte
+/// key share cannot fit one 1200-byte packet, so noq's ALPN peek fails. They
+/// used to be charged to the 128-slot BROWSER budget (every PQ fleet trunk
+/// shared it with untrusted browsers). Now they hold a slot here only across
+/// the deadline-bounded handshake; the negotiated ALPN then decides which
+/// budget the connection lives on. A hostile client still reaches nothing
+/// but this short-lived pool before its ALPN is known. `0` = uncapped.
+fn max_pending_conns() -> usize {
+    std::env::var("HIVE_P2P_PENDING_MAX_CONNS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(256)
+}
+
+/// Concurrently-served FLEET connections one remote endpoint may hold,
+/// checked when a new connection is ADMITTED (after the handshake, when the
+/// remote id is proven). Over the cap the NEW connection is closed; an
+/// established trunk is never evicted for it — during the fc-sanjose wedge
+/// the oldest trunks (va3, phx) were the only working connections, and
+/// "evict the oldest duplicate" would have cut them too. A well-behaved peer
+/// holds one trunk (`PeerPool` keys by endpoint id); 16 is a leak backstop.
+/// `0` = uncapped.
+fn max_conns_per_endpoint() -> usize {
+    std::env::var("HIVE_P2P_MAX_CONNS_PER_ENDPOINT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(16)
+}
+
+/// Wall-clock bound on ONE inbound accept: the noq handshake plus iroh's
+/// `register_connection` round trip through its socket actor, which has no
+/// bound of its own. When that actor chain wedges, every accept that
+/// finished its handshake waited forever holding its budget slot; this
+/// deadline closes the accept (releasing the slot) and counts it as
+/// `accept_stuck`. Default [`IDLE_TIMEOUT`] + 10 s (40 s), deliberately ABOVE
+/// the idle timeout, which is the only bound noq puts on a handshake: a
+/// handshake the remote abandoned then ends as a handshake error at 30 s and
+/// is never counted as stuck. What still reaches the deadline is a registration
+/// that hung (the wedge) or a handshake the remote kept alive past it — which
+/// any sender can do, so `accept_stuck` alone is never restart evidence.
+pub(crate) fn accept_deadline() -> Duration {
+    env_ms(
+        "HIVE_P2P_ACCEPT_DEADLINE_MS",
+        (IDLE_TIMEOUT + Duration::from_secs(10)).as_millis() as u64,
+    )
+}
+
+/// Application close code for a fleet (`HIVE_ALPN`) connection this node
+/// refuses AFTER its handshake: its class budget or its endpoint's admission
+/// cap is full. Same number as the browser protocol's `OVERLOADED`. A dialer
+/// treats it like a pre-handshake refusal (refused-dial backoff); an older
+/// dialer just sees a closed trunk and redials, exactly as before.
+const FLEET_CLOSE_OVERLOADED: u32 = browser_reset::OVERLOADED;
+
+/// Whether a fleet connection's close is this crate's post-handshake refusal.
+fn is_overload_close(error: &iroh::endpoint::ConnectionError) -> bool {
+    matches!(
+        error,
+        iroh::endpoint::ConnectionError::ApplicationClosed(close)
+            if close.error_code == iroh::endpoint::VarInt::from_u32(FLEET_CLOSE_OVERLOADED)
+    )
 }
 
 const BROWSER_MAX_ACTIVE_STREAMS: usize = 32;
@@ -299,6 +367,11 @@ const GOSSIP_SIG_DOMAIN: &[u8] = b"hive-gossip-v1";
 /// Cap on a single gossip frame (request path/body or response) — gossip payloads
 /// are small JSON rosters; this just bounds a malformed/hostile length prefix.
 const GOSSIP_MAX_FRAME: usize = 16 * 1024 * 1024;
+/// Read size of a streamed response body (`PeerPool::read_response_frame`);
+/// each read is bounded by the idle budget.
+const RESPONSE_CHUNK: usize = 64 * 1024;
+/// Largest up-front reservation for a streamed response body.
+const RESPONSE_PREALLOC: usize = 1024 * 1024;
 
 /// Serves one gossip request: `(method, path, body, verified_signer) -> response
 /// body bytes`. The caller (hive-cloud) wires this to dispatch onto its local admin
@@ -566,6 +639,91 @@ pub fn verify_stats() -> (u64, u64, u64, u64, u64, u64) {
         VERIFY_STATS.signer_mismatch.load(Ordering::Relaxed),
         VERIFY_STATS.rejected.load(Ordering::Relaxed),
     )
+}
+
+/// Per-connection post-quantum key-exchange counters, surfaced via `/v1/relay`
+/// (mirrors `VerifyStats`'s shape) — the SOLE source of truth for whether a
+/// trunk actually negotiated hybrid PQ key exchange. Deliberately NOT derived
+/// from any config/env flag: `bind_full` offering `X25519MLKEM768` first does
+/// not prove a given peer accepted it (an old binary, or the browser build —
+/// `crates/hive-browser` stays `tls-ring`-only, aws-lc-rs is a C/BoringSSL
+/// library with no realistic wasm32 target — falls back to classical, by
+/// design, silently, as TLS group negotiation always has). Every count here
+/// comes from `noq_proto::crypto::rustls::HandshakeData::negotiated_key_exchange_group`,
+/// read back off the ACTUAL completed handshake on both the accept path
+/// (`serve_tunnels_full`) and the one place `PeerPool` mints a genuinely NEW
+/// trunk (`PeerPool::acquire`'s fresh-dial success branch) — never on a reused
+/// trunk, so this counts distinct handshakes, not requests.
+#[derive(Default)]
+pub struct PqKexStats {
+    /// A hybrid PQ group (X25519MLKEM768 or another ML-KEM combination) was
+    /// negotiated. This is a KEY-EXCHANGE property only — it says nothing
+    /// about the peer's identity, which stays classical Ed25519 regardless
+    /// (`docs/pqc-migration-scope.md` Phase 1/2, not implemented).
+    pub hybrid_pq: AtomicU64,
+    /// A classical-only group (X25519/SECP256R1/SECP384R1) was negotiated —
+    /// the peer connected fine, just without PQ protection on this leg.
+    pub classical_fallback: AtomicU64,
+    /// The handshake completed but no `HandshakeData` (or no recognized
+    /// group) could be read back — reported honestly as unknown, never
+    /// folded into either bucket above.
+    pub unknown: AtomicU64,
+}
+
+static PQ_KEX_STATS: PqKexStats = PqKexStats {
+    hybrid_pq: AtomicU64::new(0),
+    classical_fallback: AtomicU64::new(0),
+    unknown: AtomicU64::new(0),
+};
+
+/// Snapshot of the PQ key-exchange counters: `(hybrid_pq, classical_fallback, unknown)`.
+pub fn pq_kex_stats() -> (u64, u64, u64) {
+    (
+        PQ_KEX_STATS.hybrid_pq.load(Ordering::Relaxed),
+        PQ_KEX_STATS.classical_fallback.load(Ordering::Relaxed),
+        PQ_KEX_STATS.unknown.load(Ordering::Relaxed),
+    )
+}
+
+/// Read the REAL negotiated key-exchange group off a just-established
+/// connection and bucket it. Synchronous and infallible-by-construction: by
+/// the time a caller holds a `Connection` (not a `Connecting`), the TLS
+/// handshake has already completed, so `Connection::handshake_data()` never
+/// blocks here — it returns `None` only if iroh itself withheld it, which
+/// this function treats as `unknown` rather than guessing.
+///
+/// `class` is the budget the connection was admitted under (`fleet` /
+/// `browser` on the accept path, `outbound` for a fresh `PeerPool` trunk), so
+/// a debug trace answers "which budget did this PQ handshake land in" — the
+/// question the pre-handshake classification got wrong for every hybrid dial.
+fn record_kex_telemetry(conn: &Connection, class: &'static str) {
+    let group = conn
+        .handshake_data()
+        .and_then(|data| data.downcast::<noq::crypto::rustls::HandshakeData>().ok())
+        .and_then(|hd| hd.negotiated_key_exchange_group);
+    tracing::debug!(
+        class,
+        group = ?group,
+        remote = %conn.remote_id().fmt_short(),
+        "p2p handshake key exchange"
+    );
+    match group {
+        Some(
+            rustls::NamedGroup::X25519MLKEM768
+            | rustls::NamedGroup::secp256r1MLKEM768
+            | rustls::NamedGroup::MLKEM768,
+        ) => {
+            PQ_KEX_STATS.hybrid_pq.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(_) => {
+            PQ_KEX_STATS
+                .classical_fallback
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        None => {
+            PQ_KEX_STATS.unknown.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// The domain-separated byte string an ed25519 gossip signature covers. Pure, so
@@ -2054,6 +2212,77 @@ fn pool_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Ceiling of the refused-dial backoff (`PeerPool::refused`) — below the
+/// negative-discovery memo's 180 s cap by design.
+const REFUSED_BACKOFF_CAP_MS: u64 = 30_000;
+/// How long a cached-hint address proven to answer as another identity stays
+/// out of that peer's dial set (`PeerPool::hint_distrust`).
+const HINT_DISTRUST_TTL_MS: u64 = 600_000;
+
+/// A dial skipped inside the peer's refused-dial backoff window (see
+/// `PeerPool::refused`). Deliberately NOT a [`DeadPeerTimeout`]: the peer
+/// answered — it is alive and saying "not now" — so callers that mark
+/// timed-out peers unhealthy must not read a refusal as a death.
+#[derive(Clone, Debug)]
+pub struct PeerRefused {
+    pub node_id: String,
+    pub retry_in_ms: u64,
+}
+impl std::fmt::Display for PeerRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "p2p peer {} is refusing new connections; not dialing for another {}ms",
+            self.node_id, self.retry_in_ms
+        )
+    }
+}
+impl std::error::Error for PeerRefused {}
+
+/// A relay entry routes by endpoint id, so what answers through it is the
+/// dialed identity (relays forward only to the endpoint that authenticated
+/// under that key) — unlike a direct address, which is whoever holds it now.
+fn is_relay_addr(addr: &iroh::TransportAddr) -> bool {
+    matches!(addr, iroh::TransportAddr::Relay(_))
+}
+
+/// How one bounded connect attempt ended (`PeerPool::connect_once`).
+enum ConnectOutcome {
+    Connected(Connection),
+    Failed(ConnectFailure, anyhow::Error),
+    TimedOut,
+}
+
+/// What one `acquire` dial's attempts showed about THIS endpoint
+/// (`DialEvidenceTimes::last_timeout`). Atomics only so the dial future
+/// stays `Send`; nothing else shares it.
+#[derive(Default)]
+struct DialTrace {
+    /// An attempt ran out its connect budget.
+    timed_out: std::sync::atomic::AtomicBool,
+    /// An attempt got an answer (a refusal, or a handshake with another
+    /// identity): this endpoint's connection setup demonstrably works, so
+    /// the dial's timeouts were the path's, not ours.
+    answered: std::sync::atomic::AtomicBool,
+}
+
+impl DialTrace {
+    fn note(&self, outcome: &ConnectOutcome) {
+        match outcome {
+            ConnectOutcome::TimedOut => self.timed_out.store(true, Ordering::Relaxed),
+            ConnectOutcome::Failed(ConnectFailure::Refused | ConnectFailure::IdentityMismatch, _) => {
+                self.answered.store(true, Ordering::Relaxed)
+            }
+            _ => {}
+        }
+    }
+
+    /// The dial failed because this side's connects timed out unanswered.
+    fn our_timeout(&self) -> bool {
+        self.timed_out.load(Ordering::Relaxed) && !self.answered.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone)]
 struct AcquiredPeer {
     key: String,
@@ -2102,12 +2331,16 @@ impl std::error::Error for DialLifecycleError {}
 #[derive(Clone, Debug)]
 enum SharedDialError {
     DeadPeer(DeadPeerTimeout),
+    Refused(PeerRefused),
     Failed(String),
     Lifecycle(DialLifecycleError),
 }
 
 impl SharedDialError {
     fn from_anyhow(error: &anyhow::Error) -> Self {
+        if let Some(refused) = error.downcast_ref::<PeerRefused>() {
+            return Self::Refused(refused.clone());
+        }
         error
             .downcast_ref::<DeadPeerTimeout>()
             .cloned()
@@ -2118,6 +2351,7 @@ impl SharedDialError {
     fn into_anyhow(self) -> anyhow::Error {
         match self {
             Self::DeadPeer(error) => anyhow::Error::new(error),
+            Self::Refused(error) => anyhow::Error::new(error),
             Self::Failed(message) => anyhow::anyhow!(message),
             Self::Lifecycle(error) => anyhow::Error::new(error),
         }
@@ -2135,6 +2369,14 @@ struct DialFlight {
 struct DialEvidenceTimes {
     last_success: Option<Instant>,
     last_failure: Option<Instant>,
+    /// The last failed dial whose connect attempts ran out their budget with
+    /// NONE answered (`DialTrace::our_timeout`). Narrower than
+    /// `last_failure`, which any failed dial sets: a refusal (the peer
+    /// answered) and a hint that answered as another identity prove this
+    /// endpoint's own connection setup WORKS, and a negative-discovery
+    /// short-circuit sends nothing, so none of them is establishment-wedge
+    /// evidence.
+    last_timeout: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -2152,6 +2394,9 @@ pub struct PeerDialEvidence {
     pub endpoint_id: String,
     pub last_success_ago: Option<Duration>,
     pub last_failure_ago: Option<Duration>,
+    /// Age of the last failed dial whose connect attempts TIMED OUT on this
+    /// side, none answered (see `DialEvidenceTimes::last_timeout`).
+    pub last_timeout_ago: Option<Duration>,
 }
 
 struct DialLeaderGuard<'a> {
@@ -2215,6 +2460,33 @@ pub struct PeerPool {
     /// dead-looking peer (bootstrap seeds included) is always re-tried within
     /// three minutes, and any success clears the memo.
     neg_discovery: Mutex<HashMap<String, (u64, u64)>>,
+    /// Refused-dial backoff: canonical endpoint id → (until_ms, cur_delay_ms).
+    /// Set when a peer REFUSES our dial through an identity-routed path — a
+    /// relay entry, fresh discovery, a relay-only or bare hint, or the fleet
+    /// overload close after the handshake (a pre-handshake refusal from a
+    /// direct address is first confirmed that way: it names no identity, and
+    /// a stranger at a stale IP must not keep the real peer undialed); inside
+    /// the window `acquire` fails at once without dialing — request-driven or
+    /// not, because a refusal is the peer's own "not now" and re-dialing at
+    /// once is the retry storm (~9/s against the wedged leader) that kept it
+    /// saturated. 1 s growing to a 30 s cap, cleared once a request round-trips.
+    /// The cap stays BELOW the
+    /// negative-discovery cap (180 s): nothing is un-dialable for long (the
+    /// retain_dialable lesson), and a live trunk is always reused regardless.
+    refused: StdMutex<HashMap<String, (u64, u64)>>,
+    /// Suspended cached-hint IP addresses: canonical endpoint id → (until_ms,
+    /// addresses). A dial whose handshake fails `UnknownIssuer` reached
+    /// someone else's endpoint at one of the hinted addresses (fc-sanjose
+    /// after its restart: 37 such dials to fc-phoenix in 45 s through a stale
+    /// hint), and every retry through it fails identically while charging the
+    /// stranger's accept budget. The error names no address, so EVERY direct
+    /// address of that hint is suspended for [`HINT_DISTRUST_TTL_MS`] — and
+    /// only when the hint has a relay entry (routed by endpoint id,
+    /// identity-correct by construction) to dial instead; a strip that would
+    /// leave no relay is never persisted nor applied, so the set is never
+    /// emptied (the retain_dialable partition).
+    hint_distrust:
+        StdMutex<HashMap<String, (u64, std::collections::BTreeSet<iroh::TransportAddr>)>>,
     /// Tencent-CCN private-path candidates: canonical endpoint id → the
     /// peer's VPC-private address, populated ONLY by this node's own trusted
     /// gossip-merge code (`set_private_candidate`), never from raw peer
@@ -2242,7 +2514,165 @@ impl PeerPool {
             timeouts: Arc::new(TimeoutCounters::default()),
             warm_backoff: Mutex::new(HashMap::new()),
             neg_discovery: Mutex::new(HashMap::new()),
+            refused: StdMutex::new(HashMap::new()),
+            hint_distrust: StdMutex::new(HashMap::new()),
             private_candidates: StdMutex::new(HashMap::new()),
+        })
+    }
+
+    /// Remaining refused-dial backoff for `key`, if inside a window.
+    fn refused_backoff_remaining(&self, key: &str) -> Option<u64> {
+        let now = pool_now_ms();
+        let refused = self
+            .refused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        refused
+            .get(key)
+            .map(|(until, _)| until.saturating_sub(now))
+            .filter(|remaining| *remaining > 0)
+    }
+
+    /// The peer refused a dial: open (or grow) its backoff window. Returns the
+    /// window length. One WARN per refusal — the window itself bounds the rate
+    /// (at most one dial, so one line, per window).
+    fn note_refused(&self, node_id: &str, key: &str, how: &'static str) -> u64 {
+        establish::note(EstablishEvent::OutboundRefused);
+        let now = pool_now_ms();
+        let backoff = {
+            let mut refused = self
+                .refused
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // A window long expired is history, not a streak: start over.
+            let delay = refused
+                .get(key)
+                .filter(|(until, _)| now <= until + 2 * REFUSED_BACKOFF_CAP_MS)
+                .map(|(_, delay)| *delay)
+                .unwrap_or(0);
+            let grown = if delay == 0 {
+                1_000
+            } else {
+                delay + delay / 2 + (now % (delay / 2 + 1))
+            };
+            let capped = grown.min(REFUSED_BACKOFF_CAP_MS);
+            refused.insert(key.to_string(), (now + capped, capped));
+            capped
+        };
+        tracing::warn!(
+            node_id,
+            key = %key,
+            how,
+            backoff_ms = backoff,
+            "p2p peer refused our connection; backing off before the next dial"
+        );
+        backoff
+    }
+
+    fn clear_refused(&self, key: &str) {
+        self.refused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
+    }
+
+    /// Strip suspended direct addresses (`hint_distrust`) from `addr` — but
+    /// ONLY when an identity-routed path (a relay entry) survives the strip.
+    /// A set the strip would leave without a relay is dialed as it is: an
+    /// address that is probably wrong is still better than no address (the
+    /// retain_dialable partition), and the data plane dials raw registry
+    /// hints that often carry no relay at all.
+    fn apply_hint_distrust(&self, key: &str, addr: &mut EndpointAddr) {
+        let now = pool_now_ms();
+        let mut distrust = self
+            .hint_distrust
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        distrust.retain(|_, (until, _)| *until > now);
+        let Some((_, wrong)) = distrust.get(key) else {
+            return;
+        };
+        let mut stripped = addr.clone();
+        stripped.addrs.retain(|a| !wrong.contains(a));
+        if stripped.addrs.iter().any(is_relay_addr) {
+            *addr = stripped;
+        } else if addr.addrs.iter().any(|a| wrong.contains(a)) {
+            tracing::debug!(
+                key = %key,
+                "p2p hint has suspended direct addresses but no relay; dialing its full set"
+            );
+        }
+    }
+
+    /// A dial through `addr` completed a handshake with a DIFFERENT identity.
+    /// The error names no address, so EVERY direct address of the hint is
+    /// suspended for this endpoint id (the private CCN candidate and the
+    /// peer's correct public IPs included) — and only while the hint carries
+    /// a relay entry to dial instead. Returns whether anything was suspended:
+    /// a relay-less hint suspends nothing (stripping it would leave no
+    /// transport), and its next dial uses the full set again.
+    fn distrust_hint(&self, node_id: &str, key: &str, addr: &EndpointAddr) -> bool {
+        let wrong: std::collections::BTreeSet<iroh::TransportAddr> = addr
+            .addrs
+            .iter()
+            .filter(|a| matches!(a, iroh::TransportAddr::Ip(_)))
+            .cloned()
+            .collect();
+        if wrong.is_empty() || !addr.addrs.iter().any(is_relay_addr) {
+            tracing::warn!(
+                node_id,
+                key = %key,
+                "p2p cached hint answered with a different identity (UnknownIssuer) and has no \
+                 relay entry; suspending nothing, retrying via fresh discovery"
+            );
+            return false;
+        }
+        tracing::warn!(
+            node_id,
+            key = %key,
+            addrs = ?wrong,
+            ttl_ms = HINT_DISTRUST_TTL_MS,
+            "p2p cached hint answered with a different identity (UnknownIssuer); suspending \
+             every direct address of the hint for this peer and dialing via its relay"
+        );
+        let mut distrust = self
+            .hint_distrust
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = distrust
+            .entry(key.to_string())
+            .or_insert_with(|| (0, Default::default()));
+        entry.0 = pool_now_ms() + HINT_DISTRUST_TTL_MS;
+        entry.1.extend(wrong);
+        true
+    }
+
+    /// One real outbound connect attempt, counted as an `OutboundAttempt`,
+    /// bounded by `budget` and recorded in `trace`.
+    async fn connect_once(
+        &self,
+        addr: EndpointAddr,
+        budget: Duration,
+        trace: &DialTrace,
+    ) -> ConnectOutcome {
+        establish::note(EstablishEvent::OutboundAttempt);
+        let outcome = match tokio::time::timeout(budget, self.ep.connect(addr, HIVE_ALPN)).await {
+            Ok(Ok(conn)) => ConnectOutcome::Connected(conn),
+            Ok(Err(error)) => {
+                ConnectOutcome::Failed(establish::classify_connect_error(&error), error.into())
+            }
+            Err(_) => ConnectOutcome::TimedOut,
+        };
+        trace.note(&outcome);
+        outcome
+    }
+
+    /// The typed error for a refusal, opening (or growing) the backoff window.
+    fn refused_error(&self, node_id: &str, key: &str, how: &'static str) -> anyhow::Error {
+        let retry_in_ms = self.note_refused(node_id, key, how);
+        anyhow::Error::new(PeerRefused {
+            node_id: node_id.to_string(),
+            retry_in_ms,
         })
     }
 
@@ -2369,6 +2799,9 @@ impl PeerPool {
                 last_failure_ago: evidence
                     .last_failure
                     .map(|at| now.saturating_duration_since(at)),
+                last_timeout_ago: evidence
+                    .last_timeout
+                    .map(|at| now.saturating_duration_since(at)),
             })
             .collect::<Vec<_>>();
         snapshot.sort_by(|a, b| a.endpoint_id.cmp(&b.endpoint_id));
@@ -2395,6 +2828,9 @@ impl PeerPool {
             .entry(acquired.key.clone())
             .or_default()
             .last_success = Some(Instant::now());
+        drop(state);
+        // A request round-tripped: whatever refused us before has stopped.
+        self.clear_refused(&acquired.key);
     }
 
     /// Proactively ensure a live trunk to `node_id` exists — dial (holepunch) if
@@ -2535,7 +2971,27 @@ impl PeerPool {
                 });
             }
             if let Some(dead) = state.trunks.remove(&key) {
+                let overloaded = dead
+                    .conn
+                    .close_reason()
+                    .is_some_and(|reason| is_overload_close(&reason));
                 dead.conn.close(0u32.into(), b"dead trunk removed by pool");
+                if overloaded {
+                    self.note_refused(node_id, &key, "closed as overloaded after the handshake");
+                }
+            }
+            // Refused-dial backoff: no live trunk, and the peer refused our
+            // last dial moments ago — fail now instead of re-dialing into the
+            // refusal (see `PeerPool::refused`). Checked after trunk reuse so a
+            // working trunk is never refused, and before a flight starts so no
+            // waiter can queue behind a dial that is not going to happen.
+            if let Some(retry_in_ms) = self.refused_backoff_remaining(&key) {
+                drop(state);
+                tracing::debug!(node_id, key = %key, retry_in_ms, "p2p dial skipped: refused-dial backoff");
+                return Err(anyhow::Error::new(PeerRefused {
+                    node_id: node_id.to_string(),
+                    retry_in_ms,
+                }));
             }
 
             let generation = *state.generations.entry(key.clone()).or_insert(0);
@@ -2589,26 +3045,83 @@ impl PeerPool {
             signal: signal.clone(),
             armed: true,
         };
+        let trace = DialTrace::default();
         let dialed: Result<Connection> = async {
             let budget = connect_budget();
-            Ok(match tokio::time::timeout(budget, self.ep.connect(addr, HIVE_ALPN)).await {
-                Ok(Ok(conn)) => conn,
-                Ok(Err(error)) => {
-                    tracing::warn!(node_id, err = %error, "p2p connect error using cached hint; retrying via fresh discovery");
-                    self.dial_fresh(node_id, id).await?
+            // Direct addresses a completed handshake proved to be someone
+            // else's leave the dial set while a relay remains to dial
+            // (`hint_distrust`); a bare id dials exactly as before.
+            self.apply_hint_distrust(&key, &mut addr);
+            let hinted = addr.clone();
+            // Only the relay entries of the hint: the identity-routed retry.
+            let mut routed = hinted.clone();
+            routed.addrs.retain(is_relay_addr);
+            let has_direct = hinted.addrs.iter().any(|a| matches!(a, iroh::TransportAddr::Ip(_)));
+            match self.connect_once(addr, budget, &trace).await {
+                ConnectOutcome::Connected(conn) => Ok(conn),
+                // CONNECTION_REFUSED precedes the handshake and names no
+                // identity: through a direct address it may be a stranger now
+                // holding a stale hint's IP. Confirm through an identity-routed
+                // path (the hint's relay, else fresh discovery) before opening
+                // the backoff window, which would otherwise keep the real peer
+                // undialed for as long as the stranger refuses.
+                ConnectOutcome::Failed(ConnectFailure::Refused, _) if !has_direct => {
+                    Err(self.refused_error(node_id, &key, "connection refused"))
                 }
-                Err(_) => {
+                ConnectOutcome::Failed(ConnectFailure::Refused, _) if !routed.addrs.is_empty() => {
+                    match self.connect_once(routed, budget, &trace).await {
+                        ConnectOutcome::Connected(conn) => Ok(conn),
+                        ConnectOutcome::Failed(ConnectFailure::Refused, _) => Err(self.refused_error(
+                            node_id,
+                            &key,
+                            "connection refused (confirmed via the relay)",
+                        )),
+                        _ => self.dial_fresh(node_id, id, &trace).await,
+                    }
+                }
+                ConnectOutcome::Failed(ConnectFailure::Refused, _) => {
+                    self.dial_fresh(node_id, id, &trace).await
+                }
+                // The hinted direct addresses belong to another identity:
+                // suspend them (only while a relay remains) and retry through
+                // the relay at once, else fresh discovery.
+                ConnectOutcome::Failed(ConnectFailure::IdentityMismatch, _) => {
+                    if !self.distrust_hint(node_id, &key, &hinted) {
+                        return self.dial_fresh(node_id, id, &trace).await;
+                    }
+                    match self.connect_once(routed, budget, &trace).await {
+                        ConnectOutcome::Connected(conn) => Ok(conn),
+                        ConnectOutcome::Failed(ConnectFailure::Refused, _) => Err(self.refused_error(
+                            node_id,
+                            &key,
+                            "connection refused (via the relay)",
+                        )),
+                        _ => self.dial_fresh(node_id, id, &trace).await,
+                    }
+                }
+                ConnectOutcome::Failed(ConnectFailure::Other, error) => {
+                    tracing::warn!(node_id, err = %error, "p2p connect error using cached hint; retrying via fresh discovery");
+                    self.dial_fresh(node_id, id, &trace).await
+                }
+                ConnectOutcome::TimedOut => {
                     self.timeouts.bump(node_id, PHASE_CONNECT).await;
                     tracing::warn!(
                         node_id,
                         budget_ms = budget.as_millis() as u64,
                         "p2p connect timeout using cached hint; retrying via fresh discovery"
                     );
-                    self.dial_fresh(node_id, id).await?
+                    self.dial_fresh(node_id, id, &trace).await
                 }
-            })
+            }
         }
         .await;
+        if dialed.is_ok() {
+            // A FRESH connection completed its handshake: the establishment
+            // liveness signal meshwatch reads. The refused-dial backoff is
+            // cleared only once a request round-trips (`record_success`) — a
+            // peer that refuses AFTER the handshake completes every dial.
+            establish::note(EstablishEvent::OutboundEstablished);
+        }
 
         match dialed {
             Ok(conn) => {
@@ -2649,6 +3162,11 @@ impl PeerPool {
                     drop(state);
                     leader_guard.disarm();
                     self.opened.fetch_add(1, Ordering::Relaxed);
+                    // Once per freshly-minted trunk, never on a reused one
+                    // (the `state.trunks.get(...)` hit far above this branch
+                    // returns early before reaching here) — see
+                    // `record_kex_telemetry`'s doc comment.
+                    record_kex_telemetry(&conn, "outbound");
                     // Path observability (mandatory per the CCN-preference
                     // spec): classify which transport this trunk's SELECTED
                     // path actually landed on, from iroh's own live per-path
@@ -2697,11 +3215,12 @@ impl PeerPool {
                     same_channel && state.generations.get(&key).copied().unwrap_or(0) == generation;
                 if current {
                     state.inflight.remove(&key);
-                    state
-                        .dial_evidence
-                        .entry(key.clone())
-                        .or_default()
-                        .last_failure = Some(Instant::now());
+                    let evidence = state.dial_evidence.entry(key.clone()).or_default();
+                    let now = Instant::now();
+                    evidence.last_failure = Some(now);
+                    if trace.our_timeout() {
+                        evidence.last_timeout = Some(now);
+                    }
                     let _ = signal.send_replace(Some(Err(shared)));
                 } else if same_channel {
                     state.inflight.remove(&key);
@@ -2727,7 +3246,14 @@ impl PeerPool {
     /// already tried and failed on. Called from `acquire` only after the
     /// cached-hint attempt has already failed/timed out — see `discovery_budget`
     /// for why iroh would otherwise never consult Discovery on its own here.
-    async fn dial_fresh(&self, node_id: &str, id: iroh::EndpointId) -> Result<Connection> {
+    /// Its attempt is recorded in `trace` (the memo short-circuit sends
+    /// nothing and records nothing).
+    async fn dial_fresh(
+        &self,
+        node_id: &str,
+        id: iroh::EndpointId,
+        trace: &DialTrace,
+    ) -> Result<Connection> {
         let now = pool_now_ms();
         // Memo keyed on the CANONICAL endpoint id (available here by
         // construction), never the caller's label — the two planes pass
@@ -2757,9 +3283,8 @@ impl PeerPool {
             m.insert(memo_key.clone(), (now + capped, capped));
         };
         let budget = discovery_budget();
-        match tokio::time::timeout(budget, self.ep.connect(EndpointAddr::new(id), HIVE_ALPN)).await
-        {
-            Ok(Ok(c)) => {
+        match self.connect_once(EndpointAddr::new(id), budget, trace).await {
+            ConnectOutcome::Connected(c) => {
                 let c = UnpublishedConnection::new(c);
                 self.neg_discovery.lock().await.remove(&memo_key);
                 tracing::info!(
@@ -2768,12 +3293,17 @@ impl PeerPool {
                 );
                 Ok(c.publish())
             }
-            Ok(Err(e)) => {
+            // Discovery FOUND the peer and its endpoint refused us: not a
+            // discovery failure (no memo), a refusal (the backoff window).
+            ConnectOutcome::Failed(ConnectFailure::Refused, _) => {
+                Err(self.refused_error(node_id, &memo_key, "connection refused"))
+            }
+            ConnectOutcome::Failed(_, e) => {
                 bump_memo().await;
                 tracing::warn!(node_id, err = %e, "p2p connect error via fresh discovery (giving up)");
-                Err(e.into())
+                Err(e)
             }
-            Err(_) => {
+            ConnectOutcome::TimedOut => {
                 bump_memo().await;
                 self.timeouts.bump(node_id, PHASE_CONNECT).await;
                 tracing::warn!(
@@ -2815,6 +3345,22 @@ impl PeerPool {
                 .last_failure = Some(Instant::now());
         }
         drop(state);
+        // A trunk the peer closed with the fleet overload code was refused
+        // AFTER its handshake (its budget or our endpoint's admission cap was
+        // full): the same "not now" as a pre-handshake refusal, so the same
+        // backoff — otherwise every caller re-dials straight back into it.
+        if acquired
+            .conn
+            .close_reason()
+            .is_some_and(|reason| is_overload_close(&reason))
+        {
+            let node_id = acquired.conn.remote_id().to_string();
+            self.note_refused(
+                &node_id,
+                &acquired.key,
+                "closed as overloaded after the handshake",
+            );
+        }
         acquired
             .conn
             .close(0u32.into(), b"failed acquired trunk evicted by pool");
@@ -3211,26 +3757,11 @@ impl PeerPool {
             }
             send.flush().await?;
             let _ = send.finish();
-            // Response: [u32 len][bytes]. POST-SEND read bounded by the firstbyte
-            // budget so a peer that accepts the stream but never answers can't hang.
-            // Allocation is additionally bounded by this protocol caller's cap.
-            let resp = match tokio::time::timeout(
-                firstbyte_budget(),
-                read_frame_max(&mut recv, response_cap),
-            )
-            .await
-            {
-                Ok(Ok(b)) => b,
-                Ok(Err(e)) => return Err(e.into()),
-                Err(_) => {
-                    self.timeouts.bump(node_id, PHASE_FIRSTBYTE).await;
-                    return Err(anyhow::Error::new(PostSendTimeout {
-                        node_id: node_id.to_string(),
-                        phase: "firstbyte",
-                        budget_ms: firstbyte_budget().as_millis() as u64,
-                    }));
-                }
-            };
+            // Response: [u32 len][bytes], allocation bounded by this protocol
+            // caller's cap, time bounded per phase (`read_response_frame`).
+            let resp = self
+                .read_response_frame(&mut recv, response_cap, node_id)
+                .await?;
             self.record_success(&acquired);
             return Ok(resp);
         }
@@ -3287,21 +3818,89 @@ impl PeerPool {
             send.write_all(proof.as_bytes()).await?;
             send.flush().await?;
             let _ = send.finish();
-            let resp = match tokio::time::timeout(firstbyte_budget(), read_frame(&mut recv)).await {
-                Ok(Ok(b)) => b,
-                Ok(Err(e)) => return Err(e.into()),
-                Err(_) => {
-                    self.timeouts.bump(node_id, PHASE_FIRSTBYTE).await;
-                    return Err(anyhow::Error::new(PostSendTimeout {
-                        node_id: node_id.to_string(),
-                        phase: "firstbyte",
-                        budget_ms: firstbyte_budget().as_millis() as u64,
-                    }));
-                }
-            };
+            let resp = self
+                .read_response_frame(&mut recv, GOSSIP_MAX_FRAME, node_id)
+                .await?;
             self.record_success(&acquired);
             return Ok(resp);
         }
+    }
+
+    /// Read one `[u32 len][bytes]` response frame off a request stream: the
+    /// length prefix under the first-byte budget, then the body in
+    /// [`RESPONSE_CHUNK`] reads each bounded by the IDLE budget — a deadline
+    /// on progress, not on size. It used to read the WHOLE frame inside one
+    /// 15 s first-byte budget, and at the ~170 KB/s a trunk sustains (1200-byte
+    /// PMTU, 64 ms RTT, measured) any snapshot over ~2.5 MB could never
+    /// arrive whatever timeout the caller gave: billing (6.2 MB) and incidents
+    /// (10.9 MB) did not replicate off fc-sanjose for days. The caller's own
+    /// outer timeout stays the wall-clock cap. Shared by every
+    /// request/response mode (gossip, join) so no caller can regress it.
+    async fn read_response_frame<R: AsyncRead + Unpin>(
+        &self,
+        recv: &mut R,
+        cap: usize,
+        node_id: &str,
+    ) -> Result<Vec<u8>> {
+        let mut prefix = [0u8; 4];
+        match tokio::time::timeout(
+            firstbyte_budget(),
+            AsyncReadExt::read_exact(recv, &mut prefix),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => {
+                self.timeouts.bump(node_id, PHASE_FIRSTBYTE).await;
+                return Err(anyhow::Error::new(PostSendTimeout {
+                    node_id: node_id.to_string(),
+                    phase: "firstbyte",
+                    budget_ms: firstbyte_budget().as_millis() as u64,
+                }));
+            }
+        }
+        let len = u32::from_be_bytes(prefix) as usize;
+        if len > cap {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too large").into(),
+            );
+        }
+        let idle = idle_budget();
+        // Grown as bytes arrive: a hostile or corrupt length prefix under the
+        // cap never pre-allocates more than one reservation step.
+        let mut body = Vec::with_capacity(len.min(RESPONSE_PREALLOC));
+        let mut chunk = vec![0u8; RESPONSE_CHUNK.min(len.max(1))];
+        while body.len() < len {
+            let want = (len - body.len()).min(chunk.len());
+            match tokio::time::timeout(idle, AsyncReadExt::read(recv, &mut chunk[..want])).await {
+                Ok(Ok(0)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("response truncated after {} of {len} bytes", body.len()),
+                    )
+                    .into())
+                }
+                Ok(Ok(n)) => body.extend_from_slice(&chunk[..n]),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => {
+                    self.timeouts.bump(node_id, PHASE_IDLE).await;
+                    tracing::warn!(
+                        node_id,
+                        received = body.len(),
+                        expected = len,
+                        idle_ms = idle.as_millis() as u64,
+                        "p2p response body idle timeout"
+                    );
+                    return Err(anyhow::Error::new(PostSendTimeout {
+                        node_id: node_id.to_string(),
+                        phase: "idle",
+                        budget_ms: idle.as_millis() as u64,
+                    }));
+                }
+            }
+        }
+        Ok(body)
     }
 
     pub async fn close_peer(&self, node_id: &str) {
@@ -3604,8 +4203,47 @@ pub async fn bind_full(
     if let Some(lookup) = dht::lookup_from_env(secret.as_ref()).await {
         builder = builder.address_lookup(lookup);
     }
+    builder = builder.crypto_provider(pq_hybrid_crypto_provider());
     let ep = builder.bind().await?;
     Ok(ep)
+}
+
+/// The mesh transport's TLS crypto provider: aws-lc-rs, with `X25519MLKEM768`
+/// (hybrid classical+ML-KEM-768) FIRST in the key-exchange preference list —
+/// so it is the group offered in the initial ClientHello, not merely
+/// negotiable after a HelloRetryRequest round trip.
+///
+/// This OVERRIDES whichever provider the `N0`/`Minimal` preset already
+/// installed (both presets prefer plain `ring` — classical only, zero PQ
+/// offered — whenever `tls-ring` and `tls-aws-lc-rs` are BOTH compiled in,
+/// per `endpoint/presets.rs`'s own doc comment; `hive-p2p/Cargo.toml` keeps
+/// both features on deliberately, for the browser/classical-fallback legs,
+/// which is exactly the "feature unification re-enables ring" trap
+/// `docs/pqc-migration-scope.md` names — so relying on either feature flag
+/// alone, instead of this explicit call, would silently offer zero PQ
+/// protection). The `kx_groups` list is built explicitly rather than trusted
+/// to `default_provider()`'s own ordering (which depends on whether rustls's
+/// OWN `prefer-post-quantum` cargo feature happened to be feature-unified on
+/// by some other crate in the graph — verified present here via this crate's
+/// direct `rustls` dependency, but an explicit list needs no such trust).
+///
+/// A peer that cannot speak `X25519MLKEM768` (an older binary not yet rolled
+/// to this build, or the wasm32 `hive-browser` client, which is `tls-ring`-only
+/// by necessity — aws-lc-rs is a C/BoringSSL library with no realistic wasm32
+/// target) still completes a handshake: TLS 1.3 group negotiation falls back
+/// to the first mutually-supported group in this same list (classical
+/// X25519), automatically, with no coordination or flag day. What actually
+/// got negotiated per connection is never inferred from this function having
+/// run — see `record_kex_telemetry`, the real source of truth.
+fn pq_hybrid_crypto_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.kx_groups = vec![
+        rustls::crypto::aws_lc_rs::kx_group::X25519MLKEM768,
+        rustls::crypto::aws_lc_rs::kx_group::X25519,
+        rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+        rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+    ];
+    std::sync::Arc::new(provider)
 }
 
 /// Build a self-hosted relay map from `HIVE_RELAY_URLS` (comma-separated relay URLs,
@@ -3864,50 +4502,50 @@ pub async fn serve_tunnels_full(
     browser_admission: Option<BrowserAdmissionHandler>,
     browser_crr: Option<BrowserCrrHandler>,
 ) {
-    let conn_limit = match max_inbound_conns() {
-        0 => None,
-        n => Some(Arc::new(tokio::sync::Semaphore::new(n))),
-    };
-    let browser_conn_limit = match max_browser_conns() {
-        0 => None,
-        n => Some(Arc::new(tokio::sync::Semaphore::new(n))),
-    };
     let browser_resources = BrowserInboundResources::new();
+    let budgets = establish::InboundBudgets {
+        fleet: establish::Budget::new(max_inbound_conns()),
+        browser: establish::Budget::new(max_browser_conns()),
+        pending: establish::Budget::new(max_pending_conns()),
+        fleet_peers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        browser_peers: browser_resources.peer_connections.clone(),
+    };
+    establish::register_inbound(&budgets);
     while let Some(incoming) = ep.accept().await {
-        // Unknown/fragmented ClientHello classification consumes the low-trust
-        // browser budget. Letting it consume the fleet budget would give a
-        // hostile client a deliberate route around browser isolation.
-        let proposed_browser = incoming
+        establish::note(EstablishEvent::InboundInitial);
+        // Pre-handshake class from the first Initial's ClientHello. A parsed
+        // ALPN list is charged to its budget as before; an unparseable one
+        // (every hybrid-PQ ClientHello spans two packets) only reaches the
+        // bounded `pending` pool until the NEGOTIATED ALPN decides, below.
+        // Never the fleet budget on a guess: that would hand a hostile client
+        // a route around browser isolation.
+        let class = incoming
             .decrypt()
             .and_then(|d| d.alpns())
             .map(|alpns| {
-                alpns
+                if alpns
                     .filter_map(Result::ok)
                     .any(|protocol| protocol.as_ref() == BROWSER_ALPN)
+                {
+                    ConnClass::Browser
+                } else {
+                    ConnClass::Fleet
+                }
             })
-            .unwrap_or(true);
-        let sem = if proposed_browser {
-            &browser_conn_limit
-        } else {
-            &conn_limit
-        };
+            .unwrap_or(ConnClass::Pending);
         // Never await an exhausted semaphore in the single accept loop: doing
         // so head-of-line blocks every later connection, including fleet trunks.
-        // Excess connections are rejected immediately; no waiter task or
-        // handshake queue can grow without bound.
-        let permit = match sem {
-            Some(sem) => match sem.clone().try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(tokio::sync::TryAcquireError::NoPermits) => {
-                    tracing::warn!(
-                        class = if proposed_browser { "browser" } else { "fleet" },
-                        "P2P connection budget exhausted; rejecting connection"
-                    );
-                    continue;
-                }
-                Err(tokio::sync::TryAcquireError::Closed) => return,
-            },
-            None => None,
+        // Excess connections are rejected immediately (dropping the `Incoming`
+        // answers CONNECTION_REFUSED); no waiter task or handshake queue can
+        // grow without bound.
+        let permit = match budgets.for_class(class).try_acquire() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                establish::note(EstablishEvent::Refused);
+                warn_budget_refusal(class, &format!("{:?}", incoming.remote_addr()));
+                continue;
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => return,
         };
         let local = local_http.clone();
         let trust = trust.clone();
@@ -3917,13 +4555,69 @@ pub async fn serve_tunnels_full(
         let browser_admission = browser_admission.clone();
         let browser_crr = browser_crr.clone();
         let browser_resources = browser_resources.clone();
+        let budgets = budgets.clone();
         tokio::spawn(async move {
-            let _permit = permit;
-            let conn = match incoming.await {
-                Ok(conn) => conn,
+            // The accept — noq handshake AND iroh's unbounded connection
+            // registration — runs under a deadline, so a wedged registration
+            // can never hold this budget slot for longer than that. The
+            // accept goes through `into_0rtt` only to keep a CLOSABLE handle
+            // (nothing is ever sent or read on it before the handshake
+            // completes): dropping the accept future alone would leave the
+            // connection open, because iroh's queued `AddConnection` message
+            // holds its own clone, and the dialer would get a trunk that
+            // completed its handshake and never serves a stream — never
+            // refused, so its backoff never engages. Closed with the overload
+            // code instead, a dialer backs off exactly as on any refusal.
+            let inflight = establish::InflightAccept::start();
+            let pending = match incoming.accept() {
+                Ok(accepting) => accepting.into_0rtt(),
                 Err(_) => return,
             };
-            if conn.alpn() == BROWSER_ALPN {
+            let accepted =
+                tokio::time::timeout(accept_deadline(), pending.handshake_completed()).await;
+            drop(inflight);
+            let conn = match accepted {
+                Ok(Ok(conn)) => conn,
+                Ok(Err(_)) => return,
+                Err(_) => {
+                    pending.close(FLEET_CLOSE_OVERLOADED.into(), b"accept deadline exceeded");
+                    establish::note(EstablishEvent::AcceptStuck);
+                    warn_accept_stuck(class);
+                    return;
+                }
+            };
+            drop(pending);
+            establish::note(EstablishEvent::InboundEstablished);
+            let actual = if conn.alpn() == BROWSER_ALPN {
+                ConnClass::Browser
+            } else if conn.alpn() == HIVE_ALPN {
+                ConnClass::Fleet
+            } else {
+                return;
+            };
+            // Post-handshake: the NEGOTIATED ALPN decides the budget. A
+            // connection admitted under another class (always `pending`, or
+            // a ClientHello offering both ALPNs) moves to its real budget, or
+            // is closed as overloaded when that budget is full; its
+            // pre-handshake slot is released either way.
+            let _permit = if actual == class {
+                permit
+            } else {
+                match budgets.for_class(actual).try_acquire() {
+                    Ok(real) => {
+                        drop(permit);
+                        real
+                    }
+                    Err(_) => {
+                        drop(permit);
+                        refuse_admitted(&conn, actual, "budget exhausted");
+                        warn_budget_refusal(actual, &conn.remote_id().fmt_short().to_string());
+                        return;
+                    }
+                }
+            };
+            record_kex_telemetry(&conn, actual.as_str());
+            if actual == ConnClass::Browser {
                 let remote_id = conn.remote_id().to_string();
                 let admitted = match browser_admission {
                     Some(check) => check(remote_id.clone()).await,
@@ -3951,19 +4645,111 @@ pub async fn serve_tunnels_full(
                 serve_browser_conn(conn, remote_id, browser_resources, browser_crr).await;
                 return;
             }
-            if conn.alpn() == HIVE_ALPN {
-                serve_fleet_conn(
-                    conn,
-                    local,
-                    max_concurrency,
-                    trust,
-                    gossip,
-                    join,
-                    raw_resolver,
-                )
-                .await;
-            }
+            // Per-endpoint admission cap (the browser path's
+            // `BrowserCountGuard` shape): checked only when a NEW connection is
+            // admitted, never by evicting an established trunk.
+            let remote_id = conn.remote_id().to_string();
+            let _peer_connection = match max_conns_per_endpoint() {
+                0 => None,
+                cap => {
+                    match BrowserCountGuard::acquire(budgets.fleet_peers.clone(), remote_id, cap) {
+                        Some(guard) => Some(guard),
+                        None => {
+                            refuse_admitted(&conn, actual, "per-endpoint connection cap reached");
+                            warn_endpoint_cap(&conn.remote_id().fmt_short().to_string(), cap);
+                            return;
+                        }
+                    }
+                }
+            };
+            serve_fleet_conn(
+                conn,
+                local,
+                max_concurrency,
+                trust,
+                gossip,
+                join,
+                raw_resolver,
+            )
+            .await;
         });
+    }
+}
+
+/// Close an ADMITTED (handshake-complete) connection this node has no budget
+/// for, with the overload code a dialer backs off on, and count it.
+fn refuse_admitted(conn: &Connection, class: ConnClass, why: &'static str) {
+    establish::note(EstablishEvent::Refused);
+    let code = match class {
+        ConnClass::Browser => browser_reset::OVERLOADED,
+        _ => FLEET_CLOSE_OVERLOADED,
+    };
+    conn.close(code.into(), why.as_bytes());
+}
+
+/// The budget-exhausted WARN, at most one line per class per 10 s, carrying
+/// the budget's occupancy, the refusals it stands for and the remote (the
+/// address before a handshake, the short endpoint id after one).
+fn warn_budget_refusal(class: ConnClass, remote: &str) {
+    static GATES: [establish::WarnGate; 3] = [
+        establish::WarnGate::new(),
+        establish::WarnGate::new(),
+        establish::WarnGate::new(),
+    ];
+    let gate = &GATES[class as usize];
+    if let Some(suppressed) = gate.admit(Duration::from_secs(10)) {
+        let stats = establish_stats(60);
+        let (in_use, limit) = match class {
+            ConnClass::Fleet => (stats.budget_in_use.fleet, stats.budget_limit.fleet),
+            ConnClass::Browser => (stats.budget_in_use.browser, stats.budget_limit.browser),
+            ConnClass::Pending => (stats.budget_in_use.pending, stats.budget_limit.pending),
+        };
+        tracing::warn!(
+            class = class.as_str(),
+            remote,
+            in_use,
+            limit = ?limit,
+            refused_since_last_line = suppressed + 1,
+            refused_last_60s = stats.refused_window,
+            accept_stuck = stats.accept_stuck,
+            accept_inflight = stats.accept_inflight,
+            "P2P connection budget exhausted; rejecting connection"
+        );
+    }
+}
+
+/// The per-endpoint admission-cap WARN, at most one line per 10 s: one
+/// endpoint key can open any number of connections, each completing a
+/// handshake before it is refused, so an ungated line per refusal is a
+/// journal flood any remote can drive.
+fn warn_endpoint_cap(peer: &str, cap: usize) {
+    static GATE: establish::WarnGate = establish::WarnGate::new();
+    if let Some(suppressed) = GATE.admit(Duration::from_secs(10)) {
+        tracing::warn!(
+            peer,
+            cap,
+            refused_since_last_line = suppressed + 1,
+            "P2P per-endpoint connection cap reached; closing the NEW connection \
+             (established trunks are never evicted)"
+        );
+    }
+}
+
+/// The accept-deadline WARN, at most one line per 10 s.
+fn warn_accept_stuck(class: ConnClass) {
+    static GATE: establish::WarnGate = establish::WarnGate::new();
+    if let Some(suppressed) = GATE.admit(Duration::from_secs(10)) {
+        let stats = establish_stats(60);
+        tracing::warn!(
+            class = class.as_str(),
+            deadline_ms = accept_deadline().as_millis() as u64,
+            stuck_since_last_line = suppressed + 1,
+            accept_stuck_total = stats.accept_stuck,
+            accept_inflight = stats.accept_inflight,
+            accept_inflight_oldest_ms = ?stats.accept_inflight_oldest_ms,
+            "P2P accept exceeded its deadline (iroh connection registration hung, or the remote \
+             kept its handshake alive past it); closed it and released its budget slot"
+        );
     }
 }
 
@@ -4337,6 +5123,22 @@ pub async fn serve_silent(ep: Endpoint) {
 /// it per the configured [`VerifyMode`], run the caller-provided handler, and frame
 /// the response back. The mode byte has already been consumed. `remote_id` is the
 /// QUIC connection's authenticated peer identity.
+/// A gossip response at least this large is BULK (a multi-MB store
+/// snapshot) and is sent below the default stream priority.
+const BULK_RESPONSE_BYTES: usize = 256 << 10;
+
+/// A response sink whose transmit priority can be lowered.
+trait ResponsePriority {
+    /// Let every default-priority stream on the same connection go first.
+    fn deprioritize(&self);
+}
+
+impl ResponsePriority for iroh::endpoint::SendStream {
+    fn deprioritize(&self) {
+        let _ = self.set_priority(-1);
+    }
+}
+
 async fn serve_gossip<R, W>(
     mut recv: R,
     mut send: W,
@@ -4346,7 +5148,7 @@ async fn serve_gossip<R, W>(
     trust: Option<TrustSet>,
 ) where
     R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + ResponsePriority,
 {
     let mut m = [0u8; 1];
     if recv.read_exact(&mut m).await.is_err() {
@@ -4432,6 +5234,13 @@ async fn serve_gossip<R, W>(
         }
     }
     let resp = handler(m[0], path, body, verified_signer).await;
+    // A bulk reply shares the ONE pooled trunk with probes, tunnels and small
+    // gossip; at default priority a follower's `/v1/nodes` probe queued behind
+    // a 10 MB snapshot could time out, and a failed probe closes the trunk
+    // (killing the snapshot pull with it).
+    if resp.len() >= BULK_RESPONSE_BYTES {
+        send.deprioritize();
+    }
     let len = (resp.len() as u32).to_be_bytes();
     let _ = send.write_all(&len).await;
     let _ = send.write_all(&resp).await;

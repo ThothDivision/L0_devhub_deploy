@@ -75,6 +75,89 @@ history).
   double handshakes, `relay_stats()` double-counting, the trunk warmer warming
   only the name-keyed half (leaving the control-plane trunk permanently cold),
   and `close_peer(eid)` unable to evict the edge's name-keyed trunk.
+- **Every inbound accept is bounded, budgeted by its NEGOTIATED ALPN, and
+  never evicts an established trunk.** `serve_tunnels_full` runs each accept
+  (noq handshake + iroh's unbounded `register_connection` round trip through
+  its socket actor) under `HIVE_P2P_ACCEPT_DEADLINE_MS` (default
+  `IDLE_TIMEOUT` + 10 s = 40 s — ABOVE the 30 s idle timeout, the only bound
+  noq puts on a handshake, so an abandoned handshake ends as a handshake error
+  and is never counted); an accept past it is CLOSED with the overload code —
+  releasing its budget slot — and counted as `accept_stuck`. Dropping the
+  accept future alone is not enough: iroh's queued `AddConnection` holds a
+  clone of the connection, so the dialer got a trunk that completed its
+  handshake and never served a stream (never refused, so never backed off);
+  the accept goes through `Accepting::into_0rtt` only to keep a closable
+  handle (nothing is sent or read on it before the handshake completes).
+  Before this the accept task held its permit across that await, so when the
+  iroh actor chain wedged (fc-virginia 09-12 and 09-18, fc-sanjose 09-24) the
+  budget filled with permits of connections that no longer existed and the
+  endpoint answered CONNECTION_REFUSED to the whole fleet for hours (335,055
+  refusals on sj in one day). Pre-handshake the first Initial's ClientHello
+  picks the budget — browser ALPN offered → browser (128), a parsed list
+  without it → fleet (512), UNPARSEABLE → `pending`
+  (`HIVE_P2P_PENDING_MAX_CONNS`, 256) — and after the handshake `conn.alpn()`
+  decides: the connection moves to its real budget or is closed with the
+  overload code (8, `FLEET_CLOSE_OVERLOADED`). Every hybrid X25519MLKEM768
+  dial lands in `pending`: its 1216-byte key share cannot fit one 1200-byte
+  Initial, so noq's ALPN peek fails — and the old `unwrap_or(browser)` filed
+  every PQ fleet trunk under the browser budget. Never charge an unparsed
+  ClientHello to the fleet budget (a hostile route around browser
+  isolation). Fleet connections are also capped per remote endpoint
+  (`HIVE_P2P_MAX_CONNS_PER_ENDPOINT`, 16), checked when a NEW connection is
+  admitted; over the cap the new one is closed. Never "evict the oldest
+  duplicate": during the sj wedge the oldest trunks (va3, phx) were the only
+  working connections. Budget-exhausted and per-endpoint-cap WARNs are
+  rate-limited (one per class, or per cap, per 10 s, with counts and the
+  remote) — one endpoint key can open connections without limit.
+- **A refused dial backs off; a wrong-identity hint loses its addresses.**
+  A dial the peer refuses opens a per-endpoint `refused` window (1 s growing
+  to 30 s — below the 180 s negative-discovery cap): inside it `acquire`
+  fails at once with `PeerRefused` (never `DeadPeerTimeout`, which demotes
+  health), a live trunk is still reused, and a request that round-trips
+  clears it. A pre-handshake CONNECTION_REFUSED names no identity, so one
+  that came through a hint's DIRECT addresses opens the window only once an
+  identity-routed path confirms it — the hint's relay entry, else fresh
+  discovery; a stranger now holding a stale hint's IP must never keep the
+  real peer undialed. A refusal through a relay, a relay-only or bare hint,
+  or fresh discovery, and the post-handshake overload close (proven identity),
+  open it at once. A dial whose handshake fails `UnknownIssuer` reached
+  ANOTHER identity at one of the hinted addresses (sj after its restart: 37
+  such dials to phx in 45 s); the error names no address, so EVERY direct
+  address of that hint (the CCN private candidate and correct public IPs
+  included) is suspended for that endpoint for 10 min and the dial retries at
+  once through the relay (which routes by endpoint id) — but only while the
+  hint HAS a relay entry. A strip that would leave no relay is neither
+  persisted nor applied (that dial falls back to fresh discovery, the next
+  dials use the full set): never let an address filter empty the set (the
+  retain_dialable partition).
+- **A gossip response body is read against IDLE, not a first-byte deadline.**
+  `PeerPool::read_response_frame` (every request/response mode: gossip, join)
+  reads the 4-byte length under `HIVE_P2P_FIRSTBYTE_MS` (15 s) and the body in
+  64 KiB reads each under `HIVE_P2P_IDLE_MS` (45 s); the caller's outer timeout
+  is the wall-clock cap. The whole frame used to be read inside the 15 s
+  first-byte budget, and at the ~170 KB/s one trunk sustains (1200-byte PMTU,
+  64 ms RTT, measured) nothing over ~2.5 MB could ever arrive whatever the
+  caller's timeout: billing (6.2 MB) and incidents (10.9 MB) never replicated
+  off fc-sanjose. A reply of 256 KiB or more is sent at a LOWER stream
+  priority (`serve_gossip`): it shares the one pooled trunk with probes and
+  tunnels, and a follower's probe timing out behind a 10 MB snapshot closes
+  the trunk, killing the pull with it.
+- **Establishment liveness is a number: `hive_p2p::establish_stats`, served
+  on operator-only `GET /v1/mesh/establish`, never on the unauthenticated
+  `/v1/mesh`** (to an outsider it is an exact oracle for the watchdog's
+  arming state and for how close each budget is to refusing). `accept_stuck` (+ `_last_ms`,
+  `_since_inbound_ok`), `accept_inflight` / `accept_inflight_oldest_ms`,
+  `last_inbound_established_ms` / `last_outbound_established_ms` (FRESH
+  connections, never a reused trunk), `*_window` counts over meshwatch's
+  establishment window (10 s buckets, 1 h max), `refused_total` /
+  `outbound_refused_total`, `budget_in_use` / `budget_limit` per class
+  (fleet/browser/pending) and the top-10 `budget_by_peer` (10-hex short
+  ids). NODE-LOCAL (query the node's own admin port with an operator token).
+  On a healthy node `budget_in_use.fleet` tracks the real peer trunks and
+  `accept_stuck` stays near 0 — but not always 0: any remote can keep a
+  handshake alive past the deadline, so it is never restart evidence on its
+  own. A node whose `last_outbound_established_ms` stopped moving while its
+  dials time out and its warm trunks still gossip is the wedge.
 - **UDP over the mesh is RELIABLE and ORDERED, not datagram semantics — a
   deliberate tradeoff, not an oversight.** `read_raw_datagram` /
   `write_raw_datagram` carry each UDP payload as a `[u32 len][bytes]` frame on
@@ -109,6 +192,16 @@ history).
   from the drop line itself. `vendor/` IS synced by the fanout role, so a
   vendored edit made while a roll is between its sync and its build ships
   in that roll — edit vendored crates only between rolls.
+- **A failed iroh rebind must be RETRIED, never left for the next link change
+  (`vendor/iroh` patch "retry a failed rebind").** netwatch closes the old UDP
+  socket before binding the new one, so `failed to rebind ... AddrInUse` (a
+  forked child still holds the old fd, common at load with a pinned
+  `HIVE_IROH_PORT`) leaves the transport Closed — fc-sanjose sat mesh-dark 28 h
+  (`netwatch::udp: socket closed` ~25/s, `isolated: true`). `PendingRebind`
+  retries the closed sockets every 250 ms→5 s. Diagnose from `ss -uanp "sport =
+  :11204"` (no hive-cloud socket = closed) and the journal's `failed to rebind`
+  / `transport rebind recovered` pair; `meshwatch` will NOT catch it on a
+  5-6 peer fleet (open PRD `meshwatch-blind-on-small-live-fleet`).
 
 ## Address lookup: a node can only re-learn an address from a peer it can reach
 
@@ -209,24 +302,177 @@ history).
   every boot, bumping the fleet epoch ~5/min and fencing ~17% of in-flight
   forwards (leader log: 442 rejections/h, always exactly one epoch behind,
   leader itself stable with zero transitions).
-- **Store-sync adoption is WHOLESALE-REPLACE under a per-observer owner
-  election, so an owner flap can churn a fresh leader write away fleet-wide.**
-  `store_sync::REGISTRY`'s leader-pull entries (teams, billing, projects, …)
-  replace the whole store from whatever node the follower's
-  `control_plane_leader()` returns THIS tick, and that computation flaps when
-  a chain candidate's health verdict oscillates (post-roll churn, an
-  overloaded leader, transport failures). Witnessed 2026-08-18: an
-  enterprise plan write landed on fc-sanjose, then spent 40 minutes being
-  reverted to `pro` everywhere — va's transport to sj/bkk was wedged, so va
-  elected itself and served its stale store to every follower electing it,
-  and sj's own pull could have reverted sj too. Two operational rules fall
-  out: (1) a critical write must land on EVERY owner-chain candidate (the
-  idempotent PUT retried across the flap epochs covers each), never just
-  the moment's leader; (2) a node serving everyone else from its stale store
-  because ITS pulls fail is a transport-wedge signature (zero
-  `follower-sync: adopted` lines + `mesh transport is failing against live
-  peers` in the journal) — restart the node's hive-node, exactly the
-  meshwatch remedy; with `KillMode=process` containers survive it.
+- **Store-sync adoption is WHOLESALE-REPLACE, so it happens ONLY from an
+  owner every node agrees on, and every failed pull is loud.**
+  `store_sync::REGISTRY`'s leader-pull entries (billing, incidents, apikeys,
+  …) replace the whole store from whatever node the follower's
+  `control_plane_leader_with_source()` returns this tick, gated by
+  `OwnerSource::may_adopt_wholesale_from`: only the chain HEAD (`chain[0]`)
+  or, on a chain-less mesh, the identity election. A BACKUP chain owner is the
+  owner only in the views of observers that currently miss the head — and with
+  differing per-node chains may not even own in its own view (phx/va3 with
+  `[sj,bkk,va]` resolving fc-virginia, whose chain omits itself) — and an
+  `OwnerSource::Fallback` answer is a forwarding guess; from either only the
+  per-row `MERGE_STORES` are pulled and NOTHING is adopted wholesale
+  (fc-virginia adopted fc-phoenix's stale stores wholesale on 2026-09-24).
+  During a failover followers therefore serve stale wholesale stores until the
+  head returns or the signed lease (CS-3/CS-4) can attest the backup's
+  digests. A failed snapshot fetch is never a silent `continue`:
+  `StorePullFailures` counts per (leader, store), WARNs per store (leader,
+  store, elapsed ms, at most once per 5 min) and every 10 consecutive failures
+  opens (deduped) one "store replication from <leader> failing: <store>"
+  incident, resolved on the next success; a tick where EVERY store failed is
+  one link-level WARN and one "…: every store" incident instead of ~25; a
+  change of leader, or this node becoming the owner, resolves everything
+  recorded against the previous leader. Those incidents live in the
+  follower's own store, which the next wholesale `incidents` adoption
+  replaces — the WARN lines are the durable signal (billing and incidents did
+  not replicate off fc-sanjose for days with nothing in any log). The pull is
+  `store_follower`: its own supervised loops, never behind a GuardianDB or
+  relational SQL await (it ran inside the relational mirror loop, after
+  `relational::sync_deployments`, whose guardian SQL open has no bound —
+  canonical replication gated on the mirror). `store-follower-sync` fetches
+  the small stores concurrently every `HIVE_STORE_SYNC_SECS` (60);
+  `store-large-lane` pulls LARGE stores one at a time in its own task, so the
+  small cadence never waits on a multi-minute transfer, and holds off while
+  the last batch failed every store (the link is down). A store is large while
+  its size — local copy or the last snapshot a peer served — is over 1 MiB
+  (billing, incidents, audit: pulled at most once per 5 min after a success,
+  retried after 60 s after a failure), or while SUSPECT: its batch fetch ran
+  out the whole 10 s budget while other stores fetched (the only size signal
+  before any size is known; pulled every lane round until a pull settles its
+  size). Any other batch failure stays in the batch and retries next tick.
+  How a snapshot crosses a trunk is ONE primitive for every caller
+  (`store_sync::fetch_snapshot` / `fetch_budget`, the follower pull and
+  `reconcile_on_promotion` alike): ≤1 MiB → 10 s and 16 MiB; larger → the
+  time its size plus 25 % takes at 64 KB/s plus 30 s, floored at
+  `HIVE_STORE_SYNC_LARGE_TIMEOUT_SECS` (240), with a 64 MiB bound — never a
+  fixed budget a growing store (incidents has no retention) outgrows into a
+  permanent failure. A pull that outlives the owner it was resolved for is not
+  adopted, and promotion reconcile never adopts a wholesale store whose local
+  copy changed during its fetch window (that would drop an already-200'd
+  write). Eight concurrent pulls on one ~170 KB/s trunk only split its
+  bandwidth. Two
+  operational rules still hold: (1) a critical write must land on EVERY
+  owner-chain candidate (the idempotent PUT retried across flap epochs covers
+  each), never just the moment's leader; (2) a node serving everyone else from
+  its stale store because ITS pulls fail is a transport-wedge signature (zero
+  `follower-sync: adopted` lines, the per-store or every-store FAILED WARNs,
+  `mesh transport is failing against live peers`) — restart the node's
+  hive-node, exactly the meshwatch remedy; managed databases survive it
+  (`KillMode=process`) and the boot reap replaces the previous boot's cells.
+
+## Control-plane ownership and leader-only background jobs
+
+- **With `HIVE_CP_OWNER_CHAIN` set, the owner is the first chain entry
+  PRESENT in `registry.nodes()` with a `peer_id` and a public address — never
+  the observer's `healthy` flag, never the identity election.**
+  (`Cluster::strict_chain_owner` / `control_plane_owner_with_source`.)
+  Gossip presence through any relay proves the process is alive and writing;
+  a transport-only fault between one observer and the owner must not demote
+  it — that per-observer demotion is what made fc-virginia elect itself (121
+  owner changes a day) while fc-sanjose never stopped serving. No qualifying
+  entry = `None` = HOLD (WARN at most once per 5 min): no node treats itself
+  as owner, forwarded writes answer the retryable 503 (`admin_forward_to_leader`
+  fails closed, `forward_mutation_to_leader` answers 503). `HIVE_CP_LEADER`,
+  `HIVE_DNS_LEADER_NODE` and `HIVE_BILLING_COORDINATOR_NODE` are ignored while
+  a chain is set (one WARN at boot). The chain must be identical fleet-wide
+  and made of live public servers.
+- **`control_plane_leader()` returns `Option<String>` and never falls back to
+  this node.** It is the REQUEST-PATH forwarding target: the strict owner,
+  else the first present chain entry that is not this node (a guess that is
+  never observed as an owner or adopted from), else `None`. Every caller
+  handles `None` — reads serve their local best effort, writes answer a
+  retryable 503. Only a chain-less (dev) mesh still resolves to itself when
+  nothing is electable. `is_control_plane_leader()` (request path: serve a
+  mutation locally) is `owner == me && !isolated` on an authoritative owner.
+  Every request-path read proxy and owner-forward asks ONE question,
+  `CloudState::leader_forward_target()` (the owner when it is ANOTHER node,
+  resolved once; `None` = serve locally or 503) — never a hand-rolled pair of
+  `is_control_plane_leader()` / `control_plane_leader()` calls, which resolve
+  twice and can fetch from themselves when the answer flips in between.
+- **Automated incidents dedup at the primitive.** `IncidentStore::open`
+  returns (and touches, no timeline entry) an UNRESOLVED incident with the same
+  title and `affected` set instead of opening another, under one write lock;
+  only the operator's `POST /v1/incidents` uses `open_new`. The node-death
+  self-heal opened 3.4k–12.5k duplicates per node per day, and edge-triggered
+  openers (DNS "delegation held") re-armed on every leadership edge.
+- **Every leader-only BACKGROUND job asks exactly one question:
+  `leadership::may_act(cloud, Job)`.** Owner (above; without a chain, a node
+  with a mesh roster — `HIVE_EXPECTED_NODE_IDS`, else `HIVE_TRUSTED_NODE_IDS`
+  — HOLDS with one ERROR instead of electing, and only a roster-less dev mesh
+  keeps the election/pins) AND a FRESH view (one gossip round completed since
+  boot: a booting backup's empty registry otherwise names itself the strict
+  owner) AND not isolated AND, for a BACKUP owner only (not `chain[0]`), fresh
+  direct contact with a strict majority of `HIVE_CP_VOTERS`
+  (`CloudState::direct_contact_ids`: an outbound dial/trunk success or an
+  inbound self-report, never relayed gossip; this node counts when it is a
+  voter) AND all of that CONTINUOUSLY for `Job::min_tenure()` (relocate 600 s,
+  ACME and HTTP-01 300 s, billing 120 s, DNS and git poll 60 s, others 30 s;
+  sampled every 3 s by the cluster loop, any lapse resets it, so a returning
+  or re-quorate owner waits its tenure while a backup that acted meanwhile
+  sees it and stops). The chain HEAD acts on presence (design CS-1 1b): a
+  quorum on the head turned "present through relays, short of direct reach"
+  into a writer nobody replaces. Voters must be set identically fleet-wide
+  (public servers, odd count — the ansible template renders
+  `hive_cp_voters`); unset while a chain is set logs one ERROR and drops the
+  quorum term (voters derived per observer from differing chains are not a
+  quorum). Boot logs the effective voter set once. Each change of the answer
+  is logged per job (`leader-only job acquired` / `not acting`, reason, term,
+  rate-limited to a line a minute). The jobs: node-death relocate, git poll,
+  billing meter (+ the relational billing projection, the token-mint
+  enterprise lock and `billing_authority_node` reads, via
+  `leadership::job_owner`), Vercel DNS, ACME DNS-01, custom-domain HTTP-01
+  (its own `Job::AcmeHttp01`, designated exactly like the `acme_http01`
+  store's writer — on a chain-less mesh the DNS pin must not move it), domain
+  verify/pin, push dispatch (+ the fleet VAPID keypair), inference env
+  injection, guardian reap, relational project/team backfills, browser
+  admission/presence expiry, listener-audit incidents. A new leader-only loop
+  adds a `Job` variant — never its own leadership test. Two
+  leader-coordinated surfaces do NOT use it yet: the cron loop (fires every
+  node's local jobs) and raw-port allocation (request path, leader-local
+  `raw_ports.json`) — each needs a replicated store before a stricter gate
+  can move its writer safely.
+- **Take-over work keys on the ownership TERM, never on a `may_act` edge.**
+  `leadership::check` returns a `Verdict` whose `term` identifies this node's
+  ownership run; a lapse of the other preconditions shorter than
+  `leadership::TERM_LAPSE` (30 s, the gossip freshness window — the earliest
+  another node can have seen this one gone and taken over) keeps the term, a
+  longer one starts a new term when they hold again. The DNS reconciler's
+  `begin_tenure` / "took leadership" and its hold-incident re-arm fire once
+  per term. The promotion reconcile is not a `may_act` job at all: it is the
+  preamble to taking writes, so it runs on the first tick
+  `is_control_plane_leader()` holds in an ownership run, and again only after
+  that authority lapsed for `TERM_LAPSE` or longer — a quorum or brief
+  isolation blip on a steady owner is not a promotion, and re-running it then
+  could adopt followers' stale wholesale copies over writes accepted since.
+- **What this gate cannot resolve: an owner that is present but cannot act.**
+  A backup short of a voter majority, or an isolated head, is still the owner
+  in every other node's view, so every leader-only job HOLDS fleet-wide until
+  it recovers or disappears from gossip. That is the designed direction (hold,
+  never two writers); only the signed control-plane lease (CS-3) can expire
+  such an owner. Fix a stuck hold by restoring the owner's transport or its
+  voters, never by weakening the gate.
+- **Before a roll, verify `HIVE_CP_OWNER_CHAIN` and `HIVE_CP_VOTERS` are
+  identical on every node, in the RUNNING process** (`/proc/<pid>/environ`,
+  never the unit file — a drop-in overrides it, the Seer lesson). A chain
+  that differs per node makes a backup the owner in some views only; the
+  wholesale-from-head rule keeps followers from adopting its stores, but its
+  leader-only jobs still run wherever it owns in its own view.
+- **Node-death self-heal is OFF unless `HIVE_NODE_DEATH_SELF_HEAL=1`.** A
+  follower whose own view flapped to "leader" and "host unhealthy"
+  redeployed a live node's 22 production projects 1512 times in 10 h on
+  2026-09-24. Enabled, it needs `may_act(NodeDeathRelocate)`, the host ABSENT
+  from `registry.nodes()` continuously for 10 min measured from this node's
+  first observation of the absence (never the row's `updated_ms`) with its
+  last gossip also 10 min old, no attempt for the same (project, host,
+  commit) in 6 h and fewer than 3 relocations from this node in the trailing
+  hour; its incident is deduped by `IncidentStore::open` (one per project and
+  host, never one per attempt). Absence clocks start only from a FRESH view
+  (`leadership::view_is_fresh`: a gossip round done, not isolated, a voter
+  majority when voters are set) and are discarded whenever the view is not
+  fresh — a node that cannot hear the fleet sees every host as gone. Boot logs
+  `node-death self-heal disabled` exactly once when off.
 
 ## Secrets
 
@@ -252,13 +498,60 @@ history).
   back" to control-group.** Rootful podman's conmon inherits the CALLER's
   cgroup, so with the default KillMode every `systemctl restart hive-node`
   SIGTERMs the whole service cgroup — every managed database container and
-  every tenant cell on the node dies with each fleet roll. Witnessed
+  Supabase stack on the node dies with each fleet roll. (Serverless CELLS do
+  not rely on surviving a restart: the next boot reaps the previous boot's
+  cells and cold-starts fresh ones — next bullet.) Witnessed
   2026-08-18: two live Supabase stacks 502'd right after a roll, postgres
   logging "received smart shutdown request" in the same millisecond as the
   unit stop. dockerd/containerd run KillMode=process for exactly this
   reason. The db-reconcile loop is the belt-and-braces half: it restarts
   exited backing containers and rebuilds vanished Redis/Supabase members
   from their records every 60s.
+- **The price of `KillMode=process` is that tenant CELLS outlive the process
+  that owns them, so every boot reaps its own previous boot's cells.** Nothing
+  adopts a running cell, and the lock sweep removes only exited ones, so each
+  restart used to add one more running instance of every stateful project on
+  the same named volume (fc-sanjose 2026-09-24: 511 `hive-cell-*`, 64
+  minecraft servers writing `hive-vol-minecwaft`, inotify 132/128, locks
+  under the floor). `podman_run_container` labels every cell `hive.owner`
+  (a stable hash of the node name and canonical `$HIVE_DATA`: the same across
+  restarts of one node, different for every other hive-cloud process on the
+  host), `hive.boot` (per-process id), `hive.cell` and an informational
+  `hive.node`. **Ownership is owner + boot, never boot alone:** a cell of
+  another owner (co-hosted dev nodes, a hermetic e2e/acceptance node started
+  on a fleet host) is NEVER touched, only WARNed; a label-less legacy cell is
+  removed only where this process is the host's sole supervised instance
+  (`INVOCATION_ID` set, i.e. systemd) or under `HIVE_CELL_ORPHAN_REAP_LEGACY=1`
+  (`=0` keeps them). `hive_backend::reap_orphaned_cells` is spawned in
+  `main()` right after backend selection; boot waits only for its URGENT half
+  — listing plus the SIGKILL of duplicate writers — at most 20 s, right before
+  Fluid can cold-start anything, while the graceful stops, removals and a
+  confirming re-list finish in the background (never `hive-sbx-*`,
+  `hive-db-*`, Supabase or anything without the prefix;
+  `HIVE_CELL_ORPHAN_REAP=0` opts out). On a volume with two or more live
+  writers every stale one is SIGKILLed — a SIGTERM makes each duplicate flush
+  its older state over the volume — except, when no current or foreign writer
+  shares it, the NEWEST stale writer, which gets `podman stop -t 10` after the
+  kills so the freshest state is the last flush; a sole writer and every
+  stateless cell get `stop -t 10`; removal is always `rm -f -v`, so the named
+  `hive-vol-*` survives. Mutating podman calls never carry `kill_on_drop`.
+  Until a confirmed reap has also kept no legacy cell, every launch mounting a
+  `hive-vol-*` runs `guard_volume_single_writer` in a DETACHED task (a dropped cold start must
+  not SIGKILL `podman rm` halfway): a live — running, paused or still
+  STOPPING — stale cell on that volume is stopped and removed by the same rule,
+  and the launch FAILS with a `NodeBackendUnavailable` node fault if one is
+  still live 20 s later; a listing that fails is WARNed and the launch
+  proceeds. `podman ps` output this code cannot parse, or that the plain `ps
+  -q` listing contradicts, is a SKIPPED reap (WARN), never "nothing leaked".
+  Journal line: `cell orphan reap: reaped=N per_volume={..}` (WARN with
+  survivors, foreign and legacy-kept counts whenever anything is not clean).
+  `orphan_reap_ran()` is true only once a re-list confirms no stale cell (nor
+  permitted legacy one) is left; it stays false while the reap runs, when it
+  was skipped, when a stale cell survived, when opted out, and ALWAYS on macOS
+  nodes, whose Apple `container` cells are neither labelled nor reaped — no
+  restart-based remedy may fire automatically on a node where it is false.
+  A launchd phantom respawn (two processes, one node, one `$HIVE_DATA`) is the
+  one shape the owner label cannot tell apart.
 - **The graceful stop must finish under systemd's timeout, and five
   invariants keep it there.** (1) A `persist::persist()` arriving after
   `flush_blocking` has closed admission is REFUSED, never blocked:
@@ -409,6 +702,19 @@ hard-resets the host (previous section), so the only remaining fallback was
 builds `litebox_runner_linux_userland` from a pinned commit; litebox ships no
 releases).
 
+- **A runner-binary deploy must strip `/proc/<pid>/exe`'s `" (deleted)"`
+  suffix before comparing paths, or the boot-time orphan reaper goes blind.**
+  `LiteboxBackend::reap_orphaned_runners` SIGKILLs any process whose exe is
+  the runner binary, but replacing that binary (every deploy: Linux refuses
+  an in-place overwrite of a running executable, `ETXTBSY`, so the role and
+  every ship script `mv` a new file onto the path) unlinks the orphan's OLD
+  inode while it is still mapped, and the kernel appends `" (deleted)"` to
+  that orphan's readlink from then on — a plain string comparison silently
+  stops matching exactly the orphans a binary swap creates. Confirmed with
+  `cp`+`mv -f` over a running process (the readlink target gains the
+  suffix); witnessed live on fc-phoenix (two orphans, ~48% of a core each,
+  nearly an hour) and fc-sanjose (`reaped=7` on the next restart after this
+  fix). `strip_deleted_exe_suffix` undoes the annotation before comparing.
 - **Two-tier verification, same shape as PVM.** `LiteboxBackend::is_supported()`
   (Tier 1, existence-only) gates `--litebox-probe` (Tier 2, bring-up only,
   never on a node carrying traffic — mirrors `pvm_run_smoke_test`'s gating
@@ -529,6 +835,23 @@ releases).
   leader's listener and the public round-robin host: 101, first frame is the
   prompt, `TERM_OK_42` before the next prompt, `{"type":"exited",
   "exit_code":0}` on `exit`.
+- **The shell rc also answers "command not found" WITHOUT forking
+  (`litebox-shellrc.sh`, an `extdebug` DEBUG trap running `command -v` in the
+  parent).** Interactive bash forks before it looks a command up, and under
+  litebox's fork emulation that child dies `Fatal error: glibc detected an
+  invalid stdio handle` and wedges the session (`ifconfig`, 2026-09-22) — so a
+  command that is not staged must never reach bash's own not-found path. Keep
+  the guard's failure direction safe: it only skips a command it PROVED absent
+  (`command -v` empty), leaves quoted/expanded first words alone, and is
+  installed only when `$BASH_VERSION` is set and `/dev/null` is a char device.
+  It does not cover `sh -c` (no rc is read; adding a trap there also defeats
+  bash's exec-the-last-command optimization). It is a BELT for runners without
+  `ansible/roles/litebox/files/fork-inplace.patch`: the wedge itself (a second
+  external command, any not-found command) was the native-Linux `fork()` copying
+  the guest's memory at relocated addresses and running the child on a mix of
+  its own and the parent's libc (`litebox-fork-child-corruption`); a runner built
+  with that patch forks in place and needs no guard. Drop the rc guard once every
+  litebox node runs the patched runner (`$?` would then be 127 again).
 - **A TUN device has ONE owner, so every exec and shell runner gets its
   own link; the cell's provision-time link serves only the function
   process.** litebox attaches with `TUNSETIFF`, and a second runner on the
@@ -697,6 +1020,32 @@ releases).
   fingerprints newer than the fresh sources — cargo then silently skips
   rebuilding the changed crate. If a just-rolled node still runs old behavior,
   `touch` the synced sources before rebuilding.
+
+## Post-quantum mesh transport (hybrid X25519MLKEM768)
+
+- **The mesh QUIC transport offers hybrid PQ key exchange first; transport
+  IDENTITY stays classical.** `hive_p2p::bind_full` and GuardianDB's own
+  separate endpoint (`vendor/guardian-db/.../core/mod.rs`) both explicitly
+  call `.crypto_provider(...)` with `kx_groups = [X25519MLKEM768, X25519,
+  SECP256R1, SECP384R1]` — mandatory, never optional: iroh's `N0`/`Minimal`
+  presets prefer plain `ring` (zero PQ) whenever both `tls-ring` and
+  `tls-aws-lc-rs` are compiled in, which they now always are workspace-wide
+  (Cargo feature unification). `hive_p2p::pq_kex_stats()` /
+  `GET /v1/relay`'s `pq_kex` block report the REAL negotiated group per
+  connection (`noq_proto::crypto::rustls::HandshakeData`) — never infer PQ
+  protection from a config flag. A peer that cannot speak MLKEM768 (an
+  unrolled binary, or `hive-browser`, permanently `tls-ring`-only —
+  aws-lc-rs's C cryptography has no `wasm32-unknown-unknown` target) still
+  connects via automatic TLS group fallback, live-verified both directions
+  (hybrid↔hybrid and forced-classical↔hybrid) with `crates/hive-p2p/src/
+  bin/p2p_demo.rs`. **Never claim "ML-DSA transport identity" or "post-
+  quantum identity" anywhere** — `iroh::EndpointId` is still a 32-byte
+  ed25519 key; ML-KEM is key-exchange only. Public dashboard/API HTTPS, DB
+  gateway TLS and the relay binaries' own outer TLS stay on the process-wide
+  `ring` default (`rustls::crypto::ring::default_provider().install_default()`
+  in main.rs/acme.rs) — deliberately, for external-client compatibility, not
+  an oversight. Full reasoning: `docs/security-architecture-audit-2026-09-22.md`,
+  `docs/pqc-migration-scope.md`.
 
 ## Geo-DNS (Seer)
 
@@ -1581,6 +1930,14 @@ The exchange itself (bn-browser-fleet-crr-exchange, landed):
 - **The coordinator stamps `target` before fanout** whenever it can resolve
   the environment; remote nodes must never classify against their own
   node-local `production_branch` (never forwarded, and historically wiped).
+- **The deployment ledger's checksum is verified over the payload bytes AS
+  STORED (`RawValue`), never over a re-serialization of the decoded struct.**
+  Re-serializing makes every field added anywhere in the payload, even a
+  `#[serde(default)]` one, change the bytes, so the previous binary's ledger
+  fails closed on the next (fc-phoenix, 2026-09-18: 21,679 crash-loop restarts
+  on an intact file). A ledger rewritten with `integrity_chain` should be
+  expected to fail a binary that predates that field: never roll a node back
+  past it. Detail: `recall("deployment-ledger-checksum-raw-bytes")`.
 
 ## Compose published ports (`ports: ["9000:9000"]`)
 
@@ -1635,19 +1992,128 @@ is pre-opened); a migrated port is quarantined, never re-granted. Full detail:
 
 ## Mesh watchdogs & dial discipline (post-2026-08-17-incident shape)
 
-- meshwatch has TWO triggers: continuous total isolation (600s) and
+- meshwatch has THREE triggers: continuous total isolation (600s),
   CUMULATIVE degradation (visible < expected/4 for ≥20 of 30 min AND degraded
   now AND ever-CONVERGED this process AND the fleet still gossip-AUDIBLE —
   the last guard is what distinguishes "my transport wedged" from "the fleet
-  is genuinely down", where a restart conjures nothing). The effective
-  trigger carries a per-node FNV stagger (0-10 min) so a shared onset can
-  never bounce the fleet — or all three control-plane leaders — in one tick.
+  is genuinely down", where a restart conjures nothing), and
+  `establishment_wedge`. The effective trigger carries a per-node FNV stagger
+  (0-10 min) so a shared onset can never bounce the fleet — or all three
+  control-plane leaders — in one tick.
+- **`establishment_wedge` reads the transport's counters, never peer
+  counts** — the first two cannot see a wedge that only blocks NEW
+  connections (warm trunks keep every count up; on a 26-expected fleet with
+  ~6 live peers `ever_converged` is unreachable), which is how sj sat wedged
+  10.5 h. Its evidence must be something no remote sender can forge: (a) no
+  fresh connection in either direction for `HIVE_MESH_ESTABLISH_WEDGE_SECS`
+  (300) while dials from here to ≥2 distinct peers TIMED OUT in that window,
+  or (b) ≥3 accepts closed at the accept deadline with zero successful
+  accepts AND outbound dead too (attempts, none established, ≥1 timed out).
+  A counted peer reached this node DIRECTLY inside the direct-freshness
+  window (its own self-report, never a relayed copy), and a counted failure
+  is only a connect that ran out its budget here (`PeerDialEvidence::
+  last_timeout_ago`): a refusal proves our setup works, a negative-discovery
+  short-circuit sends nothing, and a peer's own wedge completes our
+  handshakes (its accept hangs), so none counts — restarting the dialer of a
+  wedged peer (fc-virginia) was the remedy that changed nothing. Stuck
+  accepts alone only WARN: any sender can hold a handshake open past the
+  deadline, and a trigger armed by inbound counts or bare refusals lets the
+  internet restart the fleet (each restart reaps every tenant cell). Then:
+  uptime ≥10 min, ≥1 audible peer, the
+  evidence held for the node's stagger, and the shared restart gates below.
+  `HIVE_MESH_ESTABLISH_WEDGE_RESTART=0` = WARN only.
+- **Every automatic restart passes ONE chokepoint: `ControlledRestart::
+  request` → `RestartReason::admissible`.** Every reason but memory pressure
+  (which the kernel ends anyway) is refused until `hive_backend::
+  orphan_reap_ran()` confirms this boot's cell reap — a restart without it
+  adds one more writer per stateful tenant volume; false on macOS and with
+  `HIVE_CELL_ORPHAN_REAP=0`, so those nodes only WARN, for every mesh trigger.
+  Each reason's rate cap lives in `RestartReason::rate_cap`
+  (`establishment_wedge`: 1 per 6 h; the isolation/degradation triggers
+  re-arm only after the new process converges, so they carry none). A
+  refused request WARNs (once per 5 min per reason) and the trigger keeps
+  watching — a trigger must never `return` on a refusal. Never add a restart
+  path that skips `request`.
+- **Every controlled restart records its reason where the next boot reads
+  it, and the cap counted from it fails CLOSED.** `ControlledRestart::request`
+  stamps the reason into the run marker the moment it is requested
+  (`restart_audit::note_controlled_restart`), so the next boot's
+  `restart_history.json` record carries `reason` even when the graceful tail
+  dies on its hard deadline; per-reason rate caps count it there
+  (`controlled_restarts_within`), never in memory. The count is refused
+  (the cap treated as exhausted) when the history existed but could not be
+  read or parsed at boot (set aside as `restart_history.corrupt-<ms>`), when
+  this boot's record could not be written, or while the latest run-marker
+  write failed — a full data dir must not turn the cap into a restart loop.
+  A rollback to a binary predating `RestartRecord::reason` rewrites the
+  history without it: after the roll-forward earlier restarts count as none
+  (at most one extra capped restart, once).
 - PeerPool: `warm()` honors per-peer exponential backoff (5s→5min, cleared on
-  success; request-driven `acquire` always dials); `dial_fresh` keeps a
+  success); request-driven `acquire` always dials EXCEPT inside a refused-dial
+  window (1s→30s, the peer's own "not now"); `dial_fresh` keeps a
   negative-discovery memo (30s→180s cap, keyed on the canonical endpoint id,
   cleared on success) so dead peers stop burning the discovery budget healthy
   peers need. The caps are deliberately LOW: nothing is un-dialable for more
   than three minutes — the retain_dialable partition lesson in code form.
+- **A gossip round never waits on a dead peer, and one stale reading never
+  withdraws one.** Every relayed `last_seen_ms` a node holds is only as fresh
+  as its round is short, so the round ends at `HIVE_GOSSIP_ROUND_DEADLINE_MS`
+  (8000) instead of `join_all` over every target. The fan-out is ONE
+  primitive, `bounded_round::BoundedRound`, used by the gossip loop AND the
+  health prober (whose round waits `health::probe_deadline()`, 2 ×
+  `HIVE_HEALTH_TIMEOUT` + 1 s — one failing peer's ~28 s probe held every
+  probe round, its restore hysteresis and every other verdict under
+  `join_all`): each target runs in its own task under a per-target in-flight
+  flag (never dispatched twice at once), a round waits only for ITS OWN
+  targets (never for an earlier round's straggler — a target slow every time
+  would pin every round to the deadline), a straggler's result lands in
+  whichever round receives it, and `bounded_round::Completion` reports on
+  drop too, so a panicking task cannot strand its flag. New periodic fan-outs
+  use it, never a hand-rolled `join_all`. A slow sync is LATE, never absent:
+  the gossip loop keeps each target's last answered `PeerSync` and folds it
+  while the next one is in flight and the node is still in the registry
+  (`round_contributions`), so holders (the lease HRW set), routes, fleet
+  deployments and the zkauth roster (swapped whole by
+  `zkauth::set_peer_exports`) never drop a live peer on a slow round; a
+  failed target contributes nothing, as before; contributions are one per
+  NODE, newest round first (a seed is gossiped as `seed:<eid>` and `<eid>`).
+  A target with no successful sync by us AND no gossip of it in the registry
+  for 10 min is dialed on a 1 → 3 min backoff (`gossip_round::Rounds`) — but
+  only while this node's own view is fresh (some target answered within
+  `gossip_round::VIEW_FRESH_MS`, 60 s): a node that reaches nobody sees every
+  target silent, including the seeds that are its only way back, so from a
+  blind view nothing is dead, every target is dialed every round, and the
+  first answer after a blind stretch clears every backoff. A peer anyone
+  still hears is never backed off (a URL target resolves "heard" through the
+  node id it last answered as — its transport mapping is evicted on the first
+  failure), the backoff gates only the gossip loop's own dispatch, never
+  `acquire`, and its 3 min cap keeps the bound above. The mesh join is
+  skipped when that round's announce DIAL failed
+  (`gossip::FetchOutcome::Unreachable`: budget elapsed, connect-phase
+  `DeadPeerTimeout`, `PeerRefused`) — it dials the same key through the same
+  `acquire`, and a trust refusal happens after the connection is up — and a
+  target reached by nothing skips its remaining reads. `health::demote`
+  withdraws a peer only once its gossip was stale at the end of
+  `DEMOTE_STALE_ROUNDS` (2) consecutive rounds (`health::note_gossip_round`;
+  before that the outcome is `Deferred`, marked cold only), and HOLDS the
+  same way while the gossip loop has stopped ending rounds
+  (`gossip_round::stalled`, monotonic: before its first round, a
+  whole-runtime freeze, a dead loop — this node's registry is not being
+  refreshed, so every peer looks stale from it; `NodeRegistry::nodes()`'s
+  30 s cutoff still removes a peer nobody gossips); the first round after a
+  stall restarts the consecutive count. Witnessed 2026-09-24: a powered-off
+  seed cost fc-virginia 4 serial 5 s dials per round (announce twice, join
+  twice), its round ran 25-33 s, and fc-sanjose — heard by three other nodes
+  throughout — aged past `GOSSIP_ALIVE_MS` and was demoted 57 times. Every
+  10 min the loop logs `gossip rounds (last 10 min)` with the START-TO-START
+  round period p50/p99 (collect + post-round work + `ROUND_SLEEP` — the
+  interval that ages a relayed `last_seen_ms`), the deadline-capped collect
+  phase and per-target resync interval p50/p99, deadline hits, stragglers
+  and backed-off targets, and WARNs when `GOSSIP_ALIVE_MS < 2 × p99 round
+  period + health::probe_period_bound()` (the prober's bounded round, not the
+  bare interval) — a collect-phase p99 is capped by the deadline and proves
+  nothing. The same figures are `gossip_rounds` in `GET /v1/mesh/health-guard`
+  (node-local).
 - The rollout re-kicks the first THREE serial batches after the fleet
   settles: the earliest-restarted nodes form trunks against a fleet that then
   bounces behind them, and the measured incident wedged exactly that trio.

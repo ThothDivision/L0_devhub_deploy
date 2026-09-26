@@ -138,8 +138,7 @@ async fn edge_pipeline_inner(
         // token. Proxy the lookup to the leader rather than fail-validating
         // every issuance ~13/14 of the time (adversarial finding). Unknown
         // token everywhere = flat 404, no existence leak.
-        let leader = cloud.control_plane_leader();
-        if leader != cloud.node_name {
+        if let Some(leader) = cloud.leader_forward_target() {
             if let Some(ip) = cloud
                 .registry
                 .nodes()
@@ -518,9 +517,8 @@ async fn edge_pipeline_inner(
     // local candidate by the same `(production, created_at_ms)` ordering
     // `set_alias_if_newer` uses locally, so a preview can never pre-empt a
     // production deploy this node DOES hold correctly.
-    let local_is_stale = serve_local
-        && matches!(local_state, Some(fluid_core::DeployState::Ready))
-        && {
+    let local_is_stale =
+        serve_local && matches!(local_state, Some(fluid_core::DeployState::Ready)) && {
             let local_rank = cloud
                 .gw
                 .deployment_for_host(&host)
@@ -535,7 +533,10 @@ async fn edge_pipeline_inner(
                     .filter(|d| {
                         [&d.alias, &d.commit_alias, &d.branch_alias, &d.id_alias]
                             .iter()
-                            .any(|a| a.eq_ignore_ascii_case(&host) || a.split('.').next() == Some(sub.as_str()))
+                            .any(|a| {
+                                a.eq_ignore_ascii_case(&host)
+                                    || a.split('.').next() == Some(sub.as_str())
+                            })
                     })
                     .any(|d| (d.production, d.created_at_ms) > local_rank)
             })
@@ -873,10 +874,19 @@ async fn edge_pipeline_inner(
                 let same_region_http_first = !cand.region.is_empty()
                     && cand.region == region
                     && !cand.gateway.trim().is_empty();
+                // A candidate whose iroh forward recently produced no first byte
+                // (or no connection) goes HTTP-first for a cooldown, so one dead
+                // trunk costs one request the iroh budget instead of every one.
+                let iroh_cooled = !same_region_http_first
+                    && mesh.is_some()
+                    && node_iroh.contains_key(&cand.node_id)
+                    && usable_gateway(&cand.gateway)
+                    && iroh_cooling(&cand.node_id);
+                let http_first = same_region_http_first || iroh_cooled;
                 // Two passes per candidate — the SAME two attempts as before, in
                 // the cost-chosen order. Pass 0 is the preferred transport.
                 for pass in 0..2u8 {
-                    let do_iroh = (pass == 0) != same_region_http_first;
+                    let do_iroh = (pass == 0) != http_first;
                     if do_iroh {
                         // Prefer the real P2P (iroh QUIC) tunnel when both nodes have it —
                         // works across NATs. STREAM the response so SSE / chunked bodies
@@ -909,6 +919,7 @@ async fn edge_pipeline_inner(
                                 .await
                             {
                                 Ok(ts) => {
+                                    iroh_mark_ok(&cand.node_id);
                                     let status = ts.status;
                                     let mut builder = Response::builder().status(ts.status);
                                     for (k, v) in &ts.headers {
@@ -965,6 +976,11 @@ async fn edge_pipeline_inner(
                                     return out;
                                 }
                                 Err(e) => {
+                                    if e.downcast_ref::<hive_p2p::PostSendTimeout>().is_some()
+                                        || e.downcast_ref::<hive_p2p::DeadPeerTimeout>().is_some()
+                                    {
+                                        iroh_mark_bad(&cand.node_id);
+                                    }
                                     // A pre-send (connect/open) timeout is the strongest
                                     // "peer dead" signal (#H4): mark it unhealthy so
                                     // order_candidates stops ranking it — otherwise every
@@ -2151,6 +2167,84 @@ fn header(headers: &[(String, String)], name: &str) -> Option<String> {
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.clone())
+}
+
+/// Per-candidate iroh cooldown (`HIVE_EDGE_IROH_COOLDOWN_MS`, default 120 s, `0`
+/// disables). A forward over a peer's iroh trunk that yields no first byte
+/// (`PostSendTimeout`, 15 s) or no connection (`DeadPeerTimeout`) used to be
+/// followed by a working HTTP fallback — and then paid again on the NEXT request,
+/// because the peer still gossips and stays healthy. Witnessed 2026-09-19: every
+/// request to a fc-sanjose-hosted app that landed on va, va3 or phx (3 of the 4
+/// round-robin DNS answers) took 15.1–15.4 s while the same request answered by
+/// sj directly took 0.1–0.6 s, and forwards to fc-phoenix over iroh took 0.25 s.
+/// While a candidate is cooling its HTTP gateway goes first and iroh becomes the
+/// fallback; once the window expires exactly ONE request claims the probe slot
+/// (re-arming the window for everyone else) and tries iroh first again, so a
+/// recovered trunk is picked up without letting concurrent requests pile in.
+fn iroh_cooldown() -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>
+{
+    static COOLING: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    COOLING.get_or_init(Default::default)
+}
+
+fn iroh_cooldown_window() -> std::time::Duration {
+    std::time::Duration::from_millis(
+        std::env::var("HIVE_EDGE_IROH_COOLDOWN_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(120_000),
+    )
+}
+
+/// True while iroh should be tried SECOND for `node`. Expired entries hand the
+/// caller the probe slot (see [`iroh_cooldown`]) and return false.
+fn iroh_cooling(node: &str) -> bool {
+    let window = iroh_cooldown_window();
+    if window.is_zero() {
+        return false;
+    }
+    let now = std::time::Instant::now();
+    let mut map = iroh_cooldown().lock().unwrap_or_else(|e| e.into_inner());
+    match map.get(node) {
+        None => false,
+        Some(until) if *until > now => true,
+        Some(_) => {
+            map.insert(node.to_string(), now + window);
+            false
+        }
+    }
+}
+
+fn iroh_mark_bad(node: &str) {
+    let window = iroh_cooldown_window();
+    if window.is_zero() {
+        return;
+    }
+    let mut map = iroh_cooldown().lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() > 1024 {
+        map.clear();
+    }
+    map.insert(node.to_string(), std::time::Instant::now() + window);
+}
+
+fn iroh_mark_ok(node: &str) {
+    iroh_cooldown()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(node);
+}
+
+/// A gateway URL another node can actually reach: Macs and laptop dev nodes
+/// advertise their bind address (`http://0.0.0.0:8787`, `http://127.0.0.1:…`),
+/// which is meaningless from here and must never become the first choice.
+fn usable_gateway(gateway: &str) -> bool {
+    let g = gateway.trim();
+    !g.is_empty()
+        && !["://127.", "://0.0.0.0", "://localhost", "://[::"]
+            .iter()
+            .any(|bad| g.contains(bad))
 }
 
 /// HTTP-fallback timeout for one candidate (#H4). iroh and the HTTP fallback share

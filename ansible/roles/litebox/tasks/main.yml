@@ -86,6 +86,30 @@
       would silently ship the wildcard-bind bug and the hardcoded
       single-instance guest IP back.
 
+- name: Copy the fork patch to the target host (plain fork() of a single-threaded guest runs its child in place)
+  ansible.builtin.copy:
+    src: fork-inplace.patch
+    dest: "{{ litebox_src_dir }}/../litebox-fork-inplace.patch"
+    mode: "0644"
+
+- name: Apply it on top of the networking patch (same idempotency argument -- the clone above resets tracked files every run)
+  ansible.builtin.command:
+    cmd: git apply ../litebox-fork-inplace.patch
+    chdir: "{{ litebox_src_dir }}"
+  register: _fork_patch_apply
+  changed_when: true
+  failed_when: false
+
+- name: Fail loudly if the fork patch no longer applies cleanly (litebox_commit moved -- re-diff files/fork-inplace.patch, see files/PATCHES.md)
+  ansible.builtin.assert:
+    that: _fork_patch_apply.rc == 0
+    fail_msg: >-
+      files/fork-inplace.patch (see files/PATCHES.md, "Fork patch") no longer
+      applies cleanly on top of networking.patch against
+      litebox_commit={{ litebox_commit }}: {{ _fork_patch_apply.stderr }}
+      -- re-diff it. Building without it would ship the wedge-on-the-second-
+      external-command sandbox shell back.
+
 - name: Build litebox_runner_linux_userland (release) -- long-running, first build is the slow one
   ansible.builtin.command:
     cmd: cargo build --release --bin litebox_runner_linux_userland

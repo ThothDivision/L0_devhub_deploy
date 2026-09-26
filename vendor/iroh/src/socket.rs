@@ -1090,6 +1090,7 @@ impl EndpointInner {
             transports_network_change,
             direct_addr_done_rx,
             call_notify_quic_network_change: None,
+            rebind_retry: None,
         };
         // Initialize addresses
         #[cfg(not(wasm_browser))]
@@ -1413,6 +1414,37 @@ struct PendingNetworkChangeNotify {
     started: Instant,
 }
 
+/// Retry state for a rebind that failed (fluid-hive patch, see `CHANGES.md`).
+///
+/// `netwatch` drops the old socket before binding the new one, so a bind that
+/// fails (`EADDRINUSE` while a concurrently forked child still holds a copy of
+/// the old fd) leaves the transport closed. Upstream then waits for the NEXT
+/// link change to try again -- measured on fc-sanjose, 11 to 17 hours later.
+struct PendingRebind {
+    next_attempt: Instant,
+    interval: Duration,
+    attempts: u32,
+}
+
+impl PendingRebind {
+    const INITIAL_INTERVAL: Duration = Duration::from_millis(250);
+    const MAX_INTERVAL: Duration = Duration::from_secs(5);
+
+    fn new() -> Self {
+        Self {
+            next_attempt: Instant::now() + Self::INITIAL_INTERVAL,
+            interval: Self::INITIAL_INTERVAL,
+            attempts: 0,
+        }
+    }
+
+    fn advance(&mut self) {
+        self.attempts = self.attempts.saturating_add(1);
+        self.interval = (self.interval * 2).min(Self::MAX_INTERVAL);
+        self.next_attempt = Instant::now() + self.interval;
+    }
+}
+
 impl PendingNetworkChangeNotify {
     const INITIAL_INTERVAL: Duration = Duration::from_millis(100);
     const MAX_INTERVAL: Duration = Duration::from_secs(1);
@@ -1479,6 +1511,9 @@ struct Actor {
     /// until the gateway appears. Once it does, we notify immediately.
     /// After 5s total we notify anyway even without a gateway.
     call_notify_quic_network_change: Option<PendingNetworkChangeNotify>,
+    /// Set while an IP transport is closed after a failed rebind; retried with
+    /// backoff until it binds again (see [`PendingRebind`]).
+    rebind_retry: Option<PendingRebind>,
 }
 
 impl Actor {
@@ -1515,6 +1550,12 @@ impl Actor {
                 None => MaybeFuture::None,
             };
             n0_future::pin!(notify_quic_network_change);
+
+            let rebind_retry = match &self.rebind_retry {
+                Some(pending) => MaybeFuture::Some(n0_future::time::sleep_until(pending.next_attempt)),
+                None => MaybeFuture::None,
+            };
+            n0_future::pin!(rebind_retry);
 
             tokio::select! {
                 _ = shutdown_token.cancelled() => {
@@ -1613,6 +1654,9 @@ impl Actor {
                     self.handle_network_change(is_major);
                 }
                 _remote_id = self.remote_map.cleanup() => {},
+                _ = &mut rebind_retry => {
+                    self.retry_rebind();
+                }
                 _ = &mut notify_quic_network_change => {
                     let has_network = self.has_usable_network();
                     let Some(pending) = self.call_notify_quic_network_change.as_mut() else {
@@ -1640,6 +1684,33 @@ impl Actor {
         }
     }
 
+    /// Re-attempts the IP transports a failed rebind left closed. On success it
+    /// finishes what `handle_network_change` could not: relay health check, DNS
+    /// reset, a fresh STUN/net report and the QUIC network-change notification.
+    fn retry_rebind(&mut self) {
+        let Some(pending) = self.rebind_retry.as_mut() else {
+            return;
+        };
+        match self.transports_network_change.rebind_closed() {
+            Ok(()) => {
+                let attempts = pending.attempts + 1;
+                self.rebind_retry = None;
+                // warn, not info: the fleet filters iroh below warn, and this is the line an
+                // operator needs to see pair with `failed to rebind transports`.
+                warn!(attempts, "transport rebind recovered after a failed rebind");
+                self.transports_network_change.check_relay_connection();
+                #[cfg(not(wasm_browser))]
+                self.sock.dns_resolver.reset();
+                self.re_stun(UpdateReason::LinkChangeMajor);
+                self.notify_quic_network_change(true);
+            }
+            Err(err) => {
+                debug!(attempts = pending.attempts + 1, "rebind retry failed: {err:?}");
+                pending.advance();
+            }
+        }
+    }
+
     /// Whether the local network has a default route and at least one IP address.
     fn has_usable_network(&mut self) -> bool {
         #[cfg(target_family = "wasm")]
@@ -1662,8 +1733,12 @@ impl Actor {
         debug!(is_major, "link change detected");
 
         if is_major {
-            if let Err(err) = self.transports_network_change.rebind() {
-                warn!("failed to rebind transports: {err:?}");
+            match self.transports_network_change.rebind() {
+                Ok(()) => self.rebind_retry = None,
+                Err(err) => {
+                    warn!("failed to rebind transports: {err:?}; retrying with backoff");
+                    self.rebind_retry = Some(PendingRebind::new());
+                }
             }
             self.transports_network_change.check_relay_connection();
 

@@ -2358,6 +2358,7 @@ dependencies = [
  "redb 4.1.0",
  "rust-stemmers",
  "rust_decimal",
+ "rustls",
  "serde",
  "serde_cbor",
  "serde_json",
@@ -2798,6 +2799,8 @@ dependencies = [
  "iroh-mainline-address-lookup",
  "n0-future",
  "n0-mainline",
+ "noq",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
@@ -3528,8 +3531,6 @@ dependencies = [
 [[package]]
 name = "iroh-mdns-address-lookup"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c1f941695731bc3999d8c13d7e94d50e229427da81ac957eec3818264f17559"
 dependencies = [
  "data-encoding",
  "derive_more 2.1.1",
@@ -4407,6 +4408,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aa6c890013591e709a3e45dd53501351b7e27e7ff3c7e9fc3dce43e300e7e9d3"
 dependencies = [
  "aes-gcm",
+ "aws-lc-rs",
  "bytes",
  "derive_more 2.1.1",
  "enum-assoc",
@@ -7233,6 +7235,7 @@ version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dad543404f98bfc969aeb71994105c592acfc6c43323fddcd016bb208d1c65cb"
 dependencies = [
+ "aws-lc-rs",
  "base64",
  "bytes",
  "futures-core",

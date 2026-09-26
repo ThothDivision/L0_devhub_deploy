@@ -488,13 +488,12 @@ impl AddressLookupServices {
     ///
     /// If there is historical Address Lookup data, it will be published immediately on this service.
     pub fn add_boxed(&self, service: Box<dyn AddressLookup>) {
-        {
-            let data = self.last_data.read().expect("poisoned");
-            if let Some(data) = &*data {
-                service.publish(data)
-            }
+        let mut services = self.services.write().expect("poisoned");
+        let data = self.last_data.read().expect("poisoned");
+        if let Some(data) = &*data {
+            service.publish(data);
         }
-        self.services.write().expect("poisoned").push(service);
+        services.push(service);
     }
 
     /// Are there any services configured?

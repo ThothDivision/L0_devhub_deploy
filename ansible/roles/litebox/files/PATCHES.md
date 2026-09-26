@@ -373,3 +373,40 @@ Review residue kept on fc-sanjose for the next session: the exact built tree
 commit no longer exists upstream), the pin clone `/root/litebox-fix-src`,
 the probe build `/root/hive-cloud-probe-bin`, and the witness scripts
 `/root/lb-*.py`, `/root/adv-*.py`.
+
+## 2026-09-22: Fork patch (`fork-inplace.patch`) -- a second external command no longer wedges the shell
+
+Applied AFTER `networking.patch` by the role (`git apply ../litebox-fork-inplace.patch`), touching only
+`litebox_shim_linux/src/{lib.rs, syscalls/mm.rs, syscalls/process.rs}` (180 lines). Root-caused by a
+subagent with gdb on va (see the `litebox-fork-child-corruption` memory): `do_clone` gives a plain
+`fork()` an eager copy of the guest's writable memory at RELOCATED host addresses and runs the child on a
+second host thread. Only registers, the TCB self-pointer, a 4 KB stack window and a few writable ELF data
+words are patched (`fixup_stale_stack_pointers`/`fixup_stale_elf_data_pointers`); everything else in the copy
+still points into the PARENT (RELRO/`.got`/`.data.rel.ro`/stdio vtables -- Rocky's bash is full-RELRO -- and the
+whole heap). The child runs a mix of its own and the parent's libc and rewrites the parent's `_rtld_global`
+(stack lists), malloc and stdio state: `malloc(): unaligned tcache chunk`, `glibc detected an invalid stdio
+handle` (`_IO_vtable_check` failing on a translated vtable pointer), and the second child spinning in
+`__libc_fork`'s inlined `reclaim_stacks` walk over a stack list the first child corrupted.
+
+Three hunks:
+1. **process.rs, in-place fork.** A plain `fork()` of a SINGLE-THREADED caller snapshots its writable non-shared
+   regions (stack only from `rsp-512` up; refused above 256 MiB), runs the child through the existing
+   `CLONE_VFORK` path (shared page manager, caller suspended until the child execs or exits, no relocation), and
+   restores the snapshot afterwards; the child does not write a clear-tid word into shared memory. Multi-threaded
+   callers (Node, Python with threads) and over-cap callers keep the old relocating copy.
+2. **mm.rs, `sys_brk`.** A `brk` it cannot satisfy answers the unchanged break, not `-ENOMEM` (brk has no errno; glibc
+   read the errno as a huge break and `sysmalloc` wrote into unmapped pages).
+3. **lib.rs, trap fallback.** The syscall rewriter leaves `icebp; hlt` (`f1 f4`) where it cannot hook a `syscall` (the
+   trampoline page is taken when two processes load at once: `applied trap fallback count=533`); the fallback now
+   serves the syscall through the shim exactly as the hooked path does and resumes, instead of killing `head` in
+   25-30% of `ls | head` runs.
+
+**Known limits (accepted, measured):** the parent is suspended until the child execs or exits, so a NON-exec child
+that needs the parent to progress deadlocks -- `v=$(for i in $(seq 1 30000); do echo line$i; done)` hangs once the
+output passes the 64 KiB pipe; `(sleep 1; echo x) & echo y` prints `x` first; cost is O(writable RSS) per fork; if a
+child unmaps a parent region before exec the restore write fails (logged) and the parent may fault later; aarch64
+branches are unbuilt. Upstream tip (`3418c51f`, 2026-09-19) moved native Linux to a real host `fork()` but the Linux
+platform never implemented `wait_for_cross_process_exit`/`spawn_cross_process_exit_notifier` (every forking command
+exits 101 `unreachable!`); a 45-line waitpid spike got as far as `threads should not terminate unexpectedly`. Re-pin
+only after that lands, then drop this patch. Incidental, not fork-related, still open: the `time` builtin prints
+garbled user/sys times (rusage/`wait4`), and every litebox runner burns 25-100% of a core idle (net poll thread).

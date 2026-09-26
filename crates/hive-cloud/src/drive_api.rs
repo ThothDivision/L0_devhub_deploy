@@ -293,9 +293,8 @@ fn owner_candidates(cloud: &Arc<CloudState>, owner_node: &str) -> Vec<String> {
     if !owner_node.is_empty() && owner_node != cloud.node_name {
         out.push(owner_node.to_string());
     }
-    if !cloud.is_control_plane_leader() {
-        let leader = cloud.control_plane_leader();
-        if leader != cloud.node_name && !out.contains(&leader) {
+    if let Some(leader) = cloud.leader_forward_target() {
+        if !out.contains(&leader) {
             out.push(leader);
         }
     }

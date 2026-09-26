@@ -727,8 +727,7 @@ async fn list_presence(State(cloud): State<Arc<CloudState>>, claims: Claims) -> 
     // records this node has not. Union by endpoint id, newest `issued_ms` wins —
     // the same last-writer rule `put` applies, so a merge can never resurrect a
     // record that a newer write superseded.
-    if !cloud.is_control_plane_leader() {
-        let leader = cloud.control_plane_leader();
+    if let Some(leader) = cloud.leader_forward_target() {
         if let Some(value) =
             crate::admin::fetch_from_host(&cloud, &leader, "/v1/browser/presence", &tenant).await
         {
@@ -786,7 +785,7 @@ pub fn remove_for_endpoint(cloud: &Arc<CloudState>, endpoint_id: &str) {
 }
 
 pub fn snapshot_bytes(cloud: &Arc<CloudState>) -> Vec<u8> {
-    if cloud.is_control_plane_leader() {
+    if crate::leadership::may_act(cloud, crate::leadership::Job::BrowserExpiry) {
         cloud.browser_presence.expire(hive_core::now_ms());
     }
     serde_json::to_vec(&cloud.browser_presence.snapshot()).unwrap_or_default()

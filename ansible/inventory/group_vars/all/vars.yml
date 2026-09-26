@@ -99,7 +99,18 @@ hive_trusted_node_ids: []   # populated automatically by node-join.yml when enab
 
 # ---------- Control plane ----------
 hive_cp_leader: "{{ hive_cp_owner_chain.split(',')[0] }}"
-# hive_cp_owner_chain comes from inventory [platform:vars].
+# hive_cp_owner_chain comes from inventory [platform:vars]; list only LIVE
+# public servers (a powered-off entry makes the next one fail over to on every
+# gossip lapse -- the 2026-09-24 fc-virginia self-election).
+# hive_cp_voters (also [platform:vars]): the quorum set leadership::may_act
+# requires a BACKUP chain owner (not the chain head) to have direct contact
+# with a strict majority of before any leader-only job runs on it. Public
+# servers only, odd count, identical on every node; laptops never vote.
+# Empty (with a chain set) logs an ERROR at boot and drops the quorum term --
+# voters are never derived from the chain. Deliberately NOT defaulted
+# here: group_vars/all outranks inventory-file group vars in Ansible's
+# precedence, so a default here would silently blank [platform:vars]. The
+# template's `| default('')` covers the unset case.
 
 # ---------- Ingress / domains ----------
 hive_ingress: "dns"                          # ngrok | dual | dns -- dns is the supported production mode

@@ -30,9 +30,10 @@ pub struct ProductionDeploymentRecord {
     pub project: String,
     pub git: fluid_core::GitSource,
     /// The node this deployment was actually running on as of `updated_ms`.
-    /// Read, never trusted blindly — the reconciler re-checks THIS node's
-    /// live health via `registry.nodes()` before treating the record as
-    /// needing relocation, since the record itself only proves "true then".
+    /// Read, never trusted blindly — the reconciler re-checks that the host
+    /// has actually been gone from the fleet's gossip (`registry.nodes()`)
+    /// for its whole grace before treating the record as needing relocation,
+    /// since the record itself only proves "true then".
     pub host_node: String,
     pub updated_ms: u64,
 }
@@ -192,96 +193,199 @@ impl Default for ProductionDeploymentStore {
 }
 
 // ---------------------------------------------------------------------------
-// Node-death reconciler: detect a project's host going unhealthy, redeploy it
-// elsewhere via the SAME mechanism the dashboard's own "Redeploy" button uses
-// (`git::start_build`), then leave an incident recording what happened.
+// Node-death reconciler: detect a project's host gone from the fleet, redeploy
+// it elsewhere via the SAME mechanism the dashboard's own "Redeploy" button
+// uses (`git::start_build`), then leave an incident recording what happened.
+//
+// OFF by default (`HIVE_NODE_DEATH_SELF_HEAL=1` opts in). On 2026-09-24 a
+// follower whose own view flapped to "I am the leader" and "the leader's host
+// is unhealthy" redeployed a LIVE node's 22 production projects 1512 times in
+// 10 h — every attempt a real build, a real placement and a new incident.
+// Relocating a tenant is destructive enough that it needs evidence no single
+// observer's transport blip can manufacture, and a durable per-attempt ledger
+// the fleet shares; until both exist the safe default is a human redeploy.
+// When enabled, every one of these must hold:
+// - `leadership::may_act(NodeDeathRelocate)`: strict chain owner, 10 min
+//   continuous tenure, not isolated, a direct voter majority;
+// - the host is ABSENT from `registry.nodes()` — no gossip from it through
+//   ANY relay for 30 s — continuously for `RELOCATION_GRACE_MS`, measured
+//   from when this node first saw it absent (never from the row's last build
+//   time), and its last gossip is itself older than the grace. A host this
+//   observer merely cannot reach (`healthy == false` while still gossiping)
+//   is alive and serving; it is never relocated;
+// - no attempt for the same (project, host, commit) in the last
+//   `RELOCATION_COOLDOWN_MS`, and fewer than `RELOCATIONS_PER_HOUR`
+//   relocations started by this node in the trailing hour.
 // ---------------------------------------------------------------------------
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-/// A demoted node must stay demoted for this long, with no re-record from it
-/// (a re-record means the node is back and rebuilt — see `record`'s call
-/// site in `git::run_build`), before a row is treated as needing relocation.
-/// Matches the reasoning documented fleet-wide for owner-chain/DNS
-/// engage-disengage damping (AGENTS.md: a flapping node otherwise drives
-/// wasted rebuilds on every reconvergence) — a transport blip or a brief
-/// restart must not trigger a full redeploy-elsewhere.
-const RELOCATION_GRACE_MS: u64 = 5 * 60 * 1000;
+/// A host must be continuously absent from the fleet's gossip for this long
+/// (and silent in gossip for as long) before its projects are relocated. A
+/// restart, a roll or a relay blip must never trigger a full
+/// redeploy-elsewhere.
+const RELOCATION_GRACE_MS: u64 = 10 * 60 * 1000;
+
+/// At most one relocation attempt per (project, host, commit) in this window.
+const RELOCATION_COOLDOWN_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// At most this many relocations started by this node per trailing hour —
+/// the fleet-level brake on a wrong verdict.
+const RELOCATIONS_PER_HOUR: usize = 3;
 
 /// How often the reconciler sweeps `production_deployments` for rows whose
-/// host has been down past the grace period. Cheap per tick (no network I/O
-/// unless something actually needs relocating), so a short interval costs
-/// little and keeps the detect-to-heal latency close to the grace period
-/// itself rather than grace-period-plus-a-long-poll.
+/// host has been gone past the grace period. Cheap per tick (no network I/O
+/// unless something actually needs relocating).
 const RECONCILE_TICK_SECS: u64 = 30;
 
+/// In-memory evidence and brakes. Deliberately per process: absence onset is
+/// what THIS node observed, and a restart re-earns it (the leadership tenure
+/// has to be re-earned anyway).
+#[derive(Default)]
+struct SelfHealState {
+    /// host -> epoch-ms this node first saw it absent from `registry.nodes()`.
+    absent_since: HashMap<String, u64>,
+    /// (project, host, commit) -> epoch-ms of the last attempt.
+    attempts: HashMap<(String, String, String), u64>,
+    /// Epoch-ms of every attempt in the trailing hour.
+    recent: VecDeque<u64>,
+}
+
+impl SelfHealState {
+    /// Fold this tick's registry view in: start an absence clock for every
+    /// recorded host missing from the gossip-fresh set, drop the clock of every
+    /// host that is present again (or no longer hosts anything). Only from a
+    /// FRESH view (`leadership::view_is_fresh`: a gossip round done, not
+    /// isolated, a voter majority when voters are configured): a node that
+    /// cannot hear the fleet sees every host as gone, so while its view is
+    /// stale every clock is discarded, and an onset only counts once it was
+    /// observed with the fleet audible — otherwise the first ticks after this
+    /// node's own isolation clears (contact back one gossip round before the
+    /// relayed records) would read as ten minutes of absence.
+    fn observe(&mut self, cloud: &crate::state::CloudState, rows: &[ProductionDeploymentRecord]) {
+        let now = now_ms();
+        if crate::leadership::view_is_fresh(cloud) {
+            let present: HashSet<String> =
+                cloud.registry.nodes().into_iter().map(|n| n.name).collect();
+            let hosts: HashSet<&str> = rows.iter().map(|r| r.host_node.as_str()).collect();
+            self.absent_since
+                .retain(|host, _| hosts.contains(host.as_str()) && !present.contains(host));
+            for host in hosts {
+                if !present.contains(host) {
+                    self.absent_since.entry(host.to_string()).or_insert(now);
+                }
+            }
+        } else {
+            self.absent_since.clear();
+        }
+        self.attempts
+            .retain(|_, at| now.saturating_sub(*at) < RELOCATION_COOLDOWN_MS);
+        while self
+            .recent
+            .front()
+            .is_some_and(|at| now.saturating_sub(*at) >= 60 * 60 * 1000)
+        {
+            self.recent.pop_front();
+        }
+    }
+}
+
 pub fn spawn_node_death_reconcile(cloud: Arc<crate::state::CloudState>) {
+    let enabled = std::env::var("HIVE_NODE_DEATH_SELF_HEAL")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    if !enabled {
+        tracing::info!(
+            "node-death self-heal disabled (HIVE_NODE_DEATH_SELF_HEAL != 1): a dead host's \
+             production projects are not relocated automatically"
+        );
+        return;
+    }
     crate::supervise::spawn_supervised("production-deployment-node-death-reconcile", move || {
         let cloud = cloud.clone();
         async move {
+            let mut state = SelfHealState::default();
             // Let boot-time gossip/store_sync settle before the first sweep —
-            // otherwise a freshly-booted leader would see every OTHER node as
-            // "not yet in my registry" and treat their live deployments as
-            // needing relocation. Mirrors `spawn_git_poll_reconcile`'s own
-            // 45s settle sleep.
+            // otherwise a freshly-booted node would see every OTHER node as
+            // "not yet in my registry". The leadership tenure (10 min) and the
+            // absence grace (10 min, measured from this process's own first
+            // observation) already dominate; this only keeps the first
+            // observation off the cold registry.
             tokio::time::sleep(std::time::Duration::from_secs(45)).await;
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(RECONCILE_TICK_SECS));
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(RECONCILE_TICK_SECS));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
                 crate::supervise::beat("production-deployment-node-death-reconcile");
+                let rows = cloud.production_deployments.snapshot();
+                // Absence evidence is gathered on EVERY node, writer or not,
+                // so a node that becomes the writer already holds the onset
+                // it observed instead of starting the grace from zero.
+                state.observe(&cloud, &rows);
                 // LEADER ONLY — exactly one node redeploys a given dead host's
-                // projects, mirroring `git_poll_cycle`'s own gate. Without
-                // this, every node in the fleet would independently detect
-                // the same dead host and race to redeploy the same project
-                // N times.
-                if !cloud.is_control_plane_leader() {
+                // projects, through the shared background-job gate (tenure +
+                // voter quorum), never the bare request-path leader test.
+                if !crate::leadership::may_act(&cloud, crate::leadership::Job::NodeDeathRelocate) {
                     continue;
                 }
-                reconcile_once(&cloud).await;
+                reconcile_once(&cloud, &mut state, rows).await;
             }
         }
     });
 }
 
-async fn reconcile_once(cloud: &Arc<crate::state::CloudState>) {
+async fn reconcile_once(
+    cloud: &Arc<crate::state::CloudState>,
+    state: &mut SelfHealState,
+    rows: Vec<ProductionDeploymentRecord>,
+) {
     let now = now_ms();
-    let rows = cloud.production_deployments.snapshot();
-    if rows.is_empty() {
-        return;
-    }
-    let live_nodes = cloud.registry.nodes();
     for row in rows {
-        // Re-resolve the host's CURRENT health on every sweep — never cache
-        // across ticks, since a node's health is exactly the kind of fact
-        // that legitimately flips back to true (AGENTS.md's per-observer
-        // health section: this leader's own registry is the one view that
-        // actually drives placement/DNS, so it is the correct one to key
-        // off here).
-        let host_healthy = live_nodes
-            .iter()
-            .find(|n| n.name == row.host_node)
-            .map(|n| n.healthy)
-            // Absent from the registry entirely means the same thing
-            // `admin::nodes`'s own doc says it means: no gossip for 30s,
-            // i.e. offline — treat identically to an explicit `healthy: false`.
-            .unwrap_or(false);
-        if host_healthy {
+        let Some(&absent_since) = state.absent_since.get(&row.host_node) else {
+            continue; // present in the fleet's gossip: alive, whatever this node's transport says
+        };
+        if now.saturating_sub(absent_since) < RELOCATION_GRACE_MS {
             continue;
         }
-        // Grace period: the row itself is only re-written by a SUCCESSFUL
-        // build landing on a node (see `record`'s call site) — so
-        // `updated_ms` doubles as "last time we know this project was
-        // genuinely served from `host_node`". A host that died 4 minutes ago
-        // does not yet warrant relocating; one dead 6+ minutes does.
-        if now.saturating_sub(row.updated_ms) < RELOCATION_GRACE_MS {
+        if cloud
+            .registry
+            .peer_last_seen_ms(&row.host_node)
+            .is_some_and(|seen| now.saturating_sub(seen) < RELOCATION_GRACE_MS)
+        {
             continue;
         }
-        relocate_one(cloud, row).await;
+        let key = (
+            row.project.clone(),
+            row.host_node.clone(),
+            row.git.commit.clone(),
+        );
+        if state.attempts.contains_key(&key) {
+            continue; // attempted inside the cooldown window already
+        }
+        if state.recent.len() >= RELOCATIONS_PER_HOUR {
+            tracing::warn!(
+                cap = RELOCATIONS_PER_HOUR,
+                project = %row.project,
+                dead_host = %row.host_node,
+                "node-death self-heal: hourly relocation cap reached -- deferring the rest"
+            );
+            return;
+        }
+        if relocate_one(cloud, row).await {
+            state.attempts.insert(key, now);
+            state.recent.push_back(now);
+        }
     }
 }
 
-async fn relocate_one(cloud: &Arc<crate::state::CloudState>, row: ProductionDeploymentRecord) {
+/// Start one relocation. Returns whether an attempt was made (a build start
+/// was tried), which is what the cooldown and the hourly cap count.
+async fn relocate_one(
+    cloud: &Arc<crate::state::CloudState>,
+    row: ProductionDeploymentRecord,
+) -> bool {
     let project = row.project.clone();
     // A concurrent build already in flight for this project (e.g. a genuine
     // push landed around the same time the host died) means relocation is
@@ -296,16 +400,18 @@ async fn relocate_one(cloud: &Arc<crate::state::CloudState>, row: ProductionDepl
             )
     });
     if already_building {
-        return;
+        return false;
     }
 
+    // One incident per (project, dead host) while it stays unresolved, never
+    // one per attempt (`open` dedups on title + affected).
     let incident = cloud.incidents.open(crate::incidents::OpenReq {
         title: format!("Redeploying '{project}' — its host node went offline"),
         severity: crate::incidents::Severity::Minor,
         affected: vec![row.host_node.clone()],
         message: format!(
-            "Node '{}' has been unreachable for over {} minutes with '{project}' still recorded \
-             as hosted there. Automatically redeploying commit {} of {} to a healthy node.",
+            "Node '{}' has been absent from the fleet for over {} minutes with '{project}' still \
+             recorded as hosted there. Automatically redeploying commit {} of {} to a healthy node.",
             row.host_node,
             RELOCATION_GRACE_MS / 60_000,
             short_commit(&row.git.commit),
@@ -370,6 +476,7 @@ async fn relocate_one(cloud: &Arc<crate::state::CloudState>, row: ProductionDepl
                 },
             );
             monitor_relocation(cloud.clone(), incident.id, project, build_id);
+            true
         }
         Err(error) => {
             tracing::error!(
@@ -390,6 +497,7 @@ async fn relocate_one(cloud: &Arc<crate::state::CloudState>, row: ProductionDepl
                     ),
                 },
             );
+            true
         }
     }
 }

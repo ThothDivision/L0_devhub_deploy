@@ -442,6 +442,9 @@ pub struct PeerGossipEvidence {
 pub enum PeerDemotion {
     Missing,
     GossipAlive(PeerIdentity),
+    /// Gossip-stale, but the caller's commit gate declined the withdrawal
+    /// (the staleness has not yet persisted long enough); nothing written.
+    Deferred(PeerIdentity),
     Demoted(PeerIdentity),
 }
 
@@ -670,6 +673,17 @@ impl NodeRegistry {
         snapshot
     }
 
+    /// A peer's last stored record REGARDLESS of freshness (`nodes()` drops a
+    /// record once its gossip is 30 s old; this does not). Accepts either the
+    /// registry name or the canonical endpoint id. For stable facts about a
+    /// known node (is it a public server, what is its endpoint id) that must
+    /// not flicker with liveness — never for "is it up".
+    pub fn peer_record(&self, id: &str) -> Option<NodeInfo> {
+        let peers = self.peers.read();
+        let name = Self::peer_name_for(&peers, id)?;
+        peers.get(&name).cloned()
+    }
+
     /// When this peer was last heard from by gossip, epoch-ms. Accepts either
     /// the current registry name or the canonical endpoint id.
     pub fn peer_last_seen_ms(&self, id: &str) -> Option<u64> {
@@ -692,6 +706,28 @@ impl NodeRegistry {
         expected_endpoint_id: Option<&str>,
         observed_last_seen_ms: Option<u64>,
         max_age_ms: u64,
+    ) -> PeerDemotion {
+        self.demote_if_gossip_stale_gated(
+            id,
+            expected_endpoint_id,
+            observed_last_seen_ms,
+            max_age_ms,
+            |_| true,
+        )
+    }
+
+    /// [`Self::demote_if_gossip_stale`] with a caller veto evaluated under
+    /// the same write lock: `commit` sees only a peer that is gossip-stale
+    /// right now and decides whether the withdrawal is written
+    /// ([`PeerDemotion::Demoted`]) or left for later evidence
+    /// ([`PeerDemotion::Deferred`]).
+    pub fn demote_if_gossip_stale_gated(
+        &self,
+        id: &str,
+        expected_endpoint_id: Option<&str>,
+        observed_last_seen_ms: Option<u64>,
+        max_age_ms: u64,
+        commit: impl FnOnce(&PeerIdentity) -> bool,
     ) -> PeerDemotion {
         let now = now_ms();
         let mut peers = self.peers.write();
@@ -719,9 +755,28 @@ impl NodeRegistry {
         if current_fresh || observed_fresh {
             return PeerDemotion::GossipAlive(identity);
         }
+        if !commit(&identity) {
+            return PeerDemotion::Deferred(identity);
+        }
         peer.latency_ms = u64::MAX;
         peer.healthy = false;
         PeerDemotion::Demoted(identity)
+    }
+
+    /// Every stored peer (stale ones included, unlike `nodes()`) with whether
+    /// its gossiped `last_seen_ms` is fresh within `max_age_ms` right now.
+    pub fn gossip_freshness(&self, max_age_ms: u64) -> Vec<(PeerIdentity, bool)> {
+        let now = now_ms();
+        self.peers
+            .read()
+            .values()
+            .map(|p| {
+                (
+                    Self::identity(p),
+                    gossip_timestamp_fresh(p.last_seen_ms, now, max_age_ms),
+                )
+            })
+            .collect()
     }
 
     /// Restore every currently-fresh withdrawn peer and capture each immutable

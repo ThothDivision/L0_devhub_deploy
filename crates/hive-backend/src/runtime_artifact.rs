@@ -25,7 +25,22 @@ pub use hive_core::{
     RUNTIME_ARTIFACT_PROTOCOL_VERSION,
 };
 
-const MAX_ENTRIES: u64 = 100_000;
+// Bounds on one sealed artifact. `MAX_ENTRIES` is deliberately generous
+// because the logical tree is NOT the physical tree: a package-manager layout
+// that symlinks a shared store (pnpm's `node_modules/.pnpm`) is walked through
+// every symlink, so one physical package directory is enumerated once per
+// logical path that reaches it. Measured 2026-08-26 on a real pnpm Next.js
+// monorepo (DecOperations/Nodes.WTF, app `apps/web`): 31,697 physical entries
+// under the checkout, but **171,975** enumerated entries — 5.4x — because the
+// root `node_modules/.pnpm` store is reachable both directly and through each
+// consumer's symlink. A 100k cap therefore failed every pnpm monorepo build
+// mid-walk ("enumerate runtime artifact directory
+// node_modules/.pnpm/node_modules/acorn") while looking like a path-specific
+// defect. 1M keeps ~6x headroom over the measured worst real case; bytes stay
+// bounded independently by `MAX_LOGICAL_BYTES`/`MAX_MATERIALIZED_BYTES`, and
+// materialization hardlinks rather than copies, so entry count alone is not a
+// disk-cost multiplier.
+const MAX_ENTRIES: u64 = 1_000_000;
 const MAX_LOGICAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_MATERIALIZED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_PACKAGE_BYTES: u64 = MAX_MATERIALIZED_BYTES + MAX_ENTRIES * 2048 + 1024 * 1024;
