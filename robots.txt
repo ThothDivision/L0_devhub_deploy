@@ -1,0 +1,35 @@
+FIX THE PATHS WHATNOT ON THIS
+# DevHub crawler policy
+# This file controls crawler access.
+# Semantic information for AI systems is provided separately through /llms.txt.
+
+User-agent: *
+Allow: /
+
+# AI and search crawlers are intentionally allowed to discover
+# publicly available DevHub documentation and product information.
+
+# Keep private/internal application surfaces out of public crawling.
+Disallow: /admin/
+Disallow: /internal/
+Disallow: /private/
+Disallow: /api/internal/
+Disallow: /_internal/
+
+# Do not crawl authentication/session surfaces.
+Disallow: /login
+Disallow: /logout
+Disallow: /signin
+Disallow: /signup
+Disallow: /auth/
+
+# Temporary/build/system paths should not be indexed.
+Disallow: /_next/
+Disallow: /build/
+Disallow: /tmp/
+
+# AI-readable documentation index.
+# See /llms.txt for the canonical AI-oriented content map.
+
+# If a sitemap is published, add its canonical URL below:
+# Sitemap: https://devhub.shadw.cloud/sitemap.xml
