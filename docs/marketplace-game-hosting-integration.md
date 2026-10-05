@@ -4,8 +4,8 @@ Reviewed 2026-10-05 against DevHub `8481c1a` and the Marketplace source in `Thot
 
 ## Evidence
 
-- DevHub Rust CI [run 37363947832](https://github.com/ThothDivision/L0_devhub_deploy/actions/runs/37363947832): `build + unit tests` succeeded; the CLI acceptance job failed and other jobs were pending at review. Do not infer live game readiness from compilation.
-- Marketplace focused route tests and type-check passed locally; their DB/Clerk/DevHub integration is mocked. `autheo.dev` could not be reached from the gateway, `marketplace.autheo.dev` did not resolve, and `shadw.app` returned 503. The paired Windows node and gateway exposed no Docker/Podman. There was no disposable authenticated DevHub test target; no server image or client was launched.
+- DevHub Rust CI [run 37363947832](https://github.com/ThothDivision/L0_devhub_deploy/actions/runs/37363947832): `build + unit tests` succeeded. CLI acceptance finished with 34 passes and one failure: deployment was not listed after restart; its logs report refusal to restore a Ready deployment without published acceptance evidence and port 80/443 binding permission errors. Security and core jobs were cancelled. This is not a game-server smoke test; do not infer live readiness from compilation.
+- Marketplace's 59 tests, type-check and lint passed locally; their DB/Clerk/DevHub integration is mocked. `autheo.dev` could not be reached from the gateway, `marketplace.autheo.dev` did not resolve, and `shadw.app` returned 503. The paired Windows node and gateway exposed no Docker/Podman. There was no disposable authenticated DevHub test target; no server image or client was launched.
 - Marketplace accepts `game_hosting` listings but a verified provider, activated binding and healthy DevHub advertisement are required before a quote. Demo cards are not purchasable capacity.
 
 ## Blockers
