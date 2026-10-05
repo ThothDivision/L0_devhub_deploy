@@ -2,6 +2,8 @@
 
 Status: templates and mount-path plumbing implemented in source; **not live-deployed**. Do not describe a template as production-ready until its acceptance checks pass against a real node and game client. No upstream game binaries or mod packs are vendored here.
 
+Marketplace deployment and THEO metering gates are tracked separately in [marketplace-game-hosting-integration.md](marketplace-game-hosting-integration.md).
+
 ## Existing platform contract
 
 - Container-image deployments get a project-scoped named volume, one primary publicly allocated raw TCP/UDP port, and optional game settings. Minecraft Java already uses `itzg/minecraft-server` at `/data` on 25565/TCP. The dashboard's Minecraft `VERSION`/`TYPE` values are image-specific, not a universal version manager.
