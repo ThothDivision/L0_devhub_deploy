@@ -41,6 +41,22 @@ jobs:
       - name: Unit tests (workspace)
         run: cargo test --workspace --locked --verbose
 
+      - name: Package disposable local-test node
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          tar -czf /tmp/hive-cloud-local-test.tar.gz -C target/debug hive-cloud
+          (cd /tmp && sha256sum hive-cloud-local-test.tar.gz > hive-cloud-local-test.tar.gz.sha256)
+
+      - name: Upload disposable local-test node
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: hive-cloud-local-test-linux-x64
+          path: |
+            /tmp/hive-cloud-local-test.tar.gz
+            /tmp/hive-cloud-local-test.tar.gz.sha256
+          retention-days: 1
+
       # Informational quality checks — reported but non-blocking so pre-existing
       # style/lint nits don't wedge the pipeline.
       - name: rustfmt (check)
