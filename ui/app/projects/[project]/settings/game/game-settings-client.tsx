@@ -8,7 +8,7 @@ import { apiGet, apiSend, type GameServerSettings, type ProjectSettings } from "
  * Game-server settings for a project running a container game server
  * (Minecraft & co. — raw TCP/UDP containers): pull mod/plugin files from the
  * project's shadw Drive into the persistent volume at deploy time, pin the
- * server version/type (stamped as VERSION/TYPE env for itzg-style images),
+ * Minecraft version/type (stamped as VERSION/TYPE env for itzg-style images),
  * and snapshot the world save before each deploy for rollback.
  *
  * Saving PUTs `/v1/projects/:project/game`; clearing everything DELETEs it.
@@ -102,7 +102,7 @@ export function GameSettings({ paramsPromise }: { paramsPromise: Promise<{ proje
 
       <SettingCard
         title="Version Control"
-        desc="Pin the game/server version and flavor. These land as the VERSION and TYPE environment variables on the container — the convention itzg/minecraft-server and most game-server images read — but only where the deployment does not already declare them (an explicit env var in the compose file or Environment Variables page always wins)."
+        desc="Minecraft (itzg) only: VERSION and TYPE environment variables, unless the deployment already declares them. Terraria and Factorio use container image tags for version pins; these fields do not change their versions."
         footer="Applies on the next build/redeploy."
         footerAction={
           <Button onClick={save} disabled={saving}>
@@ -111,7 +111,7 @@ export function GameSettings({ paramsPromise }: { paramsPromise: Promise<{ proje
         }
       >
         <div className="flex flex-col gap-4">
-          <Field label="Game version" hint='e.g. "1.21.4" — blank tracks the image&apos;s default (LATEST for itzg/minecraft-server).'>
+          <Field label="Minecraft version (itzg images)" hint='e.g. "1.21.4" — blank tracks the image&apos;s default.'>
             <Input
               value={g.game_version ?? ""}
               onChange={(e) => setG({ ...g, game_version: e.target.value || null })}
@@ -119,7 +119,7 @@ export function GameSettings({ paramsPromise }: { paramsPromise: Promise<{ proje
               className="max-w-xs font-mono"
             />
           </Field>
-          <Field label="Server type" hint='e.g. "PAPER", "FORGE", "FABRIC" — blank uses the image&apos;s default (VANILLA for itzg/minecraft-server).'>
+          <Field label="Minecraft server type (itzg images)" hint='e.g. "PAPER", "FORGE", "FABRIC" — blank uses the image&apos;s default.'>
             <Input
               value={g.server_type ?? ""}
               onChange={(e) => setG({ ...g, server_type: e.target.value || null })}
@@ -151,7 +151,7 @@ export function GameSettings({ paramsPromise }: { paramsPromise: Promise<{ proje
               Snapshot the world save before every deploy
             </label>
           </Field>
-          <Field label="World directory (in volume)" hint='The save directory to snapshot — default "world" (Minecraft Java&apos;s overworld).'>
+          <Field label="Save directory (in volume)" hint='Default "world" for Minecraft; use "Worlds" for Terraria or "saves" for Factorio. Files in the volume root are not included.'>
             <Input
               value={g.world_subdir ?? ""}
               onChange={(e) => setG({ ...g, world_subdir: e.target.value || null })}

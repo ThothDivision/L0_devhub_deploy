@@ -61,6 +61,7 @@ interface Template {
   protocol?: string;
   env?: Record<string, string>;
   memory?: string;
+  volumeMountPath?: string;
 }
 
 // Vercel-style starters: official `vercel/vercel` examples (built from the
@@ -88,6 +89,8 @@ const TEMPLATES: Template[] = [
   // world-standard, actively-maintained public image — EULA=TRUE is
   // Mojang's own required acceptance flag, not a platform invention.
   { name: "Minecraft Server", desc: "Java Edition server (itzg/minecraft-server) with a persistent world, raw TCP.", image: "itzg/minecraft-server:latest", port: 25565, protocol: "tcp", env: { EULA: "TRUE" }, memory: "3g", tag: "MC", color: "#5b8c3e" },
+  { name: "Terraria Server", desc: "Vanilla Terraria server with persistent worlds (TCP). Pin an image tag before important upgrades.", image: "passivelemon/terraria-docker:terraria-latest", port: 7777, protocol: "tcp", env: { AUTOCREATE: "2", WORLDNAME: "World" }, volumeMountPath: "/opt/terraria/config", memory: "2g", tag: "TR", color: "#718c45" },
+  { name: "Factorio Server", desc: "Stable headless Factorio server with persistent saves (UDP). Pin a version before upgrading.", image: "factoriotools/factorio:stable", port: 34197, protocol: "udp", volumeMountPath: "/factorio", memory: "3g", tag: "FA", color: "#b77b39" },
 
   // Web3 / smart contracts (EVM) — one entry per directory of Chainlink's
   // smart-contract-examples monorepo. Each is a self-contained Hardhat
@@ -362,6 +365,7 @@ export default function NewProjectPage() {
     cpus?: string;
     ports?: { container_port: number; protocol: string; label?: string }[];
     env?: Record<string, string>;
+    volumeMountPath?: string;
     template?: Template | null;
   }) {
     setDeploying(true);
@@ -376,6 +380,7 @@ export default function NewProjectPage() {
         memory: opts.memory,
         cpus: opts.cpus,
         ports: opts.ports,
+        volume_mount_path: opts.volumeMountPath,
         env: opts.env && Object.keys(opts.env).length ? opts.env : undefined,
       });
       const guessed = slug(opts.image.split("/").pop()?.split(":")[0] || "app");
@@ -985,6 +990,7 @@ function ConfigureImageTemplate({
     memory?: string;
     ports?: { container_port: number; protocol: string; label?: string }[];
     env?: Record<string, string>;
+    volumeMountPath?: string;
   }) => void;
   deploying: boolean;
   error: string;
@@ -1031,7 +1037,7 @@ function ConfigureImageTemplate({
 
         <p className="mb-6 text-sm text-secondary">
           A pre-built image — no build step. The platform pulls it directly and attaches a persistent
-          volume at <span className="font-mono">/data</span> that survives redeploys.
+          volume at <span className="font-mono">{template.volumeMountPath ?? "/data"}</span> that survives redeploys.
         </p>
 
         <div className="mb-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -1161,6 +1167,7 @@ function ConfigureImageTemplate({
               memory: memory.trim() || undefined,
               ports,
               env: buildEnv(),
+              volumeMountPath: template.volumeMountPath,
             });
           }}
           disabled={deploying}

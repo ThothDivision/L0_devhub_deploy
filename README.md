@@ -34,6 +34,8 @@ At the application layer, it feels familiar:
 - AI inference and agents
 - Game servers and real-time workloads
 
+Game server templates, source provenance, mod/version boundaries, and live acceptance gates: [docs/game-server-mod-version-plan.md](docs/game-server-mod-version-plan.md).
+
 Underneath that experience is a distributed infrastructure stack designed around:
 
 - **Distributed compute**

@@ -1236,6 +1236,12 @@ pub async fn start_build(
     // it can reach a `Build` row, a webhook payload, a log line, or process
     // argv — everything below this line persists/emits `req.repo_url`.
     validate_deploy_source(&req)?;
+    if let Some(path) = req.image_volume_path.as_deref() {
+        anyhow::ensure!(
+            req.image_ref.is_some() && valid_image_volume_path(path),
+            "invalid image volume mount path"
+        );
+    }
     let id = format!("dpl-{}", &Uuid::new_v4().simple().to_string()[..10]);
     let project = req
         .project
@@ -1265,6 +1271,17 @@ pub async fn start_build(
     };
     if let Some(team) = admission_team.as_deref() {
         cloud.projects.set_team_exact(&project, incarnation, team)?;
+    }
+    if let Some(path) = req.image_volume_path.as_deref() {
+        let mut settings = cloud
+            .projects
+            .get_exact(&project, incarnation)?
+            .container
+            .unwrap_or_default();
+        if settings.volume_mount_path.is_none() {
+            settings.volume_mount_path = Some(path.to_owned());
+            cloud.projects.set_container_exact(&project, incarnation, Some(settings))?;
+        }
     }
     if let Some(root) = req
         .root_dir
@@ -3543,6 +3560,7 @@ async fn run_build(
         req.image_cpus.as_deref(),
         req.image_pids.unwrap_or(0),
         req.image_ports.clone(),
+        req.image_volume_path.as_deref(),
     )
     .await?;
     coordinates.normalize_function_cwds(&mut manifest)?;
@@ -6420,6 +6438,7 @@ async fn produce_manifest(
     image_cpus: Option<&str>,
     image_pids: u32,
     image_ports: Option<Vec<fluid_core::PortSpec>>,
+    image_volume_path: Option<&str>,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
     // Prebuilt OCI image (Docker Hub / Quay / any registry): pull it, auto-detect its
@@ -6443,6 +6462,7 @@ async fn produce_manifest(
             cpus,
             image_pids,
             image_ports,
+            image_volume_path,
         )
         .await;
     }
@@ -6480,6 +6500,7 @@ async fn produce_manifest(
             0.0,
             0,
             None,
+            None,
         )
         .await;
     }
@@ -6506,6 +6527,7 @@ async fn produce_manifest(
             0,
             0.0,
             0,
+            None,
             None,
         )
         .await;
@@ -10717,6 +10739,23 @@ fn container_volume_path(project_override: Option<&str>) -> String {
         .unwrap_or_else(|| "/data".to_string())
 }
 
+pub(crate) fn valid_image_volume_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() <= 256
+        && path != "/"
+        && path
+            .split('/')
+            .skip(1)
+            .all(|part| {
+                part != "."
+                    && part != ".."
+                    && !part.is_empty()
+                    && part.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+            })
+}
+
 /// The run-config JSON (container `start_cmd[3]`) that attaches an automatic
 /// persistent volume: a host-backed named volume (≥1 GB) keyed STABLY per project
 /// (+ optional service suffix for compose), so a container's data survives instance
@@ -11019,8 +11058,12 @@ async fn image_container_manifest(
     cpus: f64,
     pids: u32,
     ports_override: Option<Vec<PortSpec>>,
+    image_volume_path: Option<&str>,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
+    if let Some(path) = image_volume_path {
+        anyhow::ensure!(valid_image_volume_path(path), "invalid image volume mount path");
+    }
     let path = podman_path_env();
     // Fully qualify short names (`user/img` → `docker.io/user/img`) — Linux podman
     // rejects unqualified refs ("short-name resolution enforced").
@@ -11076,15 +11119,15 @@ async fn image_container_manifest(
             None => (8080, protocol_override.unwrap_or_default()),
         },
     };
-    // An image deploy has no fluid.json to read a `container` override from at
-    // all, so the dashboard-managed `ProjectSettings::container` is the ONLY
-    // way to redirect the automatic volume's mount path here (unlike the
-    // Dockerfile-build path, which also honors an explicit fluid.json value).
+    // An explicit image mount is scoped to this deployment; a saved project
+    // container setting takes precedence. Both are container paths, never host
+    // bind mounts. Existing projects without either still mount at /data.
     let volume_path = cloud
         .projects
         .get_exact(project, incarnation)?
         .container
-        .and_then(|s| s.volume_mount_path);
+        .and_then(|s| s.volume_mount_path)
+        .or_else(|| image_volume_path.map(str::to_owned));
     log(format!(
         "Container port {port}/{protocol}{}. Attaching persistent volume (≥1 GB) at {}.",
         if port_override.is_some() || protocol_override.is_some() {
@@ -11965,6 +12008,7 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
         image_cpus: None,
         image_pids: None,
         image_ports: None,
+        image_volume_path: None,
         git_token: token,
         marketplace_placement: None,
     };
