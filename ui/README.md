@@ -19,6 +19,8 @@ The dashboard proxies `/cloud/*` → the node's admin API (`HIVE_ADMIN`, default
 
 ## Marketplace
 
+DevHub is the deployer/developer/gamer frontend; Marketplace is the separate provider frontend. Project pages show **read-only** live verified provider offers through `/api/marketplace/providers`. This inventory does not select, reserve, bill, or schedule a provider. The cross-site browse/checkout links below are legacy pending a joint THEO-native placement lease and DevHub-native buyer flow. See the [two-role plan](https://github.com/ThothDivision/autheo-setup/blob/main/docs/architecture/provider-deployer-split-v2.md) and [replicable deployment flows](https://github.com/ThothDivision/autheo-setup/blob/main/docs/operations/deployment-flows-v1.md); paid game/image deployment remains held.
+
 Set `MARKETPLACE_URL=http://localhost:3000` when Marketplace runs locally
 (for example, Autheo.dev on port 3001). This server-only URL is required for
 Marketplace deployment-policy retrieval. Set
