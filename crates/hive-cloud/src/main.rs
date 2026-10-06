@@ -9,6 +9,7 @@ mod acme;
 mod admin;
 mod apikeys;
 mod app_discovery;
+mod artifact_catalog_transfer;
 mod audit;
 mod auth;
 mod billing;
@@ -61,9 +62,11 @@ mod integrity_signer;
 mod lease;
 mod listener_audit;
 mod marketplace;
+mod marketplace_authorization;
 mod marketplace_gateway;
 mod marketplace_migrations;
 mod marketplace_releases;
+mod marketplace_reservations;
 mod memwatch;
 mod mesh_raw;
 mod mesh_shell;
@@ -71,6 +74,7 @@ mod meshwatch;
 mod metrics;
 mod microfrontends;
 mod microfrontends_api;
+mod minecraft_executor;
 mod notifications;
 mod persist;
 mod production_deployments;
@@ -639,11 +643,17 @@ async fn async_main() -> anyhow::Result<()> {
         (litebox, "litebox", litebox_runtime_capabilities)
     } else {
         if force_mock && !litebox_verified {
-            tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1, no verified Litebox) — runtime is mocked for local development");
+            tracing::warn!(
+                "isolation backend: MockBackend (HIVE_FORCE_MOCK=1, no verified Litebox) — runtime is mocked for local development"
+            );
         } else if force_mock {
-            tracing::warn!("isolation backend: MockBackend (HIVE_FORCE_MOCK=1) — Litebox verified but its runner binary is missing on this host (Tier 1 check failed)");
+            tracing::warn!(
+                "isolation backend: MockBackend (HIVE_FORCE_MOCK=1) — Litebox verified but its runner binary is missing on this host (Tier 1 check failed)"
+            );
         } else {
-            tracing::warn!("isolation backend: MockBackend (sandboxed child process) — real microVMs need Linux + /dev/kvm; this is expected for local dev. ALL OTHER subsystems run for real.");
+            tracing::warn!(
+                "isolation backend: MockBackend (sandboxed child process) — real microVMs need Linux + /dev/kvm; this is expected for local dev. ALL OTHER subsystems run for real."
+            );
         }
         (
             Arc::new(MockBackend::new(MockConfig {
@@ -719,9 +729,11 @@ async fn async_main() -> anyhow::Result<()> {
         }
     };
     let cap = resources::capacity();
+    let cpu = resources::cpu_inventory();
     // GPU probe (nvidia-smi, once at boot; HIVE_GPUS override) — advertised in
     // gossip so placement can target GPU hosts for gpu-requesting functions.
     let gpus = resources::detect_gpus();
+    let gpu_devices = resources::detect_gpu_devices();
     // Observe all three runtime capabilities from the backend that was actually
     // selected above. Firecracker reuses its provision-time exact-rootfs proof;
     // Litebox answers only after its selected instance remains supported (and
@@ -1017,6 +1029,9 @@ async fn async_main() -> anyhow::Result<()> {
         city: geo.as_ref().map(|g| g.2.clone()),
         country: geo.as_ref().map(|g| g.3.clone()),
         cpu_cores: cap.0,
+        cpu_model: cpu.model,
+        cpu_physical_cores: cpu.physical_cores,
+        cpu_architecture: Some(cpu.architecture.into()),
         mem_total_mb: cap.1,
         disk_total_gb: cap.2,
         // Seeded here so the very first gossip round already carries a real
@@ -1045,6 +1060,7 @@ async fn async_main() -> anyhow::Result<()> {
         artifact_transfer_protocol: None,
         gpu_model: gpus.1.clone(),
         gpu_vram_mb: gpus.2,
+        gpu_devices,
         provider: std::env::var("HIVE_CLOUD_PROVIDER")
             .ok()
             .map(|v| v.trim().to_lowercase())
@@ -1259,7 +1275,10 @@ async fn async_main() -> anyhow::Result<()> {
             }
             let grace = Duration::from_secs(env_u64("HIVE_SHUTDOWN_GRACE_SECS", 15));
             if let Some(handle) = SHUTDOWN_HTTPS_HANDLE.get() {
-                tracing::info!(?grace, "shutdown requested → draining public listener (in-flight requests + cell tunnels)");
+                tracing::info!(
+                    ?grace,
+                    "shutdown requested → draining public listener (in-flight requests + cell tunnels)"
+                );
                 handle.graceful_shutdown(Some(grace));
                 // graceful_shutdown stops new connections and gives existing ones
                 // the grace window; wait for them here since exit() below would
@@ -1555,6 +1574,8 @@ async fn async_main() -> anyhow::Result<()> {
     // gossip and the destination node performs Marketplace HMAC verification.
     marketplace_gateway::spawn(cloud.clone());
     marketplace_releases::spawn_credential_rotation(cloud.clone());
+    marketplace::spawn_lifecycle_delivery(cloud.clone());
+    minecraft_executor::spawn(cloud.clone());
 
     // Initial owner resolution (single-node: this node is owner) + seed the
     // gossiped fencing epoch.
@@ -2769,7 +2790,7 @@ async fn admin_forward_to_leader(
     let body = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
-            return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response()
+            return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
         }
     };
     let path_q = parts
@@ -2781,7 +2802,7 @@ async fn admin_forward_to_leader(
     let method = match reqwest::Method::from_bytes(parts.method.as_str().as_bytes()) {
         Ok(m) => m,
         Err(_) => {
-            return (axum::http::StatusCode::METHOD_NOT_ALLOWED, "bad method").into_response()
+            return (axum::http::StatusCode::METHOD_NOT_ALLOWED, "bad method").into_response();
         }
     };
     let mut cp_epoch = cloud.cluster.epoch();
@@ -2901,7 +2922,7 @@ async fn admin_forward_to_leader(
                         axum::http::StatusCode::BAD_GATEWAY,
                         "control-plane leader forward failed",
                     )
-                        .into_response()
+                        .into_response();
                 }
             }
         }
@@ -2967,13 +2988,13 @@ async fn dashboard_proxy(
     let body = match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
         Ok(b) => b,
         Err(_) => {
-            return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response()
+            return (axum::http::StatusCode::PAYLOAD_TOO_LARGE, "body too large").into_response();
         }
     };
     let method = match reqwest::Method::from_bytes(parts.method.as_str().as_bytes()) {
         Ok(m) => m,
         Err(_) => {
-            return (axum::http::StatusCode::METHOD_NOT_ALLOWED, "bad method").into_response()
+            return (axum::http::StatusCode::METHOD_NOT_ALLOWED, "bad method").into_response();
         }
     };
     let mut rb = http.request(method, &url).body(body.to_vec());
@@ -3115,7 +3136,9 @@ async fn serve_tls(app: axum::Router, addr: SocketAddr) -> anyhow::Result<()> {
             let certified = rcgen::generate_simple_self_signed(names)?;
             let cert_pem = certified.cert.pem();
             let key_pem = certified.key_pair.serialize_pem();
-            tracing::info!("TLS using generated self-signed certificate (dev; set HIVE_TLS_CERT/KEY for production)");
+            tracing::info!(
+                "TLS using generated self-signed certificate (dev; set HIVE_TLS_CERT/KEY for production)"
+            );
             RustlsConfig::from_pem(cert_pem.into_bytes(), key_pem.into_bytes()).await?
         }
     };
@@ -5515,7 +5538,12 @@ fn spawn_health_loop(cloud: Arc<CloudState>) {
 
 #[cfg(test)]
 mod health_tests {
-    use super::health_decision;
+    use super::{health_decision, marketplace_authorization};
+    use chrono::{Duration, Utc};
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+    use sha2::Digest;
 
     #[test]
     fn threshold_prevents_single_probe_flapping() {
@@ -5538,5 +5566,679 @@ mod health_tests {
     fn threshold_one_flips_on_first_miss() {
         let (m, w) = health_decision(0, false, 1);
         assert_eq!((m, w), (1, Some(false)));
+    }
+
+    fn signed(
+        key: &SigningKey,
+        issuer: &str,
+        key_id: &str,
+        payload: serde_json::Value,
+    ) -> marketplace_authorization::SignedAuthorization {
+        let authorization = marketplace_authorization::SignedAuthorization {
+            issuer: issuer.into(),
+            key_id: key_id.into(),
+            alg: "Ed25519".into(),
+            signature: String::new(),
+            payload,
+        };
+        let signature = key.sign(
+            &marketplace_authorization::canonical_signed_authorization(
+                &authorization.alg,
+                &authorization.issuer,
+                &authorization.key_id,
+                &authorization.payload,
+            )
+            .expect("test payload is canonicalizable"),
+        );
+        marketplace_authorization::SignedAuthorization {
+            signature: base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                signature.to_bytes(),
+            ),
+            ..authorization
+        }
+    }
+
+    fn trust(
+        key: &SigningKey,
+        active_at: chrono::DateTime<Utc>,
+        expires_at: Option<chrono::DateTime<Utc>>,
+        revoked: bool,
+    ) -> marketplace_authorization::MarketplaceIssuerTrust {
+        marketplace_authorization::MarketplaceIssuerTrust::from_keys(
+            "marketplace",
+            vec![marketplace_authorization::MarketplaceIssuerTrust::test_key(
+                "marketplace",
+                "marketplace-2026-01",
+                key.verifying_key(),
+                active_at,
+                expires_at,
+                revoked,
+            )],
+        )
+    }
+
+    #[test]
+    fn marketplace_ed25519_verifier_accepts_sorted_nested_payloads() {
+        let now = Utc::now();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let payload = json!({"z":{"b":2,"a":1},"items":[{"z":1,"a":2},"first"],"message":"café"});
+        let verified = trust(&key, now - Duration::seconds(1), None, false)
+            .verify(
+                &signed(&key, "marketplace", "marketplace-2026-01", payload.clone()),
+                now,
+            )
+            .expect("valid Ed25519 signature");
+        assert_eq!(
+            String::from_utf8(verified.canonical_signed_object).expect("canonical JSON is UTF-8"),
+            r#"{"alg":"Ed25519","issuer":"marketplace","key_id":"marketplace-2026-01","payload":{"items":[{"a":2,"z":1},"first"],"message":"café","z":{"a":1,"b":2}}}"#
+        );
+        assert_eq!(verified.payload, payload);
+    }
+
+    #[test]
+    fn marketplace_ed25519_verifier_rejects_untrusted_or_invalid_keys() {
+        let now = Utc::now();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let other = SigningKey::from_bytes(&[8; 32]);
+        let authorization = signed(&key, "marketplace", "marketplace-2026-01", json!({"a": 1}));
+        assert!(matches!(
+            trust(&other, now - Duration::seconds(1), None, false).verify(&authorization, now),
+            Err(marketplace_authorization::VerificationError::InvalidSignature)
+        ));
+        let mut wrong_issuer = authorization.clone();
+        wrong_issuer.issuer = "other".into();
+        assert!(matches!(
+            trust(&key, now - Duration::seconds(1), None, false).verify(&wrong_issuer, now),
+            Err(marketplace_authorization::VerificationError::UnknownIssuer)
+        ));
+        let mut unknown_key = authorization;
+        unknown_key.key_id = "unknown".into();
+        assert!(matches!(
+            trust(&key, now - Duration::seconds(1), None, false).verify(&unknown_key, now),
+            Err(marketplace_authorization::VerificationError::UnknownKey)
+        ));
+    }
+
+    #[test]
+    fn marketplace_ed25519_verifier_enforces_key_lifecycle_and_rotation_overlap() {
+        let now = Utc::now();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let authorization = signed(&key, "marketplace", "marketplace-2026-01", json!({"a": 1}));
+        assert!(matches!(
+            trust(&key, now + Duration::seconds(1), None, false).verify(&authorization, now),
+            Err(marketplace_authorization::VerificationError::KeyInactive)
+        ));
+        assert!(matches!(
+            trust(
+                &key,
+                now - Duration::seconds(2),
+                Some(now - Duration::seconds(1)),
+                false
+            )
+            .verify(&authorization, now),
+            Err(marketplace_authorization::VerificationError::KeyExpired)
+        ));
+        assert!(matches!(
+            trust(&key, now - Duration::seconds(1), None, true).verify(&authorization, now),
+            Err(marketplace_authorization::VerificationError::KeyRevoked)
+        ));
+        let next = SigningKey::from_bytes(&[8; 32]);
+        let overlap = marketplace_authorization::MarketplaceIssuerTrust::from_keys(
+            "marketplace",
+            vec![
+                marketplace_authorization::MarketplaceIssuerTrust::test_key(
+                    "marketplace",
+                    "marketplace-2026-01",
+                    key.verifying_key(),
+                    now - Duration::seconds(1),
+                    Some(now + Duration::seconds(1)),
+                    false,
+                ),
+                marketplace_authorization::MarketplaceIssuerTrust::test_key(
+                    "marketplace",
+                    "marketplace-2026-02",
+                    next.verifying_key(),
+                    now - Duration::seconds(1),
+                    None,
+                    false,
+                ),
+            ],
+        );
+        assert!(overlap.verify(&authorization, now).is_ok());
+        assert!(overlap
+            .verify(
+                &signed(&next, "marketplace", "marketplace-2026-02", json!({"a": 2})),
+                now
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn marketplace_ed25519_verifier_rejects_bad_encoding_and_altered_payload() {
+        let now = Utc::now();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let trust = trust(&key, now - Duration::seconds(1), None, false);
+        let mut authorization = signed(&key, "marketplace", "marketplace-2026-01", json!({"a": 1}));
+        authorization.signature = "*not-base64url*".into();
+        assert!(matches!(
+            trust.verify(&authorization, now),
+            Err(marketplace_authorization::VerificationError::InvalidSignatureEncoding)
+        ));
+        let mut authorization = signed(&key, "marketplace", "marketplace-2026-01", json!({"a": 1}));
+        authorization.payload = json!({"a": 2});
+        assert!(matches!(
+            trust.verify(&authorization, now),
+            Err(marketplace_authorization::VerificationError::InvalidSignature)
+        ));
+    }
+
+    #[test]
+    fn marketplace_ed25519_signature_covers_the_complete_protected_envelope() {
+        let now = Utc::now();
+        let first = SigningKey::from_bytes(&[7; 32]);
+        let second = SigningKey::from_bytes(&[8; 32]);
+        let issuer = "marketplace";
+        let authorization = signed(
+            &first,
+            issuer,
+            "marketplace-2026-01",
+            json!({"tenant":"tenant-a","order":"order-a"}),
+        );
+        let trust = marketplace_authorization::MarketplaceIssuerTrust::from_keys(
+            issuer,
+            vec![
+                marketplace_authorization::MarketplaceIssuerTrust::test_key(
+                    issuer,
+                    "marketplace-2026-01",
+                    first.verifying_key(),
+                    now - Duration::seconds(1),
+                    None,
+                    false,
+                ),
+                marketplace_authorization::MarketplaceIssuerTrust::test_key(
+                    issuer,
+                    "marketplace-2026-02",
+                    second.verifying_key(),
+                    now - Duration::seconds(1),
+                    None,
+                    false,
+                ),
+            ],
+        );
+        assert!(trust.verify(&authorization, now).is_ok());
+
+        // A payload-only signature was accepted by the Phase 4D foundation;
+        // Phase 4F must never accept it because protected metadata is signed.
+        let payload_only_signature = first.sign(
+            &marketplace_authorization::canonical_json(&authorization.payload)
+                .expect("test payload is canonicalizable"),
+        );
+        let payload_only = marketplace_authorization::SignedAuthorization {
+            signature: base64::Engine::encode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                payload_only_signature.to_bytes(),
+            ),
+            ..authorization.clone()
+        };
+        assert!(matches!(
+            trust.verify(&payload_only, now),
+            Err(marketplace_authorization::VerificationError::InvalidSignature)
+        ));
+
+        let mut substituted_issuer = authorization.clone();
+        substituted_issuer.issuer = "other".into();
+        assert!(matches!(
+            trust.verify(&substituted_issuer, now),
+            Err(marketplace_authorization::VerificationError::UnknownIssuer)
+        ));
+        let mut substituted_key = authorization.clone();
+        substituted_key.key_id = "marketplace-2026-02".into();
+        assert!(matches!(
+            trust.verify(&substituted_key, now),
+            Err(marketplace_authorization::VerificationError::InvalidSignature)
+        ));
+        let mut substituted_algorithm = authorization;
+        substituted_algorithm.alg = "Ed448".into();
+        assert!(matches!(
+            trust.verify(&substituted_algorithm, now),
+            Err(marketplace_authorization::VerificationError::UnsupportedAlgorithm)
+        ));
+    }
+
+    #[test]
+    fn marketplace_authorization_json_rejects_duplicates_and_uses_javascript_sorting() {
+        assert!(matches!(
+            marketplace_authorization::parse_signed_authorization(
+                br#"{"issuer":"marketplace","issuer":"other","key_id":"k","alg":"Ed25519","signature":"x","payload":{}}"#,
+            ),
+            Err(marketplace_authorization::VerificationError::DuplicateJsonKey)
+        ));
+        assert_eq!(
+            marketplace_authorization::canonical_json(&json!({"z": 1, "a": [{"b": 2, "a": 1}, 3]}))
+                .expect("safe numbers"),
+            br#"{"a":[{"a":1,"b":2},3],"z":1}"#
+        );
+        // UTF-16 sort order differs from UTF-8 for this pair: U+E000 sorts
+        // after a surrogate pair in JavaScript, while UTF-8 byte sorting puts
+        // it first.
+        assert_eq!(
+            marketplace_authorization::canonical_json(&json!({"\u{e000}": 1, "😀": 2}))
+                .expect("safe numbers"),
+            "{\"😀\":2,\"\u{e000}\":1}".as_bytes()
+        );
+        assert!(matches!(
+            marketplace_authorization::canonical_json(
+                &json!({"exact_amount": 9_007_199_254_740_992_u64})
+            ),
+            Err(marketplace_authorization::VerificationError::CanonicalizationUnsupported)
+        ));
+    }
+
+    #[derive(Deserialize)]
+    struct Ed25519Fixture {
+        keys: Vec<Ed25519FixtureKey>,
+        positive_vectors: Vec<Ed25519PositiveVector>,
+        negative_cases: Vec<Ed25519NegativeCase>,
+    }
+
+    #[derive(Deserialize)]
+    struct Ed25519FixtureKey {
+        key_id: String,
+        public_key_base64url: String,
+        active_at: String,
+        expires_at: String,
+    }
+
+    #[derive(Deserialize)]
+    struct Ed25519PositiveVector {
+        envelope: Value,
+        canonical_signing_json: String,
+        canonical_utf8_hex: String,
+        test_issuer: String,
+        test_key_id: String,
+        test_public_key_base64url: String,
+        expected_verification: Ed25519ExpectedVerification,
+        key_activation: Ed25519KeyActivation,
+    }
+
+    #[derive(Deserialize)]
+    struct Ed25519NegativeCase {
+        raw_envelope_utf8: String,
+        expected_verification: Ed25519ExpectedVerification,
+        #[serde(default)]
+        key_override: Option<Ed25519KeyOverride>,
+        #[serde(default)]
+        verification_at: Option<String>,
+        #[serde(default)]
+        expected_binding: Option<Value>,
+    }
+
+    #[derive(Deserialize)]
+    struct Ed25519ExpectedVerification {
+        outcome: String,
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        verification_at: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct Ed25519KeyActivation {
+        active_at: String,
+        expires_at: String,
+        revoked_at: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct Ed25519KeyOverride {
+        revoked_at: Option<String>,
+    }
+
+    fn fixture_time(value: &str) -> chrono::DateTime<Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .expect("fixture RFC3339 time")
+            .with_timezone(&Utc)
+    }
+
+    fn fixture_verification_reason(
+        error: &marketplace_authorization::VerificationError,
+    ) -> &'static str {
+        match error {
+            marketplace_authorization::VerificationError::UnknownIssuer => "unknown_issuer",
+            marketplace_authorization::VerificationError::UnknownKey => "unknown_key",
+            marketplace_authorization::VerificationError::KeyExpired => "expired_key",
+            marketplace_authorization::VerificationError::KeyRevoked => "revoked_key",
+            marketplace_authorization::VerificationError::UnsupportedAlgorithm => {
+                "unsupported_algorithm"
+            }
+            marketplace_authorization::VerificationError::InvalidSignatureEncoding => {
+                "malformed_signature"
+            }
+            marketplace_authorization::VerificationError::InvalidSignature => "signature_invalid",
+            marketplace_authorization::VerificationError::DuplicateJsonKey => "duplicate_json_key",
+            marketplace_authorization::VerificationError::UnknownEnvelopeField => {
+                "unknown_envelope_field"
+            }
+            other => panic!("fixture exercised an unclassified verification error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn marketplace_generated_ed25519_fixtures_are_interoperable() {
+        let fixture: Ed25519Fixture = serde_json::from_str(include_str!(
+            "../../../docs/integrations/devhub-marketplace-phase-4e/fixtures/ed25519-envelope-v1.json"
+        ))
+        .expect("unchanged Marketplace Ed25519 fixture");
+        assert_eq!(fixture.positive_vectors.len(), 7, "fixture count changed");
+        assert_eq!(fixture.negative_cases.len(), 11, "fixture count changed");
+
+        for vector in &fixture.positive_vectors {
+            let authorization = marketplace_authorization::parse_signed_authorization(
+                &serde_json::to_vec(&vector.envelope).expect("fixture envelope JSON"),
+            )
+            .expect("positive fixture parses");
+            let canonical = marketplace_authorization::canonical_signed_authorization(
+                &authorization.alg,
+                &authorization.issuer,
+                &authorization.key_id,
+                &authorization.payload,
+            )
+            .expect("positive fixture canonicalizes");
+            assert_eq!(
+                canonical,
+                vector.canonical_signing_json.as_bytes(),
+                "canonical JSON drifted"
+            );
+            assert_eq!(
+                hex::encode(&canonical),
+                vector.canonical_utf8_hex,
+                "canonical UTF-8 drifted"
+            );
+            let public_key: [u8; 32] = base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                &vector.test_public_key_base64url,
+            )
+            .expect("fixture public key encoding")
+            .try_into()
+            .expect("fixture public key length");
+            let trust = marketplace_authorization::MarketplaceIssuerTrust::from_keys(
+                vector.test_issuer.clone(),
+                vec![marketplace_authorization::MarketplaceIssuerTrust::test_key(
+                    vector.test_issuer.clone(),
+                    vector.test_key_id.clone(),
+                    ed25519_dalek::VerifyingKey::from_bytes(&public_key)
+                        .expect("fixture public key"),
+                    fixture_time(&vector.key_activation.active_at),
+                    Some(fixture_time(&vector.key_activation.expires_at)),
+                    vector.key_activation.revoked_at.is_some(),
+                )],
+            );
+            assert_eq!(vector.expected_verification.outcome, "allowed");
+            trust
+                .verify(
+                    &authorization,
+                    fixture_time(
+                        vector
+                            .expected_verification
+                            .verification_at
+                            .as_deref()
+                            .expect("positive verification time"),
+                    ),
+                )
+                .expect("Marketplace-generated signature verifies");
+        }
+
+        for case in &fixture.negative_cases {
+            let authorization = match marketplace_authorization::parse_signed_authorization(
+                case.raw_envelope_utf8.as_bytes(),
+            ) {
+                Ok(authorization) => authorization,
+                Err(error) if case.expected_verification.outcome == "denied" => {
+                    assert_eq!(
+                        case.expected_verification.reason.as_deref(),
+                        Some(fixture_verification_reason(&error)),
+                        "negative Marketplace fixture parse reason drifted"
+                    );
+                    continue;
+                }
+                Err(error) => panic!("negative fixture parse failed unexpectedly: {error:?}"),
+            };
+            let fixture_key = fixture
+                .keys
+                .iter()
+                .find(|key| key.key_id == authorization.key_id)
+                .or_else(|| fixture.keys.first())
+                .expect("negative fixture references fixture key");
+            let public_key: [u8; 32] = base64::Engine::decode(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                &fixture_key.public_key_base64url,
+            )
+            .expect("fixture public key encoding")
+            .try_into()
+            .expect("fixture public key length");
+            let revoked = case
+                .key_override
+                .as_ref()
+                .and_then(|override_| override_.revoked_at.as_ref())
+                .is_some();
+            let trust = marketplace_authorization::MarketplaceIssuerTrust::from_keys(
+                "marketplace.test.authority",
+                vec![marketplace_authorization::MarketplaceIssuerTrust::test_key(
+                    "marketplace.test.authority",
+                    fixture_key.key_id.clone(),
+                    ed25519_dalek::VerifyingKey::from_bytes(&public_key)
+                        .expect("fixture public key"),
+                    fixture_time(&fixture_key.active_at),
+                    Some(fixture_time(&fixture_key.expires_at)),
+                    revoked,
+                )],
+            );
+            let at = case
+                .verification_at
+                .as_deref()
+                .or(case.expected_verification.verification_at.as_deref())
+                .map(fixture_time)
+                .unwrap_or_else(|| fixture_time("2026-11-20T00:00:00.000Z"));
+            if case.expected_binding.is_some() {
+                assert!(
+                    trust.verify(&authorization, at).is_ok(),
+                    "the binding sample must be cryptographically valid before binding is checked"
+                );
+            } else {
+                let error = trust
+                    .verify(&authorization, at)
+                    .expect_err("negative Marketplace fixture unexpectedly verified");
+                assert_eq!(
+                    case.expected_verification.reason.as_deref(),
+                    Some(fixture_verification_reason(&error)),
+                    "negative Marketplace fixture verification reason drifted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn marketplace_reverse_hmac_and_check_contract_fixtures_validate() {
+        #[derive(Deserialize)]
+        struct ReverseHmacFixture {
+            credential: ReverseHmacCredential,
+            vectors: Vec<ReverseHmacVector>,
+        }
+        #[derive(Deserialize)]
+        struct ReverseHmacCredential {
+            key_id: String,
+            secret_test_only: String,
+        }
+        #[derive(Deserialize)]
+        struct ReverseHmacVector {
+            method: String,
+            exact_path: String,
+            timestamp_ms: String,
+            nonce: String,
+            raw_request_body: String,
+            body_sha256: Option<String>,
+            expected_signature_hex: Option<String>,
+            expected_authentication_outcome: String,
+        }
+        #[derive(Deserialize)]
+        struct CheckSamples {
+            commercial_authorization: CheckSamplesCommercial,
+            provider_eligibility: CheckSamplesProvider,
+        }
+        #[derive(Deserialize)]
+        struct CheckSamplesCommercial {
+            request: Value,
+            responses: VecOrObject,
+        }
+        #[derive(Deserialize)]
+        struct CheckSamplesProvider {
+            request: Value,
+            responses: VecOrObject,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum VecOrObject {
+            Object(serde_json::Map<String, Value>),
+        }
+
+        let reverse: ReverseHmacFixture = serde_json::from_str(include_str!(
+            "../../../docs/integrations/devhub-marketplace-phase-4e/fixtures/reverse-hmac-v1.json"
+        ))
+        .expect("unchanged Marketplace reverse-HMAC fixture");
+        assert_eq!(reverse.vectors.len(), 4, "fixture count changed");
+        let signed = reverse
+            .vectors
+            .iter()
+            .filter(|vector| vector.expected_signature_hex.is_some())
+            .count();
+        assert_eq!(signed, 2, "fixture signed-vector count changed");
+        let mut authenticated_replay_scopes = std::collections::BTreeSet::new();
+        let authenticated_timestamp = reverse
+            .vectors
+            .iter()
+            .find(|vector| vector.expected_authentication_outcome == "authenticated")
+            .expect("fixture has an authenticated vector")
+            .timestamp_ms
+            .parse::<i64>()
+            .expect("fixture timestamp");
+        for vector in &reverse.vectors {
+            let replay_scope = format!(
+                "{}:{}:{}",
+                reverse.credential.key_id, vector.exact_path, vector.nonce
+            );
+            match vector.expected_authentication_outcome.as_str() {
+                "authenticated" => {
+                    let digest =
+                        hex::encode(sha2::Sha256::digest(vector.raw_request_body.as_bytes()));
+                    assert_eq!(Some(digest.as_str()), vector.body_sha256.as_deref());
+                    assert_eq!(
+                        marketplace_authorization::reverse_hmac_signature(
+                            reverse.credential.secret_test_only.as_bytes(),
+                            &vector.method,
+                            &vector.exact_path,
+                            &vector.timestamp_ms,
+                            &vector.nonce,
+                            &reverse.credential.key_id,
+                            &digest,
+                        )
+                        .expect("fixture signing parameters"),
+                        vector.expected_signature_hex.as_deref().expect("signature")
+                    );
+                    assert!(
+                        authenticated_replay_scopes.insert(replay_scope),
+                        "authenticated fixture nonce must be unique in its replay scope"
+                    );
+                }
+                "refused_replay" => {
+                    assert!(vector.expected_signature_hex.is_none());
+                    assert!(
+                        authenticated_replay_scopes.contains(&replay_scope),
+                        "replay fixture must reuse an authenticated nonce in the same scope"
+                    );
+                }
+                "refused_timestamp" => {
+                    assert!(vector.expected_signature_hex.is_none());
+                    let timestamp = vector
+                        .timestamp_ms
+                        .parse::<i64>()
+                        .expect("fixture timestamp");
+                    assert!(
+                        authenticated_timestamp - timestamp > 90_000,
+                        "timestamp fixture must exceed the 90-second tolerance"
+                    );
+                }
+                other => panic!("unknown reverse-HMAC fixture outcome: {other}"),
+            }
+        }
+
+        let samples: CheckSamples = serde_json::from_str(include_str!(
+            "../../../docs/integrations/devhub-marketplace-phase-4e/fixtures/check-api-samples-v1.json"
+        ))
+        .expect("unchanged Marketplace check API samples");
+        let commercial: marketplace_authorization::CommercialAuthorizationCheck =
+            serde_json::from_value(samples.commercial_authorization.request)
+                .expect("commercial request schema");
+        marketplace_authorization::validate_commercial_request(&commercial)
+            .expect("commercial request contract");
+        let provider: marketplace_authorization::ProviderEligibilityCheck =
+            serde_json::from_value(samples.provider_eligibility.request)
+                .expect("provider request contract");
+        marketplace_authorization::validate_provider_request(&provider)
+            .expect("Preferred Network provider request contract");
+        let standard = marketplace_authorization::ProviderEligibilityCheck {
+            network_id: None,
+            expected_network_revision: None,
+            expected_provider_membership_revision: None,
+            ..provider.clone()
+        };
+        marketplace_authorization::validate_provider_request(&standard)
+            .expect("standard placement omits all Preferred Network bindings");
+        for partial in [
+            marketplace_authorization::ProviderEligibilityCheck {
+                network_id: Some("network".into()),
+                expected_network_revision: None,
+                expected_provider_membership_revision: Some(1),
+                ..standard.clone()
+            },
+            marketplace_authorization::ProviderEligibilityCheck {
+                network_id: None,
+                expected_network_revision: Some(1),
+                expected_provider_membership_revision: Some(1),
+                ..standard.clone()
+            },
+        ] {
+            assert_eq!(
+                marketplace_authorization::validate_provider_request(&partial),
+                Err(marketplace_authorization::MarketplaceCheckError::InvalidRequest)
+            );
+        }
+        let mut unknown = serde_json::to_value(&commercial).expect("commercial JSON");
+        unknown
+            .as_object_mut()
+            .expect("commercial object")
+            .insert("unknown".into(), Value::Bool(true));
+        assert!(
+            serde_json::from_value::<marketplace_authorization::CommercialAuthorizationCheck>(
+                unknown
+            )
+            .is_err()
+        );
+        let VecOrObject::Object(commercial_responses) = samples.commercial_authorization.responses;
+        let VecOrObject::Object(provider_responses) = samples.provider_eligibility.responses;
+        assert_eq!(commercial_responses.len(), 3);
+        assert_eq!(provider_responses.len(), 3);
+        for response in commercial_responses.into_values() {
+            serde_json::from_value::<marketplace_authorization::CommercialAuthorizationResponse>(
+                response,
+            )
+            .expect("commercial response schema");
+        }
+        for response in provider_responses.into_values() {
+            serde_json::from_value::<marketplace_authorization::ProviderEligibilityResponse>(
+                response,
+            )
+            .expect("provider response schema");
+        }
     }
 }

@@ -29,10 +29,24 @@ use crate::state::CloudState;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MarketplaceReleaseSnapshot {
+    /// DevHub's immutable executable-artifact authority.  The bytes remain in
+    /// the existing sealed runtime-artifact store; this is its durable,
+    /// replicated catalog and approval record, never a second blob store.
+    #[serde(default)]
+    pub runtime_artifacts: Vec<DevHubRuntimeArtifact>,
+    /// Append-only execution evidence for catalog byte availability. This is
+    /// not a storage locator and never substitutes for reopening the verified
+    /// local sealed artifact on the executing node.
+    #[serde(default)]
+    pub artifact_materializations: Vec<ArtifactMaterializationEvidence>,
     #[serde(default)]
     pub releases: Vec<ProjectRelease>,
     #[serde(default)]
     pub workloads: Vec<MarketplaceWorkload>,
+    /// DevHub workload identities are separate from Marketplace's commercial
+    /// order and from a future compute allocation. They survive reassignment.
+    #[serde(default)]
+    pub workload_instances: Vec<DevHubWorkloadInstance>,
     /// Successful migration applications are immutable facts, not build logs.
     /// They replicate with the release authority because both are required to
     /// decide whether a Marketplace workload may become ready.
@@ -43,6 +57,10 @@ pub struct MarketplaceReleaseSnapshot {
     /// here; it remains inside the managed database store.
     #[serde(default)]
     pub managed_postgres: BTreeMap<String, String>,
+    /// Durable, retryable Marketplace lifecycle outbox. The payload is a
+    /// deliberately safe projection and never contains deployment details.
+    #[serde(default)]
+    pub lifecycle_events: Vec<MarketplaceLifecycleEvent>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,6 +75,173 @@ pub struct ProjectRelease {
     /// Immutable source/build identity, never an executable deployment request.
     #[serde(default)]
     pub source_identity: String,
+    /// Server-owned execution binding. Existing source-only releases have no
+    /// binding and are deliberately not executable Marketplace releases.
+    #[serde(default)]
+    pub execution: Option<ReleaseExecutionBinding>,
+    pub created_ms: u64,
+}
+
+/// The immutable executable authority for one release revision. The current
+/// platform has no DevHub-wide artifact catalog, so this type is intentionally
+/// only populated by a future internal artifact-storage integration; callers
+/// cannot submit it through the project or Marketplace APIs.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReleaseExecutionBinding {
+    pub artifact: ExecutableWorkloadArtifact,
+    pub runtime_spec: MinecraftRuntimeSpec,
+    pub runtime_spec_digest: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutableWorkloadArtifact {
+    /// SHA-256 of immutable executable bytes, never an image tag or URL.
+    pub digest: String,
+    /// An opaque DevHub artifact-store key, never a path, URL, or registry
+    /// location disclosed to Marketplace.
+    pub storage_reference: String,
+    pub workload_type: String,
+    pub provenance: String,
+    pub approval_state: String,
+    pub created_ms: u64,
+    pub security_validated: bool,
+    pub policy_validated: bool,
+}
+
+/// A catalog entry names a package already verified by the sealed runtime
+/// artifact subsystem.  `reference` is intentionally a URI, not a filesystem
+/// path: callers can only resolve it through DevHub.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DevHubRuntimeArtifact {
+    pub artifact_id: String,
+    pub sha256: String,
+    pub reference: String,
+    pub size_bytes: u64,
+    pub workload_type: String,
+    pub provenance: String,
+    pub created_ms: u64,
+    pub publisher_identity: String,
+    pub approval_state: String,
+    pub security_validated: bool,
+    pub policy_validated: bool,
+    pub storage_backend: String,
+    pub storage_reference: String,
+    /// Existing sealed-package bytes are durable only on this node.  The
+    /// catalog replicates the fact, never the bytes, so execution fails closed
+    /// if allocation targets another node.
+    pub storage_node: String,
+    #[serde(default)]
+    pub revoked: bool,
+    /// Descriptor-bound package metadata is what lets DevHub re-open and
+    /// re-verify the existing content-addressed bytes at materialization time.
+    pub package: hive_backend::RuntimeArtifactPackageDescriptor,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ArtifactMaterializationEvidence {
+    pub requested_digest: String,
+    pub source_node: String,
+    pub target_node: String,
+    /// `already_verified`, `materialized`, or `failed`.
+    pub result: String,
+    #[serde(default)]
+    pub verified_digest: Option<String>,
+    pub timestamp_ms: u64,
+}
+
+/// Versioned, server-owned Minecraft launch contract. Secrets are represented
+/// only by internal selectors; their values never enter a release record.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MinecraftRuntimeSpec {
+    pub version: String,
+    pub minecraft_version: String,
+    pub entrypoint: Vec<String>,
+    pub launch_arguments: Vec<String>,
+    pub public_ports: Vec<u16>,
+    pub healthcheck: String,
+    pub cpu_limit: u32,
+    pub memory_limit_mib: u64,
+    pub storage_gib: u64,
+    pub persistent_volume_schema: String,
+    pub shutdown_behavior: String,
+    pub startup_timeout_seconds: u64,
+    pub allowed_environment: Vec<String>,
+    pub secret_references: Vec<String>,
+    /// DevHub-owned OCI runtime image.  It must be digest-pinned; Marketplace
+    /// can neither provide nor alter it.
+    #[serde(default)]
+    pub runtime_image: String,
+}
+
+impl MinecraftRuntimeSpec {
+    pub(crate) fn digest(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"devhub-minecraft-runtime-spec-v1\0");
+        hasher.update(serde_json::to_vec(self).expect("runtime spec serializes"));
+        hex::encode(hasher.finalize())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DevHubWorkloadInstance {
+    pub workload_instance_id: String,
+    pub workload_order_id: String,
+    pub buyer_tenant_id: String,
+    pub marketplace_idempotency_key: String,
+    pub term_starts_at: String,
+    pub term_ends_at: String,
+    pub requested_vcpu: u32,
+    pub requested_memory_mib: u64,
+    pub requested_storage_gib: u64,
+    pub project_id: String,
+    pub release_id: String,
+    pub revision: String,
+    pub artifact_digest: String,
+    pub runtime_spec_digest: String,
+    pub lifecycle_state: String,
+    #[serde(default)]
+    pub current_primary_allocation: Option<String>,
+    #[serde(default)]
+    pub persistent_storage_id: Option<String>,
+    /// The node holding the only node-local `world` volume.  A stateful
+    /// workload may not move away from this node and silently receive a blank
+    /// volume.
+    #[serde(default)]
+    pub storage_node: Option<String>,
+    /// Honest v1 storage capabilities.  The `world` volume survives a runtime
+    /// restart on this node only; it is neither transferable nor replicated.
+    #[serde(default = "storage_persistent")]
+    pub storage_persistent: bool,
+    #[serde(default)]
+    pub storage_snapshot: bool,
+    #[serde(default)]
+    pub storage_portable_restore: bool,
+    #[serde(default)]
+    pub storage_replication: bool,
+    #[serde(default)]
+    pub storage_multi_node_attach: bool,
+    #[serde(default)]
+    pub runtime_container_id: Option<String>,
+    #[serde(default)]
+    pub runtime_process_started: bool,
+    #[serde(default)]
+    pub runtime_healthy: bool,
+    /// A raw TCP connect has reached the published Minecraft game port.
+    /// This is intentionally separate from process liveness and protocol
+    /// readiness: a listening port can exist before a server can answer a
+    /// Minecraft status request.
+    #[serde(default)]
+    pub tcp_ready: bool,
+    /// The server completed the Minecraft Server List Ping status exchange.
+    /// Old `tcp-listen-v1` release contracts leave this false rather than
+    /// overstating their weaker readiness evidence.
+    #[serde(default)]
+    pub minecraft_application_ready: bool,
+    #[serde(default)]
+    pub workload_ready: bool,
+    #[serde(default)]
+    pub failure_reason: Option<String>,
+    pub continuity_policy: String,
     pub created_ms: u64,
 }
 
@@ -74,6 +259,10 @@ impl WorkloadClientCertificateCapability {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MarketplaceWorkload {
+    /// Opaque DevHub handoff receipt. It is intentionally unrelated to a
+    /// deployment id, endpoint, provider, or credential selector.
+    #[serde(default)]
+    pub workload_handoff_id: String,
     pub allocation_id: String,
     pub project_id: String,
     pub release_id: String,
@@ -86,6 +275,20 @@ pub struct MarketplaceWorkload {
     #[serde(default)]
     pub credential_id: Option<String>,
     pub created_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MarketplaceLifecycleEvent {
+    pub event_id: String,
+    pub event_version: u8,
+    pub workload_order_id: String,
+    pub buyer_tenant_id: String,
+    pub allocation_id: String,
+    pub lifecycle_status: String,
+    pub occurred_at: String,
+    pub reason_code: String,
+    #[serde(default)]
+    pub delivered: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,6 +320,123 @@ impl MarketplaceReleaseStore {
             .iter()
             .find(|release| release.release_id == release_id)
             .cloned()
+    }
+
+    pub(crate) fn runtime_artifact(&self, digest: &str) -> Option<DevHubRuntimeArtifact> {
+        self.0
+            .read()
+            .runtime_artifacts
+            .iter()
+            .find(|artifact| artifact.sha256 == digest)
+            .cloned()
+    }
+
+    pub(crate) fn record_artifact_materialization(
+        &self,
+        evidence: ArtifactMaterializationEvidence,
+    ) {
+        let mut state = self.0.write();
+        state.artifact_materializations.push(evidence);
+        // Availability is diagnostic history, not artifact authority. Keep a
+        // bounded tail so repeated transport failures cannot grow the durable
+        // release snapshot without limit.
+        const MAX_EVIDENCE: usize = 512;
+        if state.artifact_materializations.len() > MAX_EVIDENCE {
+            let excess = state.artifact_materializations.len() - MAX_EVIDENCE;
+            state.artifact_materializations.drain(..excess);
+        }
+    }
+
+    /// Import is content-addressed and therefore idempotent.  A digest can
+    /// never be re-bound to a different descriptor, approval record, or
+    /// provenance.
+    pub(crate) fn import_runtime_artifact(
+        &self,
+        artifact: DevHubRuntimeArtifact,
+    ) -> Result<DevHubRuntimeArtifact, &'static str> {
+        if !valid_sha256(&artifact.sha256)
+            || artifact.reference != format!("devhub://runtime-artifacts/{}", artifact.sha256)
+            || artifact.package.package_sha256 != artifact.sha256
+            || artifact.size_bytes != artifact.package.package_bytes
+            || artifact.workload_type != "minecraft"
+            || artifact.storage_backend != "sealed-runtime-artifact-package-v1"
+            || artifact.storage_node.trim().is_empty()
+            || artifact.revoked
+        {
+            return Err("devhub_artifact_invalid");
+        }
+        let mut state = self.0.write();
+        if let Some(existing) = state
+            .runtime_artifacts
+            .iter()
+            .find(|existing| existing.sha256 == artifact.sha256)
+        {
+            return if existing.package == artifact.package
+                && existing.workload_type == artifact.workload_type
+                && existing.provenance == artifact.provenance
+                && existing.publisher_identity == artifact.publisher_identity
+            {
+                Ok(existing.clone())
+            } else {
+                Err("devhub_artifact_digest_conflict")
+            };
+        }
+        state.runtime_artifacts.push(artifact.clone());
+        Ok(artifact)
+    }
+
+    pub(crate) fn bind_release_artifact(
+        &self,
+        release_id: &str,
+        artifact_digest: &str,
+        runtime_spec: MinecraftRuntimeSpec,
+    ) -> Result<ProjectRelease, &'static str> {
+        let artifact = self
+            .runtime_artifact(artifact_digest)
+            .ok_or("devhub_artifact_not_found")?;
+        if artifact.revoked
+            || artifact.approval_state != "approved"
+            || !artifact.security_validated
+            || !artifact.policy_validated
+        {
+            return Err("devhub_artifact_unapproved");
+        }
+        if !valid_minecraft_runtime_spec(&runtime_spec) {
+            return Err("minecraft_runtime_spec_invalid");
+        }
+        let binding = ReleaseExecutionBinding {
+            artifact: ExecutableWorkloadArtifact {
+                digest: artifact.sha256.clone(),
+                storage_reference: artifact.reference.clone(),
+                workload_type: artifact.workload_type.clone(),
+                provenance: artifact.provenance.clone(),
+                approval_state: artifact.approval_state.clone(),
+                created_ms: artifact.created_ms,
+                security_validated: artifact.security_validated,
+                policy_validated: artifact.policy_validated,
+            },
+            runtime_spec_digest: runtime_spec.digest(),
+            runtime_spec,
+        };
+        let mut state = self.0.write();
+        let release = state
+            .releases
+            .iter_mut()
+            .find(|release| release.release_id == release_id)
+            .ok_or("marketplace_release_not_found")?;
+        match &release.execution {
+            Some(existing)
+                if existing.artifact.digest == binding.artifact.digest
+                    && existing.runtime_spec_digest == binding.runtime_spec_digest =>
+            {
+                Ok(release.clone())
+            }
+            Some(_) => Err("marketplace_release_execution_immutable"),
+            None => {
+                release.execution = Some(binding);
+                Ok(release.clone())
+            }
+        }
     }
 
     pub(crate) fn workload(&self, allocation_id: &str) -> Option<MarketplaceWorkload> {
@@ -192,6 +512,100 @@ impl MarketplaceReleaseStore {
         self.0.write().releases.push(release);
     }
 
+    /// Resolve only a fully approved immutable executable binding. A
+    /// source/build identity is provenance, not executable authority.
+    pub(crate) fn executable_binding(
+        &self,
+        project_id: &str,
+        release_id: &str,
+        revision: &str,
+    ) -> Option<ReleaseExecutionBinding> {
+        let release = self.release(release_id).filter(|release| {
+            release.project_id == project_id
+                && release.revision == revision
+                && release.published
+                && !release.revoked
+        })?;
+        let binding = release.execution?;
+        let artifact = self.runtime_artifact(&binding.artifact.digest)?;
+        (binding.artifact.workload_type == "minecraft"
+            && binding.artifact.approval_state == "approved"
+            && binding.artifact.security_validated
+            && binding.artifact.policy_validated
+            && !artifact.revoked
+            && artifact.reference == binding.artifact.storage_reference
+            && artifact.approval_state == "approved"
+            && artifact.security_validated
+            && artifact.policy_validated
+            && valid_sha256(&binding.artifact.digest)
+            && binding.runtime_spec.version == "minecraft-runtime-v1"
+            && binding.runtime_spec_digest == binding.runtime_spec.digest())
+        .then_some(binding)
+    }
+
+    pub(crate) fn accept_workload_instance(
+        &self,
+        mut instance: DevHubWorkloadInstance,
+    ) -> Result<DevHubWorkloadInstance, &'static str> {
+        let mut state = self.0.write();
+        if let Some(existing) = state.workload_instances.iter().find(|existing| {
+            existing.marketplace_idempotency_key == instance.marketplace_idempotency_key
+        }) {
+            return if existing.workload_order_id == instance.workload_order_id
+                && existing.buyer_tenant_id == instance.buyer_tenant_id
+                && existing.term_starts_at == instance.term_starts_at
+                && existing.term_ends_at == instance.term_ends_at
+                && existing.requested_vcpu == instance.requested_vcpu
+                && existing.requested_memory_mib == instance.requested_memory_mib
+                && existing.requested_storage_gib == instance.requested_storage_gib
+                && existing.project_id == instance.project_id
+                && existing.release_id == instance.release_id
+                && existing.revision == instance.revision
+                && existing.continuity_policy == instance.continuity_policy
+            {
+                Ok(existing.clone())
+            } else {
+                Err("marketplace_workload_idempotency_conflict")
+            };
+        }
+        if state
+            .workload_instances
+            .iter()
+            .any(|existing| existing.workload_order_id == instance.workload_order_id)
+        {
+            return Err("marketplace_workload_order_already_accepted");
+        }
+        instance.lifecycle_state = "accepted".into();
+        state.workload_instances.push(instance.clone());
+        Ok(instance)
+    }
+
+    pub(crate) fn workload_instance(&self, id: &str) -> Option<DevHubWorkloadInstance> {
+        self.0
+            .read()
+            .workload_instances
+            .iter()
+            .find(|instance| instance.workload_instance_id == id)
+            .cloned()
+    }
+
+    pub(crate) fn workload_instances(&self) -> Vec<DevHubWorkloadInstance> {
+        self.0.read().workload_instances.clone()
+    }
+
+    pub(crate) fn update_workload_instance(
+        &self,
+        updated: DevHubWorkloadInstance,
+    ) -> Option<DevHubWorkloadInstance> {
+        let mut state = self.0.write();
+        let instance = state
+            .workload_instances
+            .iter_mut()
+            .find(|instance| instance.workload_instance_id == updated.workload_instance_id)?;
+        *instance = updated.clone();
+        Some(updated)
+    }
+
     fn attach(&self, workload: MarketplaceWorkload) -> Result<MarketplaceWorkload, &'static str> {
         let mut state = self.0.write();
         if let Some(existing) = state
@@ -203,6 +617,7 @@ impl MarketplaceReleaseStore {
                 && existing.release_id == workload.release_id
                 && existing.revision == workload.revision
                 && existing.buyer_tenant == workload.buyer_tenant
+                && existing.workload_handoff_id == workload.workload_handoff_id
                 && existing.client_certificate_delivery_requested
                     == workload.client_certificate_delivery_requested
                 && existing.credential_id == workload.credential_id
@@ -216,6 +631,32 @@ impl MarketplaceReleaseStore {
         Ok(workload)
     }
 
+    /// Attach a workload only after the Marketplace allocation boundary has
+    /// verified its payment, tenant, project, and immutable release binding.
+    /// This keeps browser-authenticated project routes out of the commercial
+    /// handoff path entirely.
+    pub(crate) fn attach_from_marketplace(
+        &self,
+        workload_handoff_id: String,
+        allocation_id: String,
+        project_id: String,
+        release_id: String,
+        revision: String,
+        buyer_tenant: String,
+    ) -> Result<MarketplaceWorkload, &'static str> {
+        self.attach(MarketplaceWorkload {
+            workload_handoff_id,
+            allocation_id,
+            project_id,
+            release_id,
+            revision,
+            buyer_tenant,
+            client_certificate_delivery_requested: false,
+            credential_id: None,
+            created_ms: hive_core::now_ms(),
+        })
+    }
+
     pub fn workload_for_project(&self, project: &str) -> Option<MarketplaceWorkload> {
         self.0
             .read()
@@ -224,6 +665,48 @@ impl MarketplaceReleaseStore {
             .rev()
             .find(|workload| workload.project_id == project)
             .cloned()
+    }
+
+    /// Queue an immutable lifecycle event exactly once. Delivery retries retain
+    /// the same event id and byte-for-byte payload; Marketplace deduplicates by
+    /// that id rather than interpreting transport retries as new state.
+    pub(crate) fn queue_lifecycle_event(
+        &self,
+        event: MarketplaceLifecycleEvent,
+    ) -> MarketplaceLifecycleEvent {
+        let mut state = self.0.write();
+        if let Some(existing) = state
+            .lifecycle_events
+            .iter()
+            .find(|existing| existing.event_id == event.event_id)
+        {
+            return existing.clone();
+        }
+        state.lifecycle_events.push(event.clone());
+        event
+    }
+
+    pub(crate) fn pending_lifecycle_events(&self) -> Vec<MarketplaceLifecycleEvent> {
+        self.0
+            .read()
+            .lifecycle_events
+            .iter()
+            .filter(|event| !event.delivered)
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn mark_lifecycle_delivered(&self, event_id: &str) -> bool {
+        let mut state = self.0.write();
+        let Some(event) = state
+            .lifecycle_events
+            .iter_mut()
+            .find(|event| event.event_id == event_id)
+        else {
+            return false;
+        };
+        event.delivered = true;
+        true
     }
 
     /// Resolves only an exact immutable binding.  Project identity is never a
@@ -282,6 +765,42 @@ fn credential_id(allocation: &str, project: &str, release: &str) -> String {
         hasher.update(value.as_bytes());
     }
     format!("mwc-{}", hex::encode(hasher.finalize()))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_minecraft_runtime_spec(spec: &MinecraftRuntimeSpec) -> bool {
+    spec.version == "minecraft-runtime-v1"
+        && !spec.minecraft_version.trim().is_empty()
+        && !spec.entrypoint.is_empty()
+        && spec.public_ports == vec![25565]
+        && matches!(
+            spec.healthcheck.as_str(),
+            "tcp-listen-v1" | "minecraft-status-v1"
+        )
+        && spec.cpu_limit > 0
+        && spec.memory_limit_mib >= 512
+        && spec.storage_gib > 0
+        && spec.persistent_volume_schema == "minecraft-world-v1"
+        && spec.shutdown_behavior == "graceful-stop-v1"
+        && (10..=900).contains(&spec.startup_timeout_seconds)
+        && spec
+            .runtime_image
+            .strip_prefix("docker://")
+            .is_some_and(|image| image.contains("@sha256:") && image.len() <= 512)
+        && spec
+            .secret_references
+            .iter()
+            .all(|reference| reference.starts_with("devhub-secret://") && reference.len() <= 256)
+}
+
+fn storage_persistent() -> bool {
+    true
 }
 
 fn configured_path(name: &str) -> Result<PathBuf, &'static str> {
@@ -522,6 +1041,27 @@ struct CreateReleaseRequest {
     source_identity: String,
 }
 
+/// Operator-only import into the DevHub catalog.  The descriptor is metadata
+/// for bytes that are already in the existing sealed artifact store; no URL,
+/// image tag, registry credential, path, or secret is accepted.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportRuntimeArtifactRequest {
+    package: hive_backend::RuntimeArtifactPackageDescriptor,
+    workload_type: String,
+    provenance: String,
+    approval_state: String,
+    security_validated: bool,
+    policy_validated: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BindReleaseArtifactRequest {
+    artifact_digest: String,
+    runtime_spec: MinecraftRuntimeSpec,
+}
+
 #[derive(Deserialize)]
 struct AttachWorkloadRequest {
     allocation_id: String,
@@ -533,14 +1073,107 @@ struct AttachWorkloadRequest {
 pub fn routes(cloud: Arc<CloudState>) -> Router {
     Router::new()
         .route(
+            "/v1/devhub/runtime-artifacts/import",
+            post(import_runtime_artifact),
+        )
+        .route(
+            "/v1/devhub/releases/:release/artifact-binding",
+            post(bind_release_artifact),
+        )
+        .route(
             "/v1/projects/:project/marketplace-releases",
             post(create_release),
         )
-        .route(
-            "/v1/projects/:project/marketplace-workloads",
-            post(attach_workload),
-        )
         .with_state(cloud)
+}
+
+async fn import_runtime_artifact(
+    State(cloud): State<Arc<CloudState>>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(request): Json<ImportRuntimeArtifactRequest>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    crate::admin::require_operator(claims.as_ref().map(|claim| &claim.0))?;
+    if request.workload_type != "minecraft"
+        || request.provenance.trim().is_empty()
+        || request.provenance.len() > 512
+        || request.approval_state != "approved"
+    {
+        return Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            "devhub_artifact_invalid".into(),
+        ));
+    }
+    let store = crate::persist::data_dir().join("runtime-artifacts-v1");
+    let sealed =
+        hive_backend::reopen_sealed_runtime_artifact(&store, &request.package).map_err(|_| {
+            (
+                axum::http::StatusCode::CONFLICT,
+                "devhub_artifact_missing".into(),
+            )
+        })?;
+    // Opening the package performs both package SHA-256 and semantic tree
+    // verification.  This is deliberately done before recording any catalog
+    // fact, so a catalog row can never bless absent or mutable bytes.
+    let verified = sealed.verified_package().map_err(|_| {
+        (
+            axum::http::StatusCode::CONFLICT,
+            "devhub_artifact_digest_mismatch".into(),
+        )
+    })?;
+    drop(verified);
+    let publisher = claims
+        .as_ref()
+        .map(|claim| claim.0.sub.clone())
+        .unwrap_or_default();
+    let artifact = cloud
+        .marketplace_releases
+        .import_runtime_artifact(DevHubRuntimeArtifact {
+            artifact_id: format!("art_{}", Uuid::new_v4().simple()),
+            sha256: request.package.package_sha256.clone(),
+            reference: format!(
+                "devhub://runtime-artifacts/{}",
+                request.package.package_sha256
+            ),
+            size_bytes: request.package.package_bytes,
+            workload_type: request.workload_type,
+            provenance: request.provenance,
+            created_ms: hive_core::now_ms(),
+            publisher_identity: publisher,
+            approval_state: request.approval_state,
+            security_validated: request.security_validated,
+            policy_validated: request.policy_validated,
+            storage_backend: "sealed-runtime-artifact-package-v1".into(),
+            storage_reference: "sealed-runtime-artifact-package-v1".into(),
+            storage_node: cloud.node_name.clone(),
+            revoked: false,
+            package: request.package,
+        })
+        .map_err(|code| (axum::http::StatusCode::CONFLICT, code.into()))?;
+    crate::persist::persist(&cloud);
+    Ok(Json(json!({
+        "artifact_id": artifact.artifact_id,
+        "reference": artifact.reference,
+        "sha256": artifact.sha256,
+    })))
+}
+
+async fn bind_release_artifact(
+    State(cloud): State<Arc<CloudState>>,
+    Path(release): Path<String>,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Json(request): Json<BindReleaseArtifactRequest>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    crate::admin::require_operator(claims.as_ref().map(|claim| &claim.0))?;
+    let release = cloud
+        .marketplace_releases
+        .bind_release_artifact(&release, &request.artifact_digest, request.runtime_spec)
+        .map_err(|code| (axum::http::StatusCode::CONFLICT, code.into()))?;
+    crate::persist::persist(&cloud);
+    Ok(Json(json!({
+        "release_id": release.release_id,
+        "revision": release.revision,
+        "executable": true,
+    })))
 }
 
 /// Renew bound credentials before their one-hour validity floor elapses. A
@@ -604,6 +1237,10 @@ async fn create_release(
         revoked: false,
         workload_client_certificate: request.workload_client_certificate,
         source_identity: request.source_identity,
+        // Source identity is retained for provenance only. The current
+        // release endpoint cannot attach a DevHub-stored immutable artifact,
+        // so a newly created release is intentionally source-only.
+        execution: None,
         created_ms: hive_core::now_ms(),
     };
     cloud.marketplace_releases.insert_release(release.clone());
@@ -679,6 +1316,7 @@ async fn attach_workload(
     let workload = cloud
         .marketplace_releases
         .attach(MarketplaceWorkload {
+            workload_handoff_id: format!("wh_{}", Uuid::new_v4().simple()),
             allocation_id: request.allocation_id.clone(),
             project_id: project.clone(),
             release_id: release.release_id,

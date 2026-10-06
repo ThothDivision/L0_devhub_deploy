@@ -16,6 +16,12 @@ Marketplace calls DevHub through exactly four private service-to-service routes:
 * `POST /v1/marketplace/payments/verify`
 * `POST /v1/marketplace/l0/allocations`
 
+The deployment advertisement route includes the compatibility-preserving
+optional `hardware` projection for trusted, sanitized node inventory. Its
+schema, bounds, omitted-field policy, identity binding, and 60-second
+freshness behavior are defined in `devhub-marketplace-private.yaml`; it does
+not add a route or alter the private exposure boundary.
+
 DevHub calls Marketplace only for
 `GET /v1/marketplace/orders/{marketplace_order_id}/placement-policy`, from its
 server-side route with a Clerk JWT minted from the
@@ -23,13 +29,17 @@ server-side route with a Clerk JWT minted from the
 Admin route and is intentionally absent from this private DevHub OpenAPI
 document.
 
-Marketplace allocation status/read APIs, callbacks, and DevHub/Hive usage
-ingestion are not current requirements. `POST /usage-records` is
-buyer-authenticated, not a DevHub/Hive ingestion surface. Any future need for
-allocation callbacks, usage ingestion, or node-verifier completion requires a
-separately reviewed Marketplace contract covering authentication, tenant
-binding, idempotency/replay, payload sanitization, error semantics, and
-operational ownership.
+The four routes in this OpenAPI file do not include capacity holds, allocation
+status/read APIs, callbacks, project/release handoff, execution evidence, or
+DevHub/Hive usage ingestion. `POST /usage-records` is buyer-authenticated and
+is not a DevHub/Hive ingestion surface. The required, separately reviewed
+reference for those capabilities is
+[DevHub L0 operational contract](../integrations/devhub-l0-operational-contract.md).
+That contract is not yet implemented by this OpenAPI surface.
+[Marketplace consumer handoff](../integrations/marketplace-consumer-handoff.md)
+is the concise implementation guide for the separate Marketplace repository;
+it distinguishes the four available routes from the future operational
+contract.
 
 Do not add Swagger UI for Hive Admin. Static files are intentionally the only
 documentation delivery mechanism in this change.
