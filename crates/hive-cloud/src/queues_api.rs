@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use crate::admin::tenant;
 use crate::queues::{
-    ConsumerSettings, ConsumerType, QueueSettings, MAX_MESSAGE_BODY_BYTES,
-    PULL_BATCH_SIZE_DEFAULT, PULL_BATCH_SIZE_MAX, VISIBILITY_TIMEOUT_DEFAULT_MS,
+    ConsumerSettings, ConsumerType, QueueSettings, MAX_MESSAGE_BODY_BYTES, PULL_BATCH_SIZE_DEFAULT,
+    PULL_BATCH_SIZE_MAX, VISIBILITY_TIMEOUT_DEFAULT_MS,
 };
 use crate::state::CloudState;
 
@@ -42,10 +42,7 @@ pub fn routes() -> Router<Arc<CloudState>> {
             axum::routing::delete(consumer_delete),
         )
         .route("/v1/queues/:queue_id/messages", post(message_send))
-        .route(
-            "/v1/queues/:queue_id/messages/pull",
-            post(messages_pull),
-        )
+        .route("/v1/queues/:queue_id/messages/pull", post(messages_pull))
         .route("/v1/queues/:queue_id/messages/ack", post(messages_ack))
         .route("/v1/queues/:queue_id/metrics", get(queue_metrics))
 }
@@ -138,7 +135,10 @@ async fn queue_get(
     Path(queue_id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let queue = c.queues.get(&t, &queue_id).ok_or_else(|| not_found("queue"))?;
+    let queue = c
+        .queues
+        .get(&t, &queue_id)
+        .ok_or_else(|| not_found("queue"))?;
     Ok(ok_envelope(queue_view(&c, queue)))
 }
 
@@ -157,9 +157,14 @@ async fn queue_update(
     Json(body): Json<QueueUpdateReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let current = c.queues.get(&t, &queue_id).ok_or_else(|| not_found("queue"))?;
+    let current = c
+        .queues
+        .get(&t, &queue_id)
+        .ok_or_else(|| not_found("queue"))?;
     let settings = QueueSettings {
-        delivery_delay: body.delivery_delay.unwrap_or(current.settings.delivery_delay),
+        delivery_delay: body
+            .delivery_delay
+            .unwrap_or(current.settings.delivery_delay),
         delivery_paused: body
             .delivery_paused
             .unwrap_or(current.settings.delivery_paused),
@@ -278,14 +283,13 @@ async fn consumer_create(
     // A dead_letter_queue must exist AND belong to the same tenant — matches
     // Cloudflare's own consumer-create validation.
     if let Some(dlq_name) = &body.dead_letter_queue {
-        let dlq = c
-            .queues
-            .find_by_name(&t, dlq_name)
-            .ok_or_else(|| err_envelope(
+        let dlq = c.queues.find_by_name(&t, dlq_name).ok_or_else(|| {
+            err_envelope(
                 StatusCode::BAD_REQUEST,
                 10003,
                 &format!("dead_letter_queue \"{dlq_name}\" does not exist"),
-            ))?;
+            )
+        })?;
         let consumer = c.queues.create_consumer(
             &queue_id,
             body.kind,
@@ -343,7 +347,10 @@ async fn message_send(
     // the pull-consumer's messages/pull below), not producer sends — the
     // field name is specifically "delivery_paused", not "send_paused", and a
     // producer must be able to keep enqueueing while delivery is held.
-    let queue = c.queues.get(&t, &queue_id).ok_or_else(|| not_found("queue"))?;
+    let queue = c
+        .queues
+        .get(&t, &queue_id)
+        .ok_or_else(|| not_found("queue"))?;
     let body_str = req.body.to_string();
     if body_str.len() > MAX_MESSAGE_BODY_BYTES {
         return Err(err_envelope(
@@ -376,7 +383,10 @@ async fn messages_pull(
     Json(req): Json<PullReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
-    let queue = c.queues.get(&t, &queue_id).ok_or_else(|| not_found("queue"))?;
+    let queue = c
+        .queues
+        .get(&t, &queue_id)
+        .ok_or_else(|| not_found("queue"))?;
     let batch_size = req
         .batch_size
         .unwrap_or(PULL_BATCH_SIZE_DEFAULT)

@@ -1,0 +1,180 @@
+--- a/litebox_shim_linux/src/lib.rs
++++ b/litebox_shim_linux/src/lib.rs
+@@ -204,6 +204,24 @@
+                 return ContinueOperation::Terminate;
+             }
+         }
++        // The syscall rewriter leaves `icebp; hlt` (`f1 f4`) where it cannot hook a `syscall`
++        // (e.g. when the trampoline page after the image is taken by another mapping in this
++        // shared host address space) so that the guest can never reach the host kernel with
++        // it. The `icebp` trap arrives here with `rip` on the `hlt`: serve the syscall through
++        // the shim, exactly as the hooked path would, and resume after it.
++        #[cfg(target_arch = "x86_64")]
++        if !info.kernel_mode
++            && info.exception.0 == 1
++            && UserPtr::<u8>::from_usize(ctx.rip.wrapping_sub(1))
++                .to_owned_slice::<Platform>(2)
++                .is_some_and(|code| *code == [0xf1, 0xf4])
++        {
++            ctx.orig_rax = ctx.rax;
++            ctx.rip += 1;
++            ctx.rcx = ctx.rip;
++            ctx.r11 = ctx.eflags;
++            return self.enter_shim(false, ctx, Task::handle_syscall_request);
++        }
+         self.enter_shim(false, ctx, |task, _ctx| task.handle_exception_request(info))
+     }
+ 
+--- a/litebox_shim_linux/src/syscalls/mm.rs
++++ b/litebox_shim_linux/src/syscalls/mm.rs
+@@ -825,7 +825,16 @@
+     /// Handle syscall `brk`
+     #[inline]
+     pub(crate) fn sys_brk(&self, addr: UserPtrMut<u8>) -> Result<usize, Errno> {
+-        let result = litebox_common_linux::mm::sys_brk(&self.process().pm(), addr);
++        let mut result = litebox_common_linux::mm::sys_brk(&self.process().pm(), addr);
++        // The `brk` syscall has no errno: a request it cannot satisfy answers the UNCHANGED
++        // break, and glibc's `brk()`/`sbrk()` take any answer >= the request for success. An
++        // `-ENOMEM` here read as a huge break, so `sysmalloc` "grew" the heap over pages that were
++        // never mapped and its first write to the new top chunk took a SIGSEGV -- a process whose
++        // heap could not grow (the next mapping abutting its image) died instead of `malloc`
++        // falling back to `mmap`.
++        if result.is_err() {
++            result = litebox_common_linux::mm::sys_brk(&self.process().pm(), UserPtrMut::from_usize(0));
++        }
+         // Temporary (see FINDINGS.txt PASS 128): trace every brk() call's requested and
+         // returned break address, mirroring PASS 48's sys_mmap trace above, to determine
+         // whether the ~10.2MB region containing the mallocng meta-slot bug (BUG B,
+--- a/litebox_shim_linux/src/syscalls/process.rs
++++ b/litebox_shim_linux/src/syscalls/process.rs
+@@ -2275,6 +2275,29 @@
+             None
+         };
+ 
++        // A plain `fork()` of a single-threaded caller runs its child IN PLACE: on the caller's own
++        // address space, at the SAME addresses, exactly like a `CLONE_VFORK` child (the caller is
++        // suspended until the child `execve`s or exits), and the caller's writable memory is put
++        // back from a snapshot afterwards. The alternative -- an eager copy of the address space
++        // at relocated host addresses -- cannot be made sound for glibc guests: every pointer the
++        // copy holds that is not one of the few heuristically patched slots (RELRO/`.got`/vtable
++        // function pointers, the heap, ...) still names the PARENT's memory, so the child runs a
++        // MIX of its own and the parent's libc and rewrites the parent's `_rtld_global` (stack
++        // lists), malloc and stdio state. A caller with other threads, or with a writable
++        // footprint too large to snapshot, still takes the relocating copy below.
++        let fork_snapshot = if is_process_clone
++            && !flags.contains(CloneFlags::VFORK)
++            && self.process().nr_threads() == 1
++        {
++            #[cfg(target_arch = "x86_64")]
++            let sp_now = ctx.rsp;
++            #[cfg(target_arch = "aarch64")]
++            let sp_now = ctx.sp;
++            self.snapshot_writable_memory(sp_now)
++        } else {
++            None
++        };
++        let in_place_fork = fork_snapshot.is_some();
+         let (thread, init_state, pid, ppid, child_shared_pending) = if is_process_clone {
+             // Real `fork()`: build a brand-new `Process` (new thread group) whose address space
+             // is an eager duplicate of the parent's -- writes made by either the parent or the
+@@ -2299,7 +2322,7 @@
+             // onto the still-shared `pm`" shape. Register relocation is correspondingly a genuine
+             // no-op below (an empty `AddressRelocations`, `translate()` returns `None`
+             // everywhere): no addresses moved, because nothing was duplicated.
+-            let vforked = flags.contains(CloneFlags::VFORK);
++            let vforked = flags.contains(CloneFlags::VFORK) || in_place_fork;
+             let (dest_pm, relocations) = if vforked {
+                 (
+                     self.process().pm(),
+@@ -2918,13 +2941,14 @@
+             )
+         };
+         thread.init_state.set(init_state);
+-        thread.clear_child_tid.set(clear_child_tid);
++        thread.clear_child_tid.set(if in_place_fork { None } else { clear_child_tid });
+ 
+         // Captured before `thread` moves into the spawned `Task` below -- only actually blocked
+         // on when this is a `vfork()`'d process (see `Process::wait_for_vfork_done`'s doc
+         // comment); `None` for a thread-clone or a plain `fork()`.
+-        let vfork_child_process =
+-            (is_process_clone && flags.contains(CloneFlags::VFORK)).then(|| thread.process.clone());
++        let vfork_child_process = (is_process_clone
++            && (flags.contains(CloneFlags::VFORK) || in_place_fork))
++            .then(|| thread.process.clone());
+ 
+         // Declare the new thread's own guest-pid BEFORE spawning it, so a platform that tracks
+         // host-memory ownership per real OS thread (see `ThreadProvider::
+@@ -2978,10 +3002,58 @@
+         if let Some(vfork_child_process) = vfork_child_process {
+             vfork_child_process.wait_for_vfork_done();
+         }
++        if let Some(snapshot) = fork_snapshot {
++            self.restore_writable_memory(snapshot);
++        }
+ 
+         Ok(usize::try_from(child_tid).unwrap())
+     }
+ 
++    /// Copies every writable, non-shared region of the caller's address space (for the stack, only
++    /// from just below `sp` upward: nothing below the live stack pointer matters to the caller).
++    /// `None` when the copy is over `FORK_SNAPSHOT_MAX_BYTES` or a region cannot be read.
++    fn snapshot_writable_memory(&self, sp: usize) -> Option<ForkSnapshot> {
++        let mut regions = Vec::new();
++        let mut total = 0usize;
++        for (range, bits, _) in self.process().pm().tracked_regions() {
++            let flags = VmFlags::from_bits_truncate(bits);
++            if flags.is_empty()
++                || flags.contains(VmFlags::VM_SHARED)
++                || !flags.contains(VmFlags::VM_WRITE)
++            {
++                continue;
++            }
++            let mut start = range.start;
++            if flags.contains(VmFlags::VM_GROWSDOWN) && range.contains(&sp) {
++                start = start.max(sp.saturating_sub(512) & !0xfff);
++            }
++            total += range.end - start;
++            if total > FORK_SNAPSHOT_MAX_BYTES {
++                return None;
++            }
++            let bytes = UserPtr::<u8>::from_usize(start)
++                .to_owned_slice::<Platform>(range.end - start)?;
++            regions.push((start, bytes));
++        }
++        litebox_util_log::debug!(tid:% = self.tid, bytes:% = total; "clone: in-place fork snapshot");
++        Some(ForkSnapshot { regions })
++    }
++
++    /// Puts the caller's writable memory back exactly as [`Self::snapshot_writable_memory`] saw
++    /// it, undoing everything an in-place `fork()` child wrote before it exec'd or exited.
++    fn restore_writable_memory(&self, snapshot: ForkSnapshot) {
++        for (start, bytes) in snapshot.regions {
++            if UserPtrMut::<u8>::from_usize(start)
++                .copy_from_slice::<Platform>(0, &bytes)
++                .is_none()
++            {
++                litebox_util_log::error!(
++                    start:% = start; "in-place fork: cannot restore a writable region of the caller"
++                );
++            }
++        }
++    }
++
+     /// Handle syscall `set_tid_address`.
+     pub(crate) fn sys_set_tid_address(&self, tidptr: UserPtrMut<i32>) -> i32 {
+         self.thread.clear_child_tid.set(Some(tidptr));
+@@ -2994,6 +3066,14 @@
+     }
+ }
+ 
++/// The caller's writable memory at the moment of an in-place `fork()`, as `(start, bytes)`.
++struct ForkSnapshot {
++    regions: Vec<(usize, Box<[u8]>)>,
++}
++
++/// Largest writable footprint an in-place `fork()` snapshots; a bigger caller forks the old way.
++const FORK_SNAPSHOT_MAX_BYTES: usize = 256 << 20;
++
+ // TODO: enforce the following limits:
+ //
+ // `RLIMIT_NOFILE_CUR` matches real Linux distros' typical unprivileged-process soft limit

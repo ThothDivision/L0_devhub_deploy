@@ -947,7 +947,8 @@ pub(crate) async fn team_for_project(project: &str) -> Result<Option<String>, St
     if !wait_index_ready(SQL_OP_TIMEOUT).await {
         return Err("relational index not built yet".to_string());
     }
-    let age_ms = wall_ms().saturating_sub(INDEX_LAST_OK_MS.load(std::sync::atomic::Ordering::Acquire));
+    let age_ms =
+        wall_ms().saturating_sub(INDEX_LAST_OK_MS.load(std::sync::atomic::Ordering::Acquire));
     let max_age_ms = index_refresh_interval().as_millis() as u64 * 2;
     if age_ms > max_age_ms {
         return Err(format!(

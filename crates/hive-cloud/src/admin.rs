@@ -172,6 +172,10 @@ pub fn router(cloud: Arc<CloudState>) -> Router {
             "/v1/projects/:project/container",
             put(project_container_put).delete(project_container_delete),
         )
+        .route(
+            "/v1/projects/:project/game",
+            put(project_game_put).delete(project_game_delete),
+        )
         .route("/v1/projects/:project/env", post(project_env_put))
         .route("/v1/projects/:project/env/:key", delete(project_env_delete))
         .route(
@@ -933,6 +937,62 @@ async fn project_container_delete(
 ) -> Result<Json<Value>, (StatusCode, String)> {
     require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
     c.projects.set_container(&project, None);
+    crate::persist::persist(&c);
+    Ok(Json(json!(c.projects.get_masked(&project))))
+}
+
+/// `PUT /v1/projects/:project/game` — dashboard-managed game-server config
+/// (`GameServerSettings`: Drive mods folder + in-volume mods dir, version
+/// pins, world-snapshot toggle). Same "settings apply going forward"
+/// contract as `project_container_put`: nothing already running changes;
+/// git.rs merges it on the NEXT deploy, and the caller follows a save with
+/// `/v1/projects/:project/redeploy` to apply it immediately.
+async fn project_game_put(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+    Json(spec): Json<crate::project_settings::GameServerSettings>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    // Same unowned-row claim as project_container_put (see its comment).
+    let t = require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    c.projects.set_team(&project, &t);
+    // Deploy-input boundary validation (the project_container_put protocol
+    // precedent): reject a subdir that would escape the volume mount now,
+    // with a clear 400, rather than letting the deploy log a skip later.
+    for (field, v) in [
+        ("mods_dest_subdir", spec.mods_dest_subdir.as_deref()),
+        ("world_subdir", spec.world_subdir.as_deref()),
+    ] {
+        if let Some(v) = v.map(str::trim).filter(|s| !s.is_empty()) {
+            if v.starts_with('/')
+                || v.contains('\\')
+                || v.contains('\0')
+                || v.split('/').any(|c| c == "..")
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("{field} {v:?} must be a relative path inside the volume (no leading /, no ..)"),
+                ));
+            }
+        }
+    }
+    c.projects.set_game(&project, Some(spec));
+    crate::persist::persist(&c);
+    Ok(Json(json!(c.projects.get_masked(&project))))
+}
+
+/// `DELETE /v1/projects/:project/game` — clears the dashboard-managed game
+/// config. Changes nothing already deployed; the NEXT deploy stops syncing
+/// mods and snapshotting the world.
+async fn project_game_delete(
+    State(c): State<Arc<CloudState>>,
+    headers: HeaderMap,
+    claims: Option<axum::Extension<crate::auth::Claims>>,
+    Path(project): Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    require_project(&c, &headers, claims.as_ref().map(|e| &e.0), &project)?;
+    c.projects.set_game(&project, None);
     crate::persist::persist(&c);
     Ok(Json(json!(c.projects.get_masked(&project))))
 }
@@ -1994,7 +2054,13 @@ pub(crate) async fn post_to_host_json(
             }
         }
         if crate::auth::enforced() {
-            if let Ok(token) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+            if let Ok(token) = crate::auth::issue(
+                "mesh-internal",
+                team,
+                "service",
+                false,
+                crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+            ) {
                 request = request.bearer_auth(token);
             }
         }
@@ -3169,6 +3235,7 @@ pub(crate) async fn deploy_zip(
         image_cpus: None,
         image_pids: None,
         image_ports: None,
+        image_volume_path: None,
         git_token: None, // zip upload has no git clone
         marketplace_placement: None,
     };
@@ -3216,6 +3283,9 @@ pub(crate) struct ImageDeployReq {
     /// doc for the replace-not-merge semantics and the mesh-forwarding caveat.
     #[serde(default)]
     ports: Option<Vec<fluid_core::PortSpec>>,
+    /// Container-internal mount point for the project's named volume.
+    #[serde(default)]
+    volume_mount_path: Option<String>,
     #[serde(default)]
     env: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
@@ -3240,6 +3310,16 @@ pub(crate) async fn deploy_image(
         return Err((
             StatusCode::BAD_REQUEST,
             "Provide an image reference, e.g. fruitbox12/simplifi:latest".into(),
+        ));
+    }
+    if body
+        .volume_mount_path
+        .as_deref()
+        .is_some_and(|path| !crate::git::valid_image_volume_path(path))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "volume_mount_path must be a normalized absolute container directory".into(),
         ));
     }
     let t = tenant(&c, &headers, claims.as_ref().map(|e| &e.0));
@@ -3272,6 +3352,7 @@ pub(crate) async fn deploy_image(
         image_cpus: body.cpus,
         image_pids: body.pids,
         image_ports: body.ports,
+        image_volume_path: body.volume_mount_path,
         git_token: None, // prebuilt image deploy has no git clone
         marketplace_placement: None,
     };
@@ -3491,8 +3572,7 @@ pub(crate) async fn deployment_integrity(
         if !team_ok {
             return Err(StatusCode::NOT_FOUND);
         }
-        let chain_head_sha256 =
-            hive_core::fold_integrity_chain(&id, &acceptance.integrity_chain);
+        let chain_head_sha256 = hive_core::fold_integrity_chain(&id, &acceptance.integrity_chain);
         let signature = c.integrity_signer.sign_chain_head(&chain_head_sha256);
         let sep_public_keys: Vec<&hive_core::IntegrityEntryKind> = acceptance
             .integrity_chain
@@ -5990,9 +6070,13 @@ pub(crate) async fn dispatch_project_delete_with(
                     }
                 }
                 if crate::auth::enforced() {
-                    if let Ok(token) =
-                        crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS)
-                    {
+                    if let Ok(token) = crate::auth::issue(
+                        "mesh-internal",
+                        team,
+                        "service",
+                        false,
+                        crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+                    ) {
                         request = request.bearer_auth(token);
                     }
                 }
@@ -6809,7 +6893,13 @@ pub(crate) async fn fetch_bytes_from_host(
         .header("x-hive-team", team)
         .timeout(std::time::Duration::from_secs(15));
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+        if let Ok(tok) = crate::auth::issue(
+            "mesh-internal",
+            team,
+            "service",
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
             rb = rb.bearer_auth(tok);
         }
     }
@@ -6831,7 +6921,13 @@ async fn proxy_get_json(c: &Arc<CloudState>, admin: &str, path: &str, team: &str
     // proxied here silently 403'd. Attach the same short-lived signed service
     // delegation `fanout_remote` uses so this node-to-node read authenticates.
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+        if let Ok(tok) = crate::auth::issue(
+            "mesh-internal",
+            team,
+            "service",
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
             rb = rb.bearer_auth(tok);
         }
     }
@@ -6939,7 +7035,13 @@ pub(crate) fn mesh_team_qs(team: &str) -> String {
         return String::new();
     }
     if crate::auth::enforced() {
-        if let Ok(tok) = crate::auth::issue("mesh-internal", team, "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+        if let Ok(tok) = crate::auth::issue(
+            "mesh-internal",
+            team,
+            "service",
+            false,
+            crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+        ) {
             return format!("team={team}&tok={tok}");
         }
     }
@@ -7111,6 +7213,7 @@ fn redeploy_request(
         // the single-port restore this field sits beside has the exact same
         // shape it always did.
         image_ports: None,
+        image_volume_path: None,
         git_token,
         marketplace_placement: None,
     }
@@ -7792,6 +7895,7 @@ async fn git_webhook(
             image_cpus: None,
             image_pids: None,
             image_ports: None,
+            image_volume_path: None,
             // webhook auto-deploy: GitHub App installation token (first choice,
             // resolved once above) else falls back to node GITHUB_TOKEN in git.rs
             git_token: webhook_git_token.clone(),

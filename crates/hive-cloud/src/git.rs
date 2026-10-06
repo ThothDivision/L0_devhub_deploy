@@ -184,7 +184,11 @@ impl BuildStore {
             }
         }
     }
-    fn log(&self, id: &str, line: impl Into<String>) {
+    /// Append one line to a build's log. `pub(crate)` so sibling modules whose
+    /// deploy-time work produces tenant-visible diagnostics (e.g.
+    /// `game_mods`'s Drive-sync gaps) can name them in the same build log
+    /// instead of only in the node journal.
+    pub(crate) fn log(&self, id: &str, line: impl Into<String>) {
         if let Some(b) = self.map.lock().get_mut(id) {
             let mut line: String = line.into();
             if line.len() > MAX_BUILD_LOG_LINE_BYTES {
@@ -1232,6 +1236,12 @@ pub async fn start_build(
     // it can reach a `Build` row, a webhook payload, a log line, or process
     // argv — everything below this line persists/emits `req.repo_url`.
     validate_deploy_source(&req)?;
+    if let Some(path) = req.image_volume_path.as_deref() {
+        anyhow::ensure!(
+            req.image_ref.is_some() && valid_image_volume_path(path),
+            "invalid image volume mount path"
+        );
+    }
     let id = format!("dpl-{}", &Uuid::new_v4().simple().to_string()[..10]);
     let project = req
         .project
@@ -1261,6 +1271,17 @@ pub async fn start_build(
     };
     if let Some(team) = admission_team.as_deref() {
         cloud.projects.set_team_exact(&project, incarnation, team)?;
+    }
+    if let Some(path) = req.image_volume_path.as_deref() {
+        let mut settings = cloud
+            .projects
+            .get_exact(&project, incarnation)?
+            .container
+            .unwrap_or_default();
+        if settings.volume_mount_path.is_none() {
+            settings.volume_mount_path = Some(path.to_owned());
+            cloud.projects.set_container_exact(&project, incarnation, Some(settings))?;
+        }
     }
     if let Some(root) = req
         .root_dir
@@ -3539,6 +3560,7 @@ async fn run_build(
         req.image_cpus.as_deref(),
         req.image_pids.unwrap_or(0),
         req.image_ports.clone(),
+        req.image_volume_path.as_deref(),
     )
     .await?;
     coordinates.normalize_function_cwds(&mut manifest)?;
@@ -6481,6 +6503,7 @@ async fn produce_manifest(
     image_cpus: Option<&str>,
     image_pids: u32,
     image_ports: Option<Vec<fluid_core::PortSpec>>,
+    image_volume_path: Option<&str>,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
     // Prebuilt OCI image (Docker Hub / Quay / any registry): pull it, auto-detect its
@@ -6504,6 +6527,7 @@ async fn produce_manifest(
             cpus,
             image_pids,
             image_ports,
+            image_volume_path,
         )
         .await;
     }
@@ -6541,6 +6565,7 @@ async fn produce_manifest(
             0.0,
             0,
             None,
+            None,
         )
         .await;
     }
@@ -6567,6 +6592,7 @@ async fn produce_manifest(
             0,
             0.0,
             0,
+            None,
             None,
         )
         .await;
@@ -7762,6 +7788,35 @@ trap - EXIT HUP INT TERM
             )
             .await
             .context("staging platform exported-app launcher failed")?;
+        // And the Worker adapter. Consumed only when the selected app is a
+        // Cloudflare Worker (wrangler config + exported `fetch` handler) — its
+        // own `scripts.start` runs the `wrangler` CLI, which our Node substrate
+        // cannot launch. Staged here for the same reason as the launcher above:
+        // the build session is still open now and is closed by the time the
+        // start command is resolved.
+        let worker_script = r#"set -eu
+p=.hive-worker-launcher.mjs
+[ ! -L "$p" ] || { printf '%s\n' 'UNSAFE_BUILD_INPUT: worker launcher path may not be a symlink' >&2; exit 41; }
+tmp=$(mktemp .hive-worker-launcher.XXXXXX)
+trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
+printf '%s' "$1" >"$tmp"
+chmod 0444 "$tmp"
+mv -f -- "$tmp" "$p"
+trap - EXIT HUP INT TERM
+"#;
+        require_build_session(&mut isolated)?
+            .run(
+                dir,
+                worker_script,
+                "stage platform worker launcher",
+                &[WORKER_LAUNCHER_JS.to_string()],
+                false,
+                cloud,
+                bid,
+                &std::collections::BTreeMap::new(),
+            )
+            .await
+            .context("staging platform worker launcher failed")?;
     }
     // Runtime dependency normalization for nested pnpm workspaces, auto-planned
     // lane only: repository-controlled install/build overrides own their output
@@ -8023,6 +8078,27 @@ done' hive-delink {} +
                     }
                 }
             }
+            // CLOUDFLARE WORKER LANE. A Worker app's own start command runs the
+            // `wrangler` CLI, which needs workerd and an account and which our
+            // Node substrate refuses outright. When the shape is recognised,
+            // host the handler it exports through the platform's Worker adapter
+            // instead of trying to launch wrangler. The adapter was staged into
+            // this directory above; see `assets/worker-launcher.mjs` for what it
+            // does and does not emulate.
+            if let Some(entry) = discover_worker_entry(dir) {
+                let mut cmd = vec!["node".to_string()];
+                if entry.ends_with(".ts") || entry.ends_with(".mts") {
+                    cmd.push("--experimental-strip-types".to_string());
+                }
+                cmd.push(WORKER_LAUNCHER_FILE.to_string());
+                cmd.push(entry.clone());
+                log(format!(
+                    "Cloudflare Worker detected — hosting its exported `fetch` handler via the \
+                     platform worker adapter (entry `{entry}`) instead of the `wrangler` CLI, \
+                     which needs the Workers runtime and an account."
+                ));
+                start = cmd;
+            }
             log(format!(
                 "Provisioning serverless server: `{}`.",
                 start.join(" ")
@@ -8094,6 +8170,55 @@ const AFTER_SHIM_FILE: &str = ".hive-after-shim.cjs";
 /// fallback in `build_via_fdi`.
 const EXPRESS_LAUNCHER_JS: &str = include_str!("../assets/express-launcher.mjs");
 const EXPRESS_LAUNCHER_FILE: &str = ".hive-express-launcher.mjs";
+const WORKER_LAUNCHER_JS: &str = include_str!("../assets/worker-launcher.mjs");
+const WORKER_LAUNCHER_FILE: &str = ".hive-worker-launcher.mjs";
+
+/// Recognise a Cloudflare Worker application: a wrangler config plus an entry
+/// module whose default export is (or owns) a `fetch` handler.
+///
+/// These repos cannot be started the way their own template starts them — every
+/// `scripts.start` runs the `wrangler` CLI, which needs the Workers runtime
+/// (workerd) and a Cloudflare account, and our Node substrate refuses that
+/// ("command wrangler is not a dir"). Recognising the shape lets us host the
+/// SAME exported handler on Node instead (see `assets/worker-launcher.mjs`).
+fn discover_worker_entry(dir: &Path) -> Option<String> {
+    let configured = ["wrangler.jsonc", "wrangler.json", "wrangler.toml"]
+        .iter()
+        .find(|name| dir.join(name).is_file())
+        .and_then(|name| {
+            let raw = std::fs::read_to_string(dir.join(name)).ok()?;
+            // `main` names the Worker entry. The JSON flavour can carry comments
+            // (jsonc), so scan for the key rather than parsing strictly; a
+            // missing/unreadable value just falls through to the conventional
+            // stems below.
+            for line in raw.lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("main") else {
+                    continue;
+                };
+                let rest = rest.trim().trim_start_matches('=').trim();
+                let value = rest.trim_matches(',').trim().trim_matches('"').trim();
+                if !value.is_empty() && !value.contains("..") {
+                    return Some(value.to_string());
+                }
+            }
+            None
+        });
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(main) = configured {
+        candidates.push(main);
+    }
+    for prefix in ["src/", ""] {
+        for stem in ["index", "worker", "main"] {
+            for ext in [".ts", ".mts", ".js", ".mjs"] {
+                candidates.push(format!("{prefix}{stem}{ext}"));
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|rel| !rel.contains("..") && !rel.starts_with('/') && dir.join(rel).is_file())
+}
 
 /// Find an entry module that plausibly exports the app's server, for the
 /// no-start-script launcher lane. `package.json` `main`/`module` win, then the
@@ -10679,6 +10804,23 @@ fn container_volume_path(project_override: Option<&str>) -> String {
         .unwrap_or_else(|| "/data".to_string())
 }
 
+pub(crate) fn valid_image_volume_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() <= 256
+        && path != "/"
+        && path
+            .split('/')
+            .skip(1)
+            .all(|part| {
+                part != "."
+                    && part != ".."
+                    && !part.is_empty()
+                    && part.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                    })
+            })
+}
+
 /// The run-config JSON (container `start_cmd[3]`) that attaches an automatic
 /// persistent volume: a host-backed named volume (≥1 GB) keyed STABLY per project
 /// (+ optional service suffix for compose), so a container's data survives instance
@@ -10981,8 +11123,12 @@ async fn image_container_manifest(
     cpus: f64,
     pids: u32,
     ports_override: Option<Vec<PortSpec>>,
+    image_volume_path: Option<&str>,
 ) -> anyhow::Result<Manifest> {
     let log = |s: String| cloud.builds.log(bid, s);
+    if let Some(path) = image_volume_path {
+        anyhow::ensure!(valid_image_volume_path(path), "invalid image volume mount path");
+    }
     let path = podman_path_env();
     // Fully qualify short names (`user/img` → `docker.io/user/img`) — Linux podman
     // rejects unqualified refs ("short-name resolution enforced").
@@ -11038,15 +11184,15 @@ async fn image_container_manifest(
             None => (8080, protocol_override.unwrap_or_default()),
         },
     };
-    // An image deploy has no fluid.json to read a `container` override from at
-    // all, so the dashboard-managed `ProjectSettings::container` is the ONLY
-    // way to redirect the automatic volume's mount path here (unlike the
-    // Dockerfile-build path, which also honors an explicit fluid.json value).
+    // An explicit image mount is scoped to this deployment; a saved project
+    // container setting takes precedence. Both are container paths, never host
+    // bind mounts. Existing projects without either still mount at /data.
     let volume_path = cloud
         .projects
         .get_exact(project, incarnation)?
         .container
-        .and_then(|s| s.volume_mount_path);
+        .and_then(|s| s.volume_mount_path)
+        .or_else(|| image_volume_path.map(str::to_owned));
     log(format!(
         "Container port {port}/{protocol}{}. Attaching persistent volume (≥1 GB) at {}.",
         if port_override.is_some() || protocol_override.is_some() {
@@ -11067,6 +11213,36 @@ async fn image_container_manifest(
         pids,
         volume_path.as_deref(),
     );
+    // Game-server settings (bn-game-server-mods): version pins land as env on
+    // the container function (never overriding an explicit declaration), and
+    // the Drive mods sync + world snapshot run against the SAME named volume
+    // the manifest just attached, using the just-pulled image as the helper
+    // container. Degrades to logged gaps, never a build failure.
+    let game_spec = cloud
+        .projects
+        .get_exact(project, incarnation)?
+        .game;
+    if let Some(game) = game_spec {
+        if let Some(f) = manifest.functions.first_mut() {
+            if let Some(v) = game.game_version.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                f.env.entry("VERSION".into()).or_insert_with(|| v.to_string());
+            }
+            if let Some(t) = game.server_type.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                f.env.entry("TYPE".into()).or_insert_with(|| t.to_string());
+            }
+        }
+        let team = cloud.projects.team_of(project);
+        crate::game_mods::apply_game_settings(
+            cloud,
+            bid,
+            project,
+            &team,
+            image,
+            &project_volume_name(project, incarnation, None),
+            &game,
+        )
+        .await;
+    }
     // A full multi-port declaration REPLACES the single-port ports list built
     // above (the first entry is still the primary — `start_cmd[2]`/`protocol`
     // above already reflect it, since callers pass the primary as `port`/
@@ -11897,6 +12073,7 @@ async fn git_poll_one(cloud: &Arc<CloudState>, project: String) -> GitPollOutcom
         image_cpus: None,
         image_pids: None,
         image_ports: None,
+        image_volume_path: None,
         git_token: token,
         marketplace_placement: None,
     };

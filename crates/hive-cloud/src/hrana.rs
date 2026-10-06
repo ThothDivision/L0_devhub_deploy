@@ -499,7 +499,13 @@ async fn forward_to_owner(
             .json(&env)
             .timeout(std::time::Duration::from_secs(30));
         if crate::auth::enforced() {
-            if let Ok(tok) = crate::auth::issue("mesh-internal", "", "service", false, crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS) {
+            if let Ok(tok) = crate::auth::issue(
+                "mesh-internal",
+                "",
+                "service",
+                false,
+                crate::auth::MESH_DELEGATION_TOKEN_TTL_SECS,
+            ) {
                 rb = rb.bearer_auth(tok);
             }
         }

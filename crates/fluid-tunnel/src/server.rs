@@ -299,7 +299,17 @@ async fn handle_request(id: u64, payload: Bytes, local_http: &str, out: &Metered
         .and_then(|meta| serde_json::from_slice::<ReqMeta>(meta).ok())
         .map(|meta| matches!(meta.method.as_str(), "GET" | "HEAD"))
         .unwrap_or(false);
-    const MAX_ATTEMPTS: u32 = 3;
+    // Witnessed live on fc-sanjose (2026-09-16 02:10-02:24 UTC): a 14-minute
+    // burst against one litebox-backed deployment exhausted all 3 attempts
+    // (total backoff budget 60ms) on every one of 49 requests. The root
+    // cause (litebox dropping a just-written response when the guest closes
+    // right after writing, triggered by this proxy's own now-removed
+    // `Connection: close`) is fixed at the source above; this stays at 5
+    // attempts as defense-in-depth for a real backlog-exhaustion timeout
+    // (litebox's own accept backlog caps at 8 concurrent) or a response with
+    // neither Content-Length nor chunked framing, both genuine residual
+    // races unrelated to the close-triggered one.
+    const MAX_ATTEMPTS: u32 = 5;
     let mut last_error = None;
     for attempt in 0..MAX_ATTEMPTS {
         let mut head_sent = false;
@@ -380,13 +390,25 @@ async fn proxy_local(
     let meta: ReqMeta = serde_json::from_slice(&payload[4..4 + meta_len])?;
     let body = &payload[4 + meta_len..];
 
-    // Held for the whole request/response exchange (`Connection: close`
-    // delimits it), so a serial-accept guest is never offered an overlapping
-    // connect — see `set_local_connect_permits`.
+    // Held for the whole request/response exchange (`connect_gate` also
+    // matches litebox guests up to their own backlog) — see
+    // `set_local_connect_permits`.
     let _connect_permit = connect_gate(local_http).acquire_owned().await?;
     let mut conn = TcpStream::connect(local_http).await?;
 
-    // Write HTTP/1.1 request, Connection: close so EOF delimits the response.
+    // Write HTTP/1.1 request. Deliberately NOT `Connection: close`: asking the
+    // guest to close triggers litebox's guest network stack to send a bare
+    // FIN right after `res.end()` WITHOUT flushing the just-written response
+    // bytes onto the TUN device first — a write-then-close data-loss race in
+    // litebox's userspace TCP stack, packet-captured live on fc-sanjose
+    // (2026-09-17): the request was received (the guest's own counter
+    // incremented) but zero response bytes ever reached the wire, surfacing
+    // here as "function closed before headers" on the very first head-read.
+    // Framing the response via Content-Length/chunked (below, already
+    // implemented) instead of EOF-close sidesteps the guest ever needing to
+    // self-close right after a write: `conn`'s own `Drop` closes this end
+    // once we've read a complete, correctly-framed response, which is an
+    // ordinary client-initiated close the guest was never mid-write for.
     let mut req = format!("{} {} HTTP/1.1\r\n", meta.method, meta.path);
     let mut has_host = false;
     for (k, v) in &meta.headers {
@@ -403,7 +425,7 @@ async fn proxy_local(
         req.push_str("host: fluid.internal\r\n");
     }
     req.push_str(&format!("content-length: {}\r\n", body.len()));
-    req.push_str("connection: close\r\n\r\n");
+    req.push_str("connection: keep-alive\r\n\r\n");
     conn.write_all(req.as_bytes()).await?;
     conn.write_all(body).await?;
     conn.flush().await?;
@@ -462,6 +484,18 @@ async fn proxy_local(
         }
     }
 
+    // A response to HEAD, or a 1xx/204/304, has no body BY DEFINITION and no
+    // Content-Length/chunked framing to end on. With `connection: keep-alive`
+    // the read-to-EOF arm below never sees the close it waits for, so the
+    // exchange never finished — and it holds the connect gate the whole time:
+    // one 304 forwarded into a litebox node (1 permit) wedged EVERY later
+    // forwarded request behind it, 15 s first-byte timeouts to the peer
+    // (fc-sanjose, 2026-09-19: one loopback exchange idle for 59 minutes).
+    let bodiless = meta.method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status)
+        || status == 204
+        || status == 304;
+
     // Send response head, then stream the body. `head_sent` flips FIRST: once
     // any frame may have reached the wire, the caller must never retry.
     let meta = RespMeta {
@@ -476,7 +510,9 @@ async fn proxy_local(
         serde_json::to_vec(&meta)?,
     ))?;
     // Stream the body.
-    if chunked {
+    if bodiless {
+        // nothing follows the head
+    } else if chunked {
         // Decode HTTP/1.1 chunked framing and forward ONLY the payload bytes, so
         // any Content-Encoding (gzip/br) stays valid for the client. Each chunk is
         // "<hex-size>[;ext]\r\n<data>\r\n", terminated by a zero-size chunk.

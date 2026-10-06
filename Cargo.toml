@@ -106,6 +106,7 @@ hive-zkauth = { path = "crates/hive-zkauth" }
 guardian-db = { path = "vendor/guardian-db" }
 iroh-blobs = { path = "vendor/guardian-db/iroh-blobs" }
 iroh-docs = { path = "vendor/guardian-db/iroh-docs" }
+iroh-mdns-address-lookup = { path = "vendor/guardian-db/iroh-mdns-address-lookup" }
 # iroh #4390: `pending_open_paths` (remote_state.rs) is an unbounded VecDeque
 # with no dedup — still unbounded upstream in 1.0.3, both community fix PRs
 # closed unmerged. Measured cause of a real production OOM (71,680 MiB, 99.8%

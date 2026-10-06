@@ -1,0 +1,40 @@
+# Game server templates, mods, and versions
+
+Status: templates and mount-path plumbing implemented in source; **not live-deployed**. Do not describe a template as production-ready until its acceptance checks pass against a real node and game client. No upstream game binaries or mod packs are vendored here.
+
+Marketplace deployment and THEO metering gates are tracked separately in [marketplace-game-hosting-integration.md](marketplace-game-hosting-integration.md).
+
+## Existing platform contract
+
+- Container-image deployments get a project-scoped named volume, one primary publicly allocated raw TCP/UDP port, and optional game settings. Minecraft Java already uses `itzg/minecraft-server` at `/data` on 25565/TCP. The dashboard's Minecraft `VERSION`/`TYPE` values are image-specific, not a universal version manager.
+- This increment allows `POST /v1/deploy/image` to specify `volume_mount_path`: a normalized *container-internal* directory, not a host bind mount. It is validated at ingress and at build admission, persists in project container settings when none exists, and an existing project setting takes precedence. The image template shows the path before deployment. Existing deployments without an override still use `/data`.
+- Only the primary raw port is known to forward across mesh nodes today; do **not** promise an externally usable Factorio RCON or TShock REST side port. Drive mod sync copies into a relative subdirectory of that same named volume, pruning that subdirectory on redeploy. World snapshots are copies in that volume, not off-node disaster recovery or automated rollback. Stop/quiesce the server and create an independent backup before upgrades.
+
+## Upstream-to-platform mapping
+
+| Source | Relevant capability | DevHub use and limitation |
+| --- | --- | --- |
+| [MineCloud](https://github.com/SolutionsAsService/MineCloud) | Configuration packages for Minecraft, Factorio, Terraria; Discord-triggered on-demand server; AWS CDK/Spot lifecycle | Reference for game-specific install/version/mod and lifecycle design. **Do not deploy its CDK stack or import AWS/Discord credentials** as a side effect of enabling a DevHub template. An on-demand/idle shutdown controller needs an explicit resource, save integrity checks, and cost review. |
+| [terraria-docker](https://github.com/SolutionsAsService/terraria-docker) | Vanilla and tModLoader images, 7777/TCP, persistent `/opt/terraria/config`, versioned image tags, `Worlds`, `ModPacks`, `MODPACK` | Vanilla template uses upstream Docker Hub `passivelemon/terraria-docker:terraria-latest` with `AUTOCREATE=2`. Pin a tested `terraria-<version>` tag before real saves. tModLoader requires a **matched modpack and explicit MODPACK name**; no one-click modded claim yet. Fork's GPL-3.0 source is referenced, not copied into this repository. |
+| [TShock](https://github.com/SolutionsAsService/TShock) | Server-side plugins, permissions, anti-cheat, Dockerfile, distinct `/tshock`, `/worlds`, `/plugins` mounts | Separate variant gate: needs a reviewed/reproducible image, plugin/version compatibility, and persistence across all three paths (current image template mounts only one path). Do not present it as a working template or expose REST 7878 without authentication and network review. |
+| [terraria-server-files](https://github.com/SolutionsAsService/terraria-server-files) | Historical Terraria/tModLoader executables and sample config | Treat as a historical format/config reference only. No bundled binaries, no default installation source, and no implied redistribution rights; use a verified current server distribution. |
+| [factoriotools/factorio-docker](https://github.com/factoriotools/factorio-docker) | Stable/version tags, `/factorio`, saves/config/mods, 34197/UDP | Factorio template uses `factoriotools/factorio:stable`. Pin a tested numeric tag for durable worlds. The RCON 27015/TCP port is intentionally private. Player access and server licensing must be checked before any live launch. |
+
+## Operator workflows (after first deployment)
+
+1. Confirm deployment's *actual allocated public port* in its deployment record (not the container port), successful startup logs, and one real client connection. Check named-volume mount path in build logs. Terraform/AWS resources are not created by these templates.
+2. In **Settings → Game**, use Drive sync only for server-side content in its real on-disk directory: Minecraft `mods` or `plugins`, Factorio `mods`. Terraria vanilla has no mod loader; do not sync `.tmod` into vanilla. For tModLoader, first validate the image's `ModPacks/<name>/enabled.json` layout and sync behavior with a disposable world. TShock plugins need the separate `/plugins` persistence gate above.
+3. Version pinning: Minecraft `VERSION`/`TYPE` only with the itzg image; Terraria `terraria-<version>` / `tmodloader-<version>` and Factorio numeric **image tags**, not the generic Game settings fields. Record current game, loader, image digest, mods and save checksum together. Confirm client/server/mod compatibility **before** applying a new tag. Explicit deployment environment values win over dashboard defaults.
+4. Set the snapshot subdirectory to `world` (Minecraft), `Worlds` (Terraria), or `saves` (Factorio), then confirm a snapshot actually exists after a later redeploy. For Factorio also back up `/factorio/config` and `/factorio/mods`; for Terraria back up entire `/opt/terraria/config`. Same-volume snapshots may fail with a full volume and do not protect against node loss. Never silently migrate or delete an old world.
+
+## Delivery plan and acceptance gates
+
+1. **Template smoke test:** deploy each template on a disposable project; verify 7777/TCP (Terraria) and 34197/UDP (Factorio) via real clients across nodes, confirm image pull, mount paths, settings persistence over redeploy, and named-volume isolation. This is **pending**; source compilation is not a live game-server test.
+2. **Version/rollback:** provide per-game immutable deployment manifest (game variant, image digest/tag, game version, loader/runtime, mod-set hashes, save backup identifier). Stage a compatibility check; take an off-node backup; gate upgrades until restart + client join pass. Implement rollback as a new deployment pointing at the old verified image and a separately restored save; never overwrite a source save by default. Images tagged `latest`/`stable` are floating.
+3. **Mod handling:** declare game-aware adapters: Minecraft Fabric/Forge vs Paper plugins; Factorio mod-list/zip and game-version compatibility; tModLoader modpacks (`enabled.json`, `MODPACK`) vs TShock plugins. Validate extensions, hashes, allowed paths, no symlink escapes, and missing dependencies. Keep Drive sync's destructive prune opt-in and scope clearly visible; never equate a copied mod with a compatible or safe one.
+4. **TShock:** verify release and license/build provenance, use one reviewed image with persistent config/world/plugins, ensure REST/admin is private by default, then test plugin load, permissions, backup/restart and a real Terraria client. The single-volume template cannot satisfy its Dockerfile's three distinct mount points yet.
+5. **MineCloud-inspired lifecycle:** only after save integrity and cost gates, add optional per-game idle/Discord start-stop orchestration. Preserve DevHub's existing tenant volumes and authorization; do not port AWS Spot/SSH/CDK implementation wholesale. Test crash, restart, concurrent start, billing and backup handling.
+
+## Provenance and licensing
+
+The named SolutionsAsService repositories are forks/reference implementations, not a permission to redistribute game binaries. MineCloud is MIT-licensed; `terraria-docker` carries GPL-3.0; TShock's `COPYING` and the game's own server terms must be checked for each distribution. This change copies none of their implementation or packaged Terraria executables. Paid AWS services, game distribution, and production deployment require separate decisions.

@@ -65,6 +65,26 @@ imposter_pid() { # <expected-name> <admin-port>
   esac
 }
 
+# A job launchd cannot even SPAWN is not fixed by `kickstart -k`: its registered
+# definition must be replaced. Witnessed 2026-09-19 -> 09-21: dev.shadw.fc-lax
+# (the mesh's `fc-lax3`) sat dead for ~59 h — 21,500 spawn attempts, this
+# watchdog kickstarting it every minute — with `last exit code = 78: EX_CONFIG`
+# and launchd's log saying "Service could not initialize: Unable to get updated
+# LWCR" (the BTM/launch-constraint record went stale after the debug binary was
+# rebuilt). The binary itself ran fine by hand; a bootout + bootstrap of the same
+# plist cured it. hive-cloud never exits 78, so the code identifies a spawn failure.
+spawn_broken() { # <label>
+  launchctl print "$DOMAIN/$1" 2>/dev/null | grep -q 'last exit code = 78'
+}
+
+reload_job() { # <label>
+  local plist="$HOME/Library/LaunchAgents/$1.plist"
+  [ -f "$plist" ] || return 1
+  launchctl bootout "$DOMAIN/$1" 2>/dev/null || true
+  sleep 3   # bootout returns before the job is fully gone; bootstrap in that window fails EIO
+  launchctl bootstrap "$DOMAIN" "$plist" 2>/dev/null
+}
+
 ensure() { # <label> <admin-port>
   launchctl print "$DOMAIN/$1" >/dev/null 2>&1 || return 0   # not installed → skip
 
@@ -118,6 +138,10 @@ ensure() { # <label> <admin-port>
   # required to clear a wedged process that won't exit on its own; the sustained
   # window above guarantees we only reach here for a truly dead node.
   echo "$(date '+%H:%M:%S') $1 down on :$2 (failed $STRIKES probes over ~$((STRIKES * (PROBE_TIMEOUT + SLEEP_BETWEEN)))s) — restarting"
+  if spawn_broken "$1"; then
+    echo "$(date '+%H:%M:%S') $1 cannot be spawned (last exit 78 EX_CONFIG) — kickstart cannot fix that; re-registering its plist"
+    reload_job "$1" && return 0
+  fi
   launchctl kickstart -k "$DOMAIN/$1" 2>/dev/null || true
 }
 

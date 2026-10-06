@@ -86,6 +86,32 @@ The `./data:/data` volume maps to a real, durable, host-backed named volume
 your world is not regenerated every time you push. There's nothing else to
 configure; every container-runtime deployment gets this automatically.
 
+## Mods & plugins from the Drive
+
+The project's shadw Drive (dashboard → Drive) doubles as the mod drop:
+
+1. Open the project's Drive page and create a folder, e.g. `/mods`, then
+   upload your `.jar` mod/plugin files into it.
+2. In **Settings → Game**, set *Drive folder* to `/mods` and the *mods
+   directory* to where the server reads them inside the volume — `mods` for
+   Forge/Fabric, `plugins` for Paper/Spigot/Bukkit.
+3. Redeploy. Every deploy copies the folder's files into the persistent
+   volume (files you delete from the Drive folder are pruned from the mods
+   dir on the next deploy — only that dir is touched, never the world).
+
+Modded gameplay usually wants a matching server type — the same settings page
+pins *Server type* (`FORGE`, `FABRIC`, `PAPER`, …) and *Game version*
+(`1.21.4`, …), which land as the `TYPE`/`VERSION` env vars this image reads.
+An explicit `TYPE`/`VERSION` in this compose file's `environment:` always
+wins over the settings page.
+
+## World save snapshots (version control)
+
+**Settings → Game → World Save Snapshots** copies the world directory to
+`.hive-snapshots/<build-id>/` inside the same volume before every deploy — a
+rollback point per build. Snapshots are kept until you remove them yourself;
+deploys never prune saves.
+
 ## Verifying it's actually working
 
 A bare TCP connect (`nc`, `curl`, a browser) isn't a real test — Minecraft's

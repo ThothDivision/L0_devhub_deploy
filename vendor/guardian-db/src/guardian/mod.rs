@@ -73,6 +73,10 @@ impl GuardianDB {
         })
     }
 
+    pub async fn close(&self) -> Result<()> {
+        self.base.close().await
+    }
+
     /// Persists the identity to a JSON file so it can be reloaded across sessions
     fn save_identity(path: &std::path::Path, identity: &crate::log::identity::Identity) {
         if let Some(parent) = path.parent()
@@ -1442,10 +1446,10 @@ impl DocumentStore for DocumentStoreWrapper {
         // (as `search_documents_by_key` does below) is synchronous and can
         // only serve already-cached values, silently under-reporting any key
         // not yet lazily warmed right after a cold-start rebuild.
-        if let Some(doc_store) = self
-            .store
-            .as_any()
-            .downcast_ref::<crate::stores::document_store::GuardianDBDocumentStore>()
+        if let Some(doc_store) =
+            self.store
+                .as_any()
+                .downcast_ref::<crate::stores::document_store::GuardianDBDocumentStore>()
         {
             let get_opts = crate::traits::DocumentStoreGetOptions {
                 case_insensitive: opts.case_insensitive,
@@ -1485,10 +1489,10 @@ impl DocumentStore for DocumentStoreWrapper {
         // cached-only and unrelated to this async `AsyncDocumentFilter`), so
         // reuse its lazy single-key fetch across the full key set instead of
         // the generic synchronous, cache-only `get_all_documents_from_index`.
-        let all_documents = if let Some(doc_store) = self
-            .store
-            .as_any()
-            .downcast_ref::<crate::stores::document_store::GuardianDBDocumentStore>()
+        let all_documents = if let Some(doc_store) =
+            self.store
+                .as_any()
+                .downcast_ref::<crate::stores::document_store::GuardianDBDocumentStore>()
         {
             let mut docs = Vec::new();
             for key in doc_store.index_key_set() {

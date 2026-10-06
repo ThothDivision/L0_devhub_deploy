@@ -927,7 +927,7 @@ impl ChatState {
     async fn new(username: String) -> Result<Self> {
         let config = ClientConfig {
             enable_pubsub: true,
-            enable_discovery_mdns: true,
+            enable_discovery_mdns: false,
             enable_discovery_n0: true,
             data_store_path: Some(format!("./chat_data/{}", username).into()),
             gossip: GossipConfig {

@@ -137,10 +137,7 @@ fn parse_table(text: &str, family: &'static str) -> Vec<WildcardListen> {
         };
         // Columns 5..=9 are tx/rx queue, tr/tm->when, retrnsmt, uid, timeout;
         // the inode is the 10th field (index 9 after the first four).
-        let inode = f
-            .nth(5)
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
+        let inode = f.nth(5).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
         out.push(WildcardListen {
             port,
             inode,
@@ -285,7 +282,10 @@ fn incident_title(node: &str, f: &ForeignListener) -> String {
             f.port,
             f.cmd.split(' ').take(4).collect::<Vec<_>>().join(" ")
         ),
-        None => format!("Foreign public listener on {node}: :{} (owner unresolved)", f.port),
+        None => format!(
+            "Foreign public listener on {node}: :{} (owner unresolved)",
+            f.port
+        ),
     }
 }
 

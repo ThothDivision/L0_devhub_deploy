@@ -19,6 +19,24 @@
 // http/https/http2/ws all inherit net.Server.prototype unmodified, so this
 // covers them automatically; NODE_OPTIONS is inherited by `cluster` workers
 // automatically too.
+// Assigning `process.title` reaches libuv's uv_set_process_title, which rewrites
+// the process's argv block in place. Under litebox the initial stack keeps the
+// environment strings inside that block, so the assignment zeroes process.env:
+// measured on fc-phoenix (2026-09-19), a guest went from 12 environment
+// variables to 0 on `process.title = 'x'`. Next.js sets `next-server (vX)`
+// before it listens, so every Next app on a litebox node lost every variable
+// its owner configured (tokenhun: "PROXY_API_KEY is not configured on the proxy
+// server" with the variable set and present in the runner's own environment).
+// Keep the title JS-side only.
+let processTitle = process.title;
+try {
+  Object.defineProperty(process, 'title', {
+    get() { return processTitle; },
+    set(value) { processTitle = String(value); },
+    enumerable: true,
+    configurable: true,
+  });
+} catch (_) {}
 const net = require('net');
 const WORKDIR = process.env.HIVE_RUNTIME_WORKDIR;
 if (WORKDIR) {

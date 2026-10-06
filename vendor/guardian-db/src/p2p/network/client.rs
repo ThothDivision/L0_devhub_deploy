@@ -334,8 +334,8 @@ impl IrohClient {
     /// to Gossip.handle_connection() so it is kept alive. Without this, the connection
     /// would be closed on going out of scope, causing "closed by peer: 0".
     pub async fn connect_gossip(&self, node_id: NodeId) -> Result<()> {
-        // Register the peer as known (a candidate for automatic DocTicket exchange).
-        self.backend.note_known_peer(node_id).await;
+        // The caller selected this identity explicitly, independently of discovery.
+        self.backend.note_explicit_peer(node_id).await;
 
         let endpoint_arc = self.backend.get_endpoint().await?;
         let endpoint_lock = endpoint_arc.read().await;

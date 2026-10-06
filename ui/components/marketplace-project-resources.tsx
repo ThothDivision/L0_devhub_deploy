@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { Loader2, RefreshCw, Server, HardDrive } from "lucide-react";
 import { Button, Card, Badge } from "@/components/ui";
+import { MarketplaceProviderOffers } from "@/components/marketplace-provider-offers";
 import {
   attachMarketplaceOrderToProject,
   fetchMarketplaceProjectResources,
@@ -84,7 +85,7 @@ export function MarketplaceProjectResources({ project }: { project: string }) {
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h2 className="font-medium">Marketplace resources</h2>
-          <p className="mt-1 text-sm text-secondary">Add Marketplace compute or storage to this project.</p>
+          <p className="mt-1 text-sm text-secondary">Review live providers here in DevHub; existing order flows still open Marketplace until the joint lease contract is ready.</p>
         </div>
         <div className="flex gap-2">
           <a href={browse("compute")} target="_blank" rel="noreferrer">
@@ -127,6 +128,7 @@ export function MarketplaceProjectResources({ project }: { project: string }) {
           ))}
         </div>
       )}
+      <MarketplaceProviderOffers />
     </Card>
   );
 }

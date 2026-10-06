@@ -946,7 +946,10 @@ impl GuardianDBKeyValue {
                     Ok(Some(Ok(_))) => {}
                     Ok(Some(Err(e))) => {
                         // A lagging/errored subscription may have dropped events.
-                        debug!("KV live sync subscription error (scheduling resync): {:?}", e);
+                        debug!(
+                            "KV live sync subscription error (scheduling resync): {:?}",
+                            e
+                        );
                         full_dirty = true;
                     }
                 }
@@ -1234,32 +1237,82 @@ impl GuardianDBKeyValue {
         // secret and become an isolated writer). It may only import an existing one.
         let requested_read_only = opts.read_only.unwrap_or(false);
 
-        // Resolve the DocTicket to use: an explicit ticket (opts) takes priority; otherwise,
-        // try AUTOMATIC EXCHANGE with known peers — joining the shared namespace of
-        // a peer that already holds this store and that authorizes this node (gated via AccessController).
-        let resolved_ticket: Option<String> = match opts.doc_ticket.clone() {
-            Some(t) => Some(t),
-            None => Box::pin(client.backend().resolve_shared_ticket(&store_key)).await,
+        let explicit_ticket = opts.doc_ticket.clone();
+        let mut cached_namespace_id = None;
+        let reopened = if explicit_ticket.is_none() {
+            match cache.get(NAMESPACE_CACHE_KEY).await {
+                Ok(Some(namespace_bytes)) if namespace_bytes.len() == 32 => {
+                    let mut ns_bytes = [0u8; 32];
+                    ns_bytes.copy_from_slice(&namespace_bytes);
+                    let namespace_id = iroh_docs::NamespaceId::from(ns_bytes);
+                    cached_namespace_id = Some(namespace_id);
+                    match Box::pin(docs.open_doc(namespace_id)).await? {
+                        Some(doc) => {
+                            let writable = Self::load_writable(cache.as_ref()).await;
+                            info!(
+                                writable,
+                                "Reopened existing iroh-docs document: {:?}", namespace_id
+                            );
+                            Some((doc, writable))
+                        }
+                        None => {
+                            warn!(
+                                "Cached namespace {:?} is absent locally; trying admitted peers",
+                                namespace_id
+                            );
+                            None
+                        }
+                    }
+                }
+                Ok(Some(namespace_bytes)) => {
+                    return Err(GuardianError::Store(format!(
+                        "Cached NamespaceId has invalid length {}; refusing namespace replacement",
+                        namespace_bytes.len()
+                    )));
+                }
+                Ok(None) => None,
+                Err(error) => {
+                    return Err(GuardianError::Store(format!(
+                        "Failed to read cached NamespaceId: {error}"
+                    )));
+                }
+            }
+        } else {
+            None
         };
 
-        // Establish the document, tracking whether this replica holds the namespace write
-        // secret (`doc_is_writable`). If a DocTicket was resolved, import the peer's SHARED
-        // namespace — the secure replication path via capability: both nodes start using the
-        // same namespace and sync (range-based + live) starts with the ticket's peers.
-        let (doc_handle, doc_is_writable) = if let Some(ticket_str) = resolved_ticket.as_ref() {
+        let resolved_ticket = if reopened.is_some() {
+            None
+        } else {
+            match explicit_ticket {
+                Some(ticket) => Some(ticket),
+                None => Box::pin(client.backend().resolve_shared_ticket(&store_key)).await?,
+            }
+        };
+
+        let (doc_handle, doc_is_writable) = if let Some(reopened) = reopened {
+            reopened
+        } else if let Some(ticket_str) = resolved_ticket.as_ref() {
             let ticket = ticket_str
                 .parse::<iroh_docs::DocTicket>()
-                .map_err(|e| GuardianError::Store(format!("Invalid DocTicket: {}", e)))?;
-            // The ticket's capability determines whether we receive the write secret.
-            let ticket_writable = matches!(ticket.capability, Capability::Write(_));
+                .map_err(|error| GuardianError::Store(format!("Invalid DocTicket: {error}")))?;
+            let ticket_namespace_id = ticket.capability.id();
+            if let Some(expected_namespace_id) = cached_namespace_id
+                && ticket_namespace_id != expected_namespace_id
+            {
+                return Err(GuardianError::Store(format!(
+                    "Recovered DocTicket namespace {:?} does not match cached namespace {:?}",
+                    ticket_namespace_id, expected_namespace_id
+                )));
+            }
+            let ticket_writable = matches!(&ticket.capability, Capability::Write(_));
             let doc = Box::pin(docs.import_doc(ticket)).await?;
             let ns_id = doc.id();
-            // Persist the imported NamespaceId and its writability for future reopenings.
             cache
                 .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
                 .await
-                .map_err(|e| {
-                    GuardianError::Store(format!("Failed to persist imported NamespaceId: {}", e))
+                .map_err(|error| {
+                    GuardianError::Store(format!("Failed to persist imported NamespaceId: {error}"))
                 })?;
             Self::persist_writable(cache.as_ref(), ticket_writable).await;
             info!(
@@ -1267,78 +1320,28 @@ impl GuardianDBKeyValue {
                 "Imported shared iroh-docs document via ticket: {:?}", ns_id
             );
             (doc, ticket_writable)
+        } else if let Some(namespace_id) = cached_namespace_id {
+            return Err(GuardianError::Store(format!(
+                "Cached namespace {:?} is absent locally and unavailable from admitted peers; refusing namespace replacement",
+                namespace_id
+            )));
+        } else if requested_read_only {
+            return Err(GuardianError::Store(format!(
+                "Read-only store '{}' cannot create a namespace and none was available to import",
+                store_key
+            )));
         } else {
-            // Try to retrieve the NamespaceId from the cache to reopen an existing document.
-            match cache.get(NAMESPACE_CACHE_KEY).await {
-                Ok(Some(namespace_bytes)) if namespace_bytes.len() == 32 => {
-                    // Existing NamespaceId — try to reopen the document.
-                    let mut ns_bytes = [0u8; 32];
-                    ns_bytes.copy_from_slice(&namespace_bytes);
-                    let namespace_id = iroh_docs::NamespaceId::from(ns_bytes);
-
-                    match Box::pin(docs.open_doc(namespace_id)).await? {
-                        Some(doc) => {
-                            // Writability was recorded when the namespace was first established;
-                            // legacy stores without the flag are assumed write-capable.
-                            let writable = Self::load_writable(cache.as_ref()).await;
-                            info!(
-                                writable,
-                                "Reopened existing iroh-docs document: {:?}", namespace_id
-                            );
-                            (doc, writable)
-                        }
-                        None if requested_read_only => {
-                            return Err(GuardianError::Store(format!(
-                                "Read-only store '{}' cannot create a namespace and the cached \
-                                 namespace {:?} was not found; no ticket available to import",
-                                store_key, namespace_id
-                            )));
-                        }
-                        None => {
-                            // Document not found — create a new one.
-                            warn!(
-                                "Cached namespace {:?} not found, creating new document",
-                                namespace_id
-                            );
-                            let doc = Box::pin(docs.create_doc()).await?;
-                            let ns_id = doc.id();
-                            cache
-                                .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
-                                .await
-                                .map_err(|e| {
-                                    GuardianError::Store(format!(
-                                        "Failed to persist NamespaceId: {}",
-                                        e
-                                    ))
-                                })?;
-                            Self::persist_writable(cache.as_ref(), true).await;
-                            info!("Created new iroh-docs document: {:?}", ns_id);
-                            (doc, true)
-                        }
-                    }
-                }
-                _ if requested_read_only => {
-                    return Err(GuardianError::Store(format!(
-                        "Read-only store '{}' cannot create a namespace and none was available \
-                         to import (no ticket, no cached namespace)",
-                        store_key
-                    )));
-                }
-                _ => {
-                    // No NamespaceId in the cache — create a new document.
-                    let doc = Box::pin(docs.create_doc()).await?;
-                    let ns_id = doc.id();
-                    cache
-                        .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
-                        .await
-                        .map_err(|e| {
-                            GuardianError::Store(format!("Failed to persist NamespaceId: {}", e))
-                        })?;
-                    Self::persist_writable(cache.as_ref(), true).await;
-                    info!("Created new iroh-docs document: {:?}", ns_id);
-                    (doc, true)
-                }
-            }
+            let doc = Box::pin(docs.create_doc()).await?;
+            let ns_id = doc.id();
+            cache
+                .put(NAMESPACE_CACHE_KEY, ns_id.as_bytes())
+                .await
+                .map_err(|error| {
+                    GuardianError::Store(format!("Failed to persist NamespaceId: {error}"))
+                })?;
+            Self::persist_writable(cache.as_ref(), true).await;
+            info!("Created new iroh-docs document: {:?}", ns_id);
+            (doc, true)
         };
 
         // Effective writability: a node explicitly opened read-only never writes, even if it

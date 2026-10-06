@@ -224,12 +224,10 @@ where
                     }
                 }
                 Ok(Some((TAG_EXITED, payload))) if payload.len() == 4 => {
-                    let code =
-                        i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    let code = i32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
                     let exit_code = if code == i32::MIN { None } else { Some(code) };
                     let _ = out_tx.send(Message::Text(
-                        serde_json::json!({ "type": "exited", "exit_code": exit_code })
-                            .to_string(),
+                        serde_json::json!({ "type": "exited", "exit_code": exit_code }).to_string(),
                     ));
                     break;
                 }
