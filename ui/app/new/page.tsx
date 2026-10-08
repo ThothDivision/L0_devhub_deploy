@@ -15,6 +15,7 @@ import { PreparingDeployment } from "@/components/clone-animation";
 import Image from "next/image";
 import { MarketplaceDeploymentModal } from "@/components/marketplace-deployment-modal";
 import { DeploymentModelHelp } from "@/components/deployment-model-help";
+import { GAME_SERVER_PRESETS, gamePresetEnvErrors, isSensitiveGameEnv, type GamePresetFields } from "@/lib/game-server-presets";
 
 // How long the "Preparing Git Repository" clone animation plays before the view
 // transitions to the live build logs (the build itself runs async on the node).
@@ -40,7 +41,7 @@ interface GhDetail {
   live?: boolean;
 }
 
-interface Template {
+interface Template extends GamePresetFields {
   name: string;
   desc: string;
   tag: string; // framework label for the monogram fallback
@@ -91,6 +92,8 @@ const TEMPLATES: Template[] = [
   { name: "Minecraft Server", desc: "Java Edition server (itzg/minecraft-server) with a persistent world, raw TCP.", image: "itzg/minecraft-server:latest", port: 25565, protocol: "tcp", env: { EULA: "TRUE" }, memory: "3g", tag: "MC", color: "#5b8c3e" },
   { name: "Terraria Server", desc: "Vanilla Terraria server with persistent worlds (TCP). Pin an image tag before important upgrades.", image: "passivelemon/terraria-docker:terraria-latest", port: 7777, protocol: "tcp", env: { AUTOCREATE: "2", WORLDNAME: "World" }, volumeMountPath: "/opt/terraria/config", memory: "2g", tag: "TR", color: "#718c45" },
   { name: "Factorio Server", desc: "Stable headless Factorio server with persistent saves (UDP). Pin a version before upgrading.", image: "factoriotools/factorio:stable", port: 34197, protocol: "udp", volumeMountPath: "/factorio", memory: "3g", tag: "FA", color: "#b77b39" },
+
+  ...GAME_SERVER_PRESETS,
 
   // Web3 / smart contracts (EVM) — one entry per directory of Chainlink's
   // smart-contract-examples monorepo. Each is a self-contained Hardhat
@@ -999,7 +1002,7 @@ function ConfigureImageTemplate({
   const [port, setPort] = useState(String(template.port ?? ""));
   const [protocol, setProtocol] = useState(template.protocol ?? "tcp");
   const [memory, setMemory] = useState(template.memory ?? "");
-  const [extraPorts, setExtraPorts] = useState<{ port: string; protocol: string; label: string }[]>([]);
+  const [extraPorts, setExtraPorts] = useState<{ port: string; protocol: string; label: string }[]>(() => (template.extraPorts ?? []).map(row => ({ ...row, port: String(row.port) })));
   const [envVars, setEnvVars] = useState<{ key: string; value: string }[]>(() => {
     const rows = Object.entries(template.env ?? {}).map(([key, value]) => ({ key, value }));
     return rows.length ? rows : [{ key: "", value: "" }];
@@ -1016,6 +1019,8 @@ function ConfigureImageTemplate({
     for (const { key, value } of envVars) if (key.trim()) out[key.trim()] = value;
     return out;
   };
+
+  const envErrors = gamePresetEnvErrors(template, buildEnv());
 
   return (
     <div className="mx-auto max-w-2xl">
@@ -1039,6 +1044,8 @@ function ConfigureImageTemplate({
           A pre-built image — no build step. The platform pulls it directly and attaches a persistent
           volume at <span className="font-mono">{template.volumeMountPath ?? "/data"}</span> that survives redeploys.
         </p>
+
+        {!!template.setupNotes?.length && <ul className="mb-6 list-disc space-y-2 pl-5 text-xs text-secondary">{template.setupNotes.map(note => <li key={note}>{note}</li>)}</ul>}
 
         <div className="mb-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
           <div>
@@ -1122,7 +1129,7 @@ function ConfigureImageTemplate({
               <div key={i} className="flex items-center gap-2">
                 <Input value={row.key} placeholder="KEY" className="flex-1 font-mono text-xs"
                   onChange={(e) => setEnvVars((rows) => rows.map((r, j) => (j === i ? { ...r, key: e.target.value } : r)))} />
-                <Input value={row.value} placeholder="value" className="flex-1 font-mono text-xs"
+                <Input type={isSensitiveGameEnv(row.key) ? "password" : "text"} autoComplete="off" value={row.value} placeholder="value" className="flex-1 font-mono text-xs"
                   onChange={(e) => setEnvVars((rows) => rows.map((r, j) => (j === i ? { ...r, value: e.target.value } : r)))} />
                 <button type="button" className="shrink-0 rounded-md p-2 text-muted hover:bg-subtle hover:text-fg"
                   onClick={() => setEnvVars((rows) => (rows.length <= 1 ? [{ key: "", value: "" }] : rows.filter((_, j) => j !== i)))}>
@@ -1141,10 +1148,12 @@ function ConfigureImageTemplate({
         </div>
         <DeploymentModelHelp className="mb-6" />
 
+        {envErrors.length > 0 && <p role="alert" className="mb-4 text-sm text-red-600">{envErrors.join(" ")}</p>}
         {error ? <p className="mb-4 text-sm text-red-600">{error}</p> : null}
 
         <Button
           onClick={async () => {
+            if (gamePresetEnvErrors(template, buildEnv()).length) return;
             if (typeof window !== "undefined") {
               await switchTeam(team === "personal" ? "__personal__" : team);
             }
@@ -1170,7 +1179,7 @@ function ConfigureImageTemplate({
               volumeMountPath: template.volumeMountPath,
             });
           }}
-          disabled={deploying}
+          disabled={deploying || envErrors.length > 0}
           className="w-full justify-center bg-fg py-2.5 text-bg"
         >
           {deploying ? <><Loader2 className="h-4 w-4 animate-spin" /> Creating…</> : "Create"}
