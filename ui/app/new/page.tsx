@@ -15,7 +15,9 @@ import { PreparingDeployment } from "@/components/clone-animation";
 import Image from "next/image";
 import { MarketplaceDeploymentModal } from "@/components/marketplace-deployment-modal";
 import { DeploymentModelHelp } from "@/components/deployment-model-help";
-import { GAME_SERVER_PRESETS, gamePresetEnvErrors, isSensitiveGameEnv, type GamePresetFields } from "@/lib/game-server-presets";
+import { GAME_SERVER_PRESETS, gamePresetEnvErrors, isSensitiveGameEnv, type GameServerPreset, type GamePresetFields } from "@/lib/game-server-presets";
+
+import { GamesMenu, ConfigureGame } from "@/components/game-hosting";
 
 // How long the "Preparing Git Repository" clone animation plays before the view
 // transitions to the live build logs (the build itself runs async on the node).
@@ -89,9 +91,6 @@ const TEMPLATES: Template[] = [
   // explanation. Real Java Edition server (itzg/minecraft-server), a
   // world-standard, actively-maintained public image — EULA=TRUE is
   // Mojang's own required acceptance flag, not a platform invention.
-  { name: "Minecraft Server", desc: "Java Edition server (itzg/minecraft-server) with a persistent world, raw TCP.", image: "itzg/minecraft-server:latest", port: 25565, protocol: "tcp", env: { EULA: "TRUE" }, memory: "3g", tag: "MC", color: "#5b8c3e" },
-  { name: "Terraria Server", desc: "Vanilla Terraria server with persistent worlds (TCP). Pin an image tag before important upgrades.", image: "passivelemon/terraria-docker:terraria-latest", port: 7777, protocol: "tcp", env: { AUTOCREATE: "2", WORLDNAME: "World" }, volumeMountPath: "/opt/terraria/config", memory: "2g", tag: "TR", color: "#718c45" },
-  { name: "Factorio Server", desc: "Stable headless Factorio server with persistent saves (UDP). Pin a version before upgrading.", image: "factoriotools/factorio:stable", port: 34197, protocol: "udp", volumeMountPath: "/factorio", memory: "3g", tag: "FA", color: "#b77b39" },
 
   ...GAME_SERVER_PRESETS,
 
@@ -184,8 +183,9 @@ export default function NewProjectPage() {
   const [marketplaceOpen, setMarketplaceOpen] = useState(false);
 
   const TPL_PER = 5;
-  const tplPages = Math.max(1, Math.ceil(TEMPLATES.length / TPL_PER));
-  const shownTemplates = TEMPLATES.slice(tplPage * TPL_PER, tplPage * TPL_PER + TPL_PER);
+  const nonGameTemplates = TEMPLATES.filter(t => !t.gameId);
+  const tplPages = Math.max(1, Math.ceil(nonGameTemplates.length / TPL_PER));
+  const shownTemplates = nonGameTemplates.slice(tplPage * TPL_PER, tplPage * TPL_PER + TPL_PER);
 
   useEffect(() => {
     cachedJson<GhDetail>("/api/github/status", 30_000).then(async (s) => {
@@ -446,6 +446,7 @@ export default function NewProjectPage() {
 
   // ----- Configure screen (after a template is selected) -----
   if (selected) {
+    if (selected.gameId) return <ConfigureGame key={selected.gameId} game={selected as GameServerPreset} onBack={() => { setSelected(null); setError(""); }} onCreate={opts => runImageDeploy({ ...opts, template: selected })} deploying={deploying} error={error} />;
     return selected.image ? (
       <ConfigureImageTemplate
         template={selected}
@@ -636,6 +637,7 @@ export default function NewProjectPage() {
       </div>
       {error ? <p className="mb-6 text-center text-sm text-red-600">{error}</p> : null}
 
+      <GamesMenu onSelect={game => { setError(""); setSelected(game); }} disabled={deploying} />
       <div className="grid grid-cols-1 gap-8 md:grid-cols-2">
         {/* Import Git Repository */}
         <div>
