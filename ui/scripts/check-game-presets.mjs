@@ -7,7 +7,7 @@ let checks=0;
 function check(ok,message){checks++;if(!ok)throw new Error(message);}
 const expected={minecraft:[25565,'tcp','/data',[]],terraria:[7777,'tcp','/opt/terraria/config',[]],factorio:[34197,'udp','/factorio',[]],palworld:[8211,'udp','/palworld',[]],valheim:[2456,'udp','/config',[2457,2458]],arma3:[2302,'udp','/arma3/server',[2303,2304,2305,2306]],'ark-ase':[7777,'udp','/app',[7778,27015]],gesource:[27015,'udp','/app/gesource/logs',[]],romestead:[8050,'udp','/home/steam/server-files',[]]};
 // Presets whose upstream image exposes no env controls (command-line/cfg configured only).
-const NO_ENV_CONTROLS=new Set(['gesource']);
+const NO_ENV_CONTROLS=new Set([]);
 check(GAME_SERVER_PRESETS.length===9,'nine identities required');
 check(new Set(GAME_SERVER_PRESETS.map(p=>p.gameId)).size===9,'duplicate identities');
 for(const t of GAME_SERVER_PRESETS){
@@ -43,14 +43,13 @@ check(ark.name.includes('Survival Evolved') && ark.env.STEAM_LOGIN==='anonymous'
 check(!ark.extraPorts.some(p=>p.port===27020),'RCON publicly exposed');
 check(ark.env.UDP_SOCKET_PORT===String(ark.port+1),'ARK adjacent port mismatch');
 const ge=GAME_SERVER_PRESETS.find(t=>t.gameId==='gesource');
-check(ge.image.startsWith('ghcr.io/lacledeslan/gamesvr-gesource:')&&ge.platform==='linux/amd64','GE:S wrong image/platform');
-check(ge.setupNotes[0].startsWith('STARTUP COMMAND REQUIRED'),'GE:S startup gap must be disclosed first');
+check(ge.image.startsWith('ghcr.io/solutionsasservice/gamesvr-gesource:')&&ge.platform==='linux/amd64','GE:S wrong image/platform');
+check(!ge.setupNotes.some(n=>n.includes('STARTUP COMMAND REQUIRED')),'GE:S derived image has an entrypoint; stale startup note');
 check(!(ge.extraPorts??[]).length&&ge.protocol==='udp','GE:S must not publish RCON TCP');
-const rs=GAME_SERVER_PRESETS.find(t=>t.gameId==='romestead');
-check(rs.env.PUID&&rs.env.PGID&&rs.env.PORT===String(rs.port)&&rs.env.UPDATE_ON_START==='true','Romestead required defaults');
-check(rs.env.PASSWORD===''&&isSensitiveGameEnv('PASSWORD'),'Romestead password default/masking');
-for(const [k,v] of [['PASSWORD','a"b'],['PASSWORD','a\\b'],['AUTO_START_WORLD_NAME','$(id)'],['AUTO_START_WORLD_NAME','`id`'],['AUTO_CREATE_WORLD_SEED','12 34'],['PORT','9000'],['PUID',''],['PGID','x']])check(gamePresetEnvErrors(rs,{...rs.env,[k]:v}).length>0,'Romestead unsafe '+k+' accepted');
-for(const [k,v] of [['PASSWORD','correct-horse'],['AUTO_START_WORLD_NAME','My World'],['AUTO_CREATE_WORLD_SEED','abc-123'],['AUTO_CREATE_WORLD_SEED','null']])check(!gamePresetEnvErrors(rs,{...rs.env,[k]:v}).length,'Romestead valid '+k+' rejected');
+check(ge.env.GES_MAP==='ge_archives'&&ge.env.GES_MAXPLAYERS==='16'&&ge.env.GES_PASSWORD===''&&ge.env.GES_RCON_PASSWORD===''&&!ge.requiredEnv.length,'GE:S defaults');
+for(const key of ['GES_PASSWORD','GES_RCON_PASSWORD'])check(ge.fields.find(f=>f.key===key)?.kind==='secret'&&isSensitiveGameEnv(key)&&settings.includes('"'+key+'"'),'GE:S secret policy '+key);
+for(const [k,v] of [['GES_MAP','ge_archives;quit'],['GES_MAP','../x'],['GES_MAP',''],['GES_MAXPLAYERS','0'],['GES_MAXPLAYERS','33'],['GES_HOSTNAME','a";quit'],['GES_HOSTNAME','a;quit'],['GES_HOSTNAME','$(id)'],['GES_HOSTNAME','a`id`'],['GES_HOSTNAME','a\\b'],['GES_HOSTNAME',''],['GES_HOSTNAME','x'.repeat(64)],['GES_PASSWORD','a b'],['GES_PASSWORD','a;rcon'],['GES_PASSWORD','a"b'],['GES_RCON_PASSWORD','x;quit'],['GES_RCON_PASSWORD','$x'],['GES_RCON_PASSWORD','x'.repeat(65)]])check(gamePresetEnvErrors(ge,{...ge.env,[k]:v}).length>0,'GE:S unsafe '+k+' accepted');
+for(const [k,v] of [['GES_MAP','ge_depot'],['GES_HOSTNAME',"Bond's [MI6] Server #1 (EU)"],['GES_PASSWORD','mi6-secret'],['GES_RCON_PASSWORD','r@con!']])check(!gamePresetEnvErrors(ge,{...ge.env,[k]:v}).length,'GE:S valid '+k+' rejected');
 check(form.includes('game.fields?.length ?'),'no-env-controls fallback missing');
 for(const key of ['PASSWORD','STEAM_LOGIN','BETA_ACCESSCODE','DISCORD_WEBHOOK_URL'])check(settings.includes('"'+key+'"')&&isSensitiveGameEnv(key),'secret policy missing '+key);
 check(page.includes('<GamesMenu')&&page.includes('<ConfigureGame')&&page.includes('TEMPLATES.filter(t => !t.gameId)'),'Games grouping not wired');

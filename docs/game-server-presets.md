@@ -2,7 +2,7 @@
 
 These are catalog/configuration presets, not a claim of playable, capacity-approved
 or paid deployments. The Games menu unifies Minecraft, Terraria, Factorio, Palworld,
-Valheim, Arma 3, ARK: Survival Evolved, GoldenEye: Source and Romestead. Existing image, port, memory and
+Valheim, Arma 3, ARK: Survival Evolved, GoldenEye: Source, Romestead. Existing image, port, memory and
 environment defaults are preserved; Minecraft now explicitly names /data. No upstream source code, game binaries or passwords are copied.
 
 ## Audited upstream revisions (2026-10-08)
@@ -38,10 +38,16 @@ our source of truth; image tags below remain mutable and are NOT digest pins.
   not upstream scripts. **Survival Evolved, not Survival Ascended.**
 
 - GoldenEye: Source: [LacledesLAN / gamesvr-gesource](https://github.com/LacledesLAN/gamesvr-gesource/tree/a75d5fbef7c23438b2cbd7d69155df2764d92006)
-  (mirrored at SolutionsAsService/gamesvr-gesource). README, linux.Dockerfile,
-  dist/linux/ll-tests and LICENSE (Unlicense). Image ghcr.io/lacledeslan/gamesvr-gesource:latest,
-  linux/amd64, config created 2023-04-06; Docker Hub lacledeslan/gamesvr-gesource no
-  longer resolves (registry 401/not found on 2026-10-12), so the GHCR publish target is used.
+  README, linux.Dockerfile, dist/linux/ll-tests and LICENSE (Unlicense). Base image
+  ghcr.io/lacledeslan/gamesvr-gesource:latest (linux/amd64, created 2023-04-06, CMD /bin/bash,
+  no ENTRYPOINT); Docker Hub lacledeslan/gamesvr-gesource no longer resolves.
+  The preset uses the derived image **ghcr.io/solutionsasservice/gamesvr-gesource:latest**
+  built from [SolutionsAsService / gamesvr-gesource @ e32998a](https://github.com/SolutionsAsService/gamesvr-gesource/tree/e32998abf43ff5d09f05e2ef93db4be1ae976d72)
+  (devhub.Dockerfile, dist/linux/devhub-entrypoint.sh, .github/workflows/devhub-image.yml).
+  Published 2026-10-12 by GitHub Actions as linux/amd64, digest
+  sha256:bef77cd2b34ec65d1d766955b8ab58f92a117ab11e1505032fd50945cf93e5af (also tag
+  sha-e32998abf43ff5d09f05e2ef93db4be1ae976d72); the GHCR package is public and the manifest
+  resolves anonymously. ENTRYPOINT /usr/local/bin/devhub-entrypoint.sh, user GESource.
 - Romestead: [indifferentbroccoli / romestead-server-docker](https://github.com/SolutionsAsService/romestead-server-docker/tree/e6cc37b8b3d8e642c613d3a4296433844a724ad1)
   (SolutionsAsService fork). README, Dockerfile, docker-compose.yml, .env.example,
   scripts/init.sh, scripts/functions.sh, scripts/start.sh and LICENSE (GPL-3.0).
@@ -63,7 +69,7 @@ not claims of game edition compatibility or preinstalled mods.
 | Palworld | Private direct connect; name, players, join password | latest OCI; Steam runtime independent |
 | Valheim | Private Steam/crossplay; name, world, password, listing | latest OCI; downloaded runtime independent |
 | Arma 3 | Prepared config volume; profile/startup world, headless count, local Launcher HTML mod preset, dedicated Steam login | v2 OCI; refreshed Steam depots independent |
-| GoldenEye: Source | Stock server only; no env controls exist upstream (srcds command line / cfg) | Game files baked into OCI image; tag is the only version |
+| GoldenEye: Source | Standard 16 / small 8 / N64-style 4 players; hostname, start map, max players (1-32), optional join password, optional RCON password | Game files baked into OCI image; tag/digest is the only version |
 | Romestead | Auto-created or named world; players, optional password, world size/seed, cheats, update-on-start | latest/v1 OCI; Steam depot downloaded on start, independent of tag |
 | ARK ASE | Private TheIsland or custom map/mods; session/map/players, join/admin passwords, numeric Workshop IDs, update/validation/backup switches | latest OCI; ASE runtime download/update independent |
 
@@ -109,19 +115,30 @@ upstream and not offered. No arbitrary map/version list or default credential.
 
 ## GoldenEye: Source operations
 
-**Not ready to play through the current image-deploy engine.** The stock image's
-CMD is `/bin/bash` with no ENTRYPOINT and no EXPOSE; upstream always launches the
-server with an explicit `./srcds_run -game gesource +map <map> ...` command.
-`/v1/deploy/image` cannot pass a run command (the backend only honours
-`entrypoint`/`cmd` for compose services), so a deployment starts a shell that exits.
-Two fixes, either acceptable: (1) plumb an optional `command` through
-ImageDeployReq → GitDeployRequest → container run (the backend argv slot already
-exists), or (2) publish a thin derived image (e.g. from the SolutionsAsService fork)
-whose ENTRYPOINT runs srcds_run with env-driven map/maxplayers/hostname. The
-preset is catalogued now so the Games menu, validation and docs are in place.
-`MALLOC_CHECK_=0` is baked into the image and required. srcds RCON shares
-27015/TCP and is never published. Only logs are persisted so a named volume can
-never shadow the ~1.8 GB of baked game files.
+The stock LacledesLAN image's CMD is `/bin/bash` with no ENTRYPOINT, and
+`/v1/deploy/image` cannot pass a run command, so the preset uses a thin derived
+image from the SolutionsAsService fork (fix option 2). Its entrypoint runs
+`/app/srcds_run -game gesource -norestart -port 27015 +maxplayers $GES_MAXPLAYERS +map $GES_MAP`
+(exec'd, so SIGTERM reaches srcds_run).
+
+| Env | Default | Validation (UI and entrypoint) |
+| --- | --- | --- |
+| GES_MAP | ge_archives | `[A-Za-z0-9_]{1,64}`; entrypoint also requires gesource/maps/<map>.bsp |
+| GES_MAXPLAYERS | 16 | integer 1-32 |
+| GES_HOSTNAME | GoldenEye: Source | 1-63 chars; no quotes, `;`, `\`, `$`, backticks, newlines |
+| GES_PASSWORD | empty (public) | optional secret; 1-64 chars, no spaces/quotes/`;`/`\`/`$`/backticks |
+| GES_RCON_PASSWORD | empty (RCON off) | optional secret; same charset |
+
+srcds splits console input on `;` and newlines, so these allow-lists are what
+prevent command injection; the entrypoint additionally never evaluates values in a
+shell. Hostname and passwords go to `gesource/cfg/devhub_env.cfg` (mode 0600),
+which is `exec`'d at the end of server.cfg so it overrides the stock hostname on
+every map load. Invalid values stop the container with exit 64 and messages name
+keys only. Passwords are masked and sensitive in both `isSensitiveGameEnv` and the
+backend `game_secret` list. srcds RCON shares 27015/TCP and is never published.
+`MALLOC_CHECK_=0` is inherited. Only logs are persisted so a named volume never
+shadows baked game files. Entrypoint behaviour was unit-tested with a stubbed
+srcds_run; the image itself was not run and no client join was tested.
 
 ## Romestead operations
 
@@ -155,7 +172,7 @@ is NOT a ready-to-play multiport server. This preset task does not change routin
 | Valheim | ghcr.io/community-valheim-tools/valheim-server:latest | 2456–2458/UDP | /config |
 | Arma 3 | ghcr.io/brettmayson/arma3server/arma3server:v2 | 2302–2306/UDP | /arma3/server |
 | ARK: Survival Evolved | hermsi/ark-server:latest | 7777,7778,27015/UDP; no public RCON | /app |
-| GoldenEye: Source | ghcr.io/lacledeslan/gamesvr-gesource:latest | 27015/UDP; no public RCON | /app/gesource/logs |
+| GoldenEye: Source | ghcr.io/solutionsasservice/gamesvr-gesource:latest (derived) | 27015/UDP; no public RCON | /app/gesource/logs |
 | Romestead | indifferentbroccoli/romestead-server-docker:latest | 8050/UDP | /home/steam/server-files |
 
 Palworld upstream publishes amd64/arm64 images; Valheim's build and Arma's Compose
