@@ -2,7 +2,7 @@
 
 These are catalog/configuration presets, not a claim of playable, capacity-approved
 or paid deployments. The Games menu unifies Minecraft, Terraria, Factorio, Palworld,
-Valheim, Arma 3, ARK: Survival Evolved, GoldenEye: Source, Romestead. Existing image, port, memory and
+Valheim, Arma 3, ARK: Survival Evolved, GoldenEye: Source, Romestead and Don't Starve Together. Existing image, port, memory and
 environment defaults are preserved; Minecraft now explicitly names /data. No upstream source code, game binaries or passwords are copied.
 
 ## Audited upstream revisions (2026-10-08)
@@ -54,6 +54,13 @@ our source of truth; image tags below remain mutable and are NOT digest pins.
   Image indifferentbroccoli/romestead-server-docker:latest (also v1/v1.0/v1.0.1), linux/amd64.
   The fork also publishes ghcr.io/solutionsasservice/romestead-server-docker:main; not used
   by default because upstream has semver tags.
+- Don't Starve Together: [Jamesits / docker-dst-server](https://github.com/Jamesits/docker-dst-server/tree/503f0fee89ea076241cfa044de28caad75c33b6c)
+  (HEAD, 2022-05-21). README, Dockerfile, docker-compose.yml, azure-pipelines.yaml,
+  scripts_system/entrypoint.sh, supervisor/supervisor.conf, dst_default_config/ and
+  LICENSE (GPL-2.0-or-later). Docker Hub jamesits/dst-server: latest = vanilla
+  (2022-05-21, sha256:fa61065f8d2d…), nightly (2025-07-12), steamcmd-rebase and -slim
+  variants; all linux/amd64 only. ENTRYPOINT entrypoint.sh, CMD supervisord; VOLUME /data;
+  EXPOSE 10999-11000/udp 12346-12347/udp.
 
 ## Audited configure controls and profiles
 
@@ -71,6 +78,7 @@ not claims of game edition compatibility or preinstalled mods.
 | Arma 3 | Prepared config volume; profile/startup world, headless count, local Launcher HTML mod preset, dedicated Steam login | v2 OCI; refreshed Steam depots independent |
 | GoldenEye: Source | Standard 16 / small 8 / N64-style 4 players; hostname, start map, max players (1-32), optional join password, optional RCON password | Game files baked into OCI image; tag/digest is the only version |
 | Romestead | Auto-created or named world; players, optional password, world size/seed, cheats, update-on-start | latest/v1 OCI; Steam depot downloaded on start, independent of tag |
+| Don't Starve Together | Master + Caves cluster, 64-bit or legacy 32-bit binary; required masked cluster token. Name/password/players/PvP are cluster.ini file settings | latest/vanilla/nightly OCI; steamcmd updates game + mods on every start |
 | ARK ASE | Private TheIsland or custom map/mods; session/map/players, join/admin passwords, numeric Workshop IDs, update/validation/backup switches | latest OCI; ASE runtime download/update independent |
 
 Field ranges are conservative **form bounds**, not certified upstream capacity.
@@ -152,6 +160,35 @@ the form rejects quotes, backslashes, `$` and backticks and restricts seeds.
 Graceful stop sends `stop` over a FIFO and waits 30s. Upstream asks for 4–8 GB
 RAM, 2–4 cores and 10–20 GB disk; 8g is a request, not verified capacity.
 
+## Don't Starve Together operations
+
+**Multiport / no-NAT limit (read first).** The image runs two shards (Master
+10999/UDP, Caves 11000/UDP) plus Steam ports 12346/12347/UDP, and upstream says
+not to NAT them to different port numbers. mesh_raw forwards only the primary
+port and public allocations may differ, so this is not playable on mesh-only
+hosting. It needs direct serving-node ingress with identical public port numbers
+for all four; the form's ingress checkbox gates review. The two extra high UDP
+ports DST opens for Steam are ephemeral/outbound and 10998/UDP is shard-to-shard on
+127.0.0.1; neither is published.
+
+DST_CLUSTER_TOKEN is required, masked, empty by default and marked sensitive in
+`isSensitiveGameEnv` and the backend `game_secret` list. The UI rejects whitespace and
+control characters; upstream writes it with printf to Cluster_1/cluster_token.txt on
+each start. DST_SERVER_ARCH selects bin64 (amd64, README example) or the image's
+legacy 32-bit default (x86). Cluster name, description, password, max players (64),
+PvP (on), game mode and whitelist are **cluster.ini file settings** in the /data
+volume, generated on first start with a public, password-less name; there are no
+env controls upstream, and the catalog does not invent any. The generated [SHARD]
+cluster_key is a fixed upstream value (shards bind 127.0.0.1); change it.
+Disabling Caves or using one shard requires changing supervisor.conf in a derived
+image. The entrypoint starts as root to chown /data, then supervisord runs both
+shards as `dst`. Every start runs `steamcmd app_update 343050` (anonymous) and a
+server-mods update, so first start and restarts need network and the OCI tag never
+pins the game. Saving on stop can take ~5 minutes (compose stop_grace_period 6m,
+supervisor stopwaitsecs 720); short stop timeouts can lose progress. latest was
+built 2022-05 (Debian buster); nightly 2025-07. GPL-2.0 applies to the image's
+scripts; we reference the published image only.
+
 ## Transport and persistence
 
 All use the prebuilt-image /v1/deploy/image engine, not Git builds or HTTP ingress.
@@ -159,7 +196,7 @@ A nonempty ports list REPLACES defaults, so the primary port is included alongsi
 all seeded extra ports. Container ports below are not promises of public ports.
 **Existing engine limitation:** fluid-core documents that mesh_raw only forwards
 the PRIMARY port (spec_idx != 0 is unsupported). Secondary raw ports receive
-allocations but are not cross-node forwardable. Valheim, Arma and ARK therefore need
+allocations but are not cross-node forwardable. Valheim, Arma, ARK and Don't Starve Together therefore need
 verified serving-node raw ingress for all secondary ports; a mesh-only deployment
 is NOT a ready-to-play multiport server. This preset task does not change routing.
 
@@ -174,6 +211,7 @@ is NOT a ready-to-play multiport server. This preset task does not change routin
 | ARK: Survival Evolved | hermsi/ark-server:latest | 7777,7778,27015/UDP; no public RCON | /app |
 | GoldenEye: Source | ghcr.io/solutionsasservice/gamesvr-gesource:latest (derived) | 27015/UDP; no public RCON | /app/gesource/logs |
 | Romestead | indifferentbroccoli/romestead-server-docker:latest | 8050/UDP | /home/steam/server-files |
+| Don't Starve Together | jamesits/dst-server:latest | 10999,11000,12346,12347/UDP; same public numbers required | /data |
 
 Palworld upstream publishes amd64/arm64 images; Valheim's build and Arma's Compose
 specify linux/amd64. Terraria/Factorio retain existing image architecture behavior;
@@ -232,7 +270,7 @@ request/fanout/settings/mount plumbing needed to honor non-/data game paths.
 
 Run from ui: node scripts/check-game-presets.mjs (Node 24's TypeScript stripping).
 This is an offline catalog/schema regression validator, not a mock game server.
-It checks all nine identities, transport/persistence, multiports, typed fields,
+It checks all ten identities, transport/persistence, multiports, typed fields,
 profiles, OCI/runtime version validation, missing/short credentials, masked
 summary values, backend policy and accessibility/navigation source guards.
 These source guards are NOT DOM/browser interaction proof.
