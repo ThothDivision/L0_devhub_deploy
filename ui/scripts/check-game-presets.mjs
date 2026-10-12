@@ -5,14 +5,16 @@ const form=readFileSync(new URL('../components/game-hosting.tsx',import.meta.url
 const settings=readFileSync(new URL('../../crates/hive-cloud/src/project_settings.rs',import.meta.url),'utf8');
 let checks=0;
 function check(ok,message){checks++;if(!ok)throw new Error(message);}
-const expected={minecraft:[25565,'tcp','/data',[]],terraria:[7777,'tcp','/opt/terraria/config',[]],factorio:[34197,'udp','/factorio',[]],palworld:[8211,'udp','/palworld',[]],valheim:[2456,'udp','/config',[2457,2458]],arma3:[2302,'udp','/arma3/server',[2303,2304,2305,2306]],'ark-ase':[7777,'udp','/app',[7778,27015]]};
-check(GAME_SERVER_PRESETS.length===7,'seven identities required');
-check(new Set(GAME_SERVER_PRESETS.map(p=>p.gameId)).size===7,'duplicate identities');
+const expected={minecraft:[25565,'tcp','/data',[]],terraria:[7777,'tcp','/opt/terraria/config',[]],factorio:[34197,'udp','/factorio',[]],palworld:[8211,'udp','/palworld',[]],valheim:[2456,'udp','/config',[2457,2458]],arma3:[2302,'udp','/arma3/server',[2303,2304,2305,2306]],'ark-ase':[7777,'udp','/app',[7778,27015]],gesource:[27015,'udp','/app/gesource/logs',[]],romestead:[8050,'udp','/home/steam/server-files',[]]};
+// Presets whose upstream image exposes no env controls (command-line/cfg configured only).
+const NO_ENV_CONTROLS=new Set(['gesource']);
+check(GAME_SERVER_PRESETS.length===9,'nine identities required');
+check(new Set(GAME_SERVER_PRESETS.map(p=>p.gameId)).size===9,'duplicate identities');
 for(const t of GAME_SERVER_PRESETS){
  const [port,protocol,path,extras]=expected[t.gameId];
  check(t.port===port && t.protocol===protocol && t.volumeMountPath===path,t.name+' wrong transport/persistence');
  check(JSON.stringify((t.extraPorts??[]).map(p=>p.port))===JSON.stringify(extras),t.name+' wrong extra ports');
- check(t.fields?.length>0 && t.profiles?.length>0 && t.imageTags?.length>0,t.name+' missing configure metadata');
+ check((NO_ENV_CONTROLS.has(t.gameId)?Array.isArray(t.fields)&&t.fields.length===0&&Object.keys(t.env).length===0:t.fields?.length>0) && t.profiles?.length>0 && t.imageTags?.length>0,t.name+' missing configure metadata');
  check(new Set(t.fields.map(f=>f.key)).size===t.fields.length,'duplicate fields');
  check(gameImageError(t,t.image)===undefined,'valid default image rejected');
  check(gameImageError(t,t.image.replace(/:[^/:]+$/,'@sha256:'+'a'.repeat(64)))===undefined,'valid digest rejected');
@@ -40,9 +42,19 @@ const ark=GAME_SERVER_PRESETS.find(t=>t.gameId==='ark-ase');
 check(ark.name.includes('Survival Evolved') && ark.env.STEAM_LOGIN==='anonymous','ARK wrong identity/login');
 check(!ark.extraPorts.some(p=>p.port===27020),'RCON publicly exposed');
 check(ark.env.UDP_SOCKET_PORT===String(ark.port+1),'ARK adjacent port mismatch');
+const ge=GAME_SERVER_PRESETS.find(t=>t.gameId==='gesource');
+check(ge.image.startsWith('ghcr.io/lacledeslan/gamesvr-gesource:')&&ge.platform==='linux/amd64','GE:S wrong image/platform');
+check(ge.setupNotes[0].startsWith('STARTUP COMMAND REQUIRED'),'GE:S startup gap must be disclosed first');
+check(!(ge.extraPorts??[]).length&&ge.protocol==='udp','GE:S must not publish RCON TCP');
+const rs=GAME_SERVER_PRESETS.find(t=>t.gameId==='romestead');
+check(rs.env.PUID&&rs.env.PGID&&rs.env.PORT===String(rs.port)&&rs.env.UPDATE_ON_START==='true','Romestead required defaults');
+check(rs.env.PASSWORD===''&&isSensitiveGameEnv('PASSWORD'),'Romestead password default/masking');
+for(const [k,v] of [['PASSWORD','a"b'],['PASSWORD','a\\b'],['AUTO_START_WORLD_NAME','$(id)'],['AUTO_START_WORLD_NAME','`id`'],['AUTO_CREATE_WORLD_SEED','12 34'],['PORT','9000'],['PUID',''],['PGID','x']])check(gamePresetEnvErrors(rs,{...rs.env,[k]:v}).length>0,'Romestead unsafe '+k+' accepted');
+for(const [k,v] of [['PASSWORD','correct-horse'],['AUTO_START_WORLD_NAME','My World'],['AUTO_CREATE_WORLD_SEED','abc-123'],['AUTO_CREATE_WORLD_SEED','null']])check(!gamePresetEnvErrors(rs,{...rs.env,[k]:v}).length,'Romestead valid '+k+' rejected');
+check(form.includes('game.fields?.length ?'),'no-env-controls fallback missing');
 for(const key of ['PASSWORD','STEAM_LOGIN','BETA_ACCESSCODE','DISCORD_WEBHOOK_URL'])check(settings.includes('"'+key+'"')&&isSensitiveGameEnv(key),'secret policy missing '+key);
 check(page.includes('<GamesMenu')&&page.includes('<ConfigureGame')&&page.includes('TEMPLATES.filter(t => !t.gameId)'),'Games grouping not wired');
 check(page.includes('volume_mount_path: opts.volumeMountPath')&&page.includes('image: opts.image'),'payload image/volume missing');
 for(const fragment of ['aria-label="Games"','htmlFor={"game-" + f.key}','id={"game-" + f.key}','Back to Games','Back to configuration','Review configuration','stage !== "review"','!game.extraPorts?.length || ingress','gameSummaryEnv(env)','type={f.kind === "secret" ? "password"','volumeMountPath: game.volumeMountPath','port: game.port','env, volumeMountPath','raw server errors are not shown'])check(form.includes(fragment),'form source guard missing '+fragment);
 check(settings.includes('game_secret || looks_like_secret(&value.value)'),'encrypted policy missing');
-console.log('PASS '+checks+' offline catalog/schema/source checks; all seven games. No browser, registry or game-runtime proof.');
+console.log('PASS '+checks+' offline catalog/schema/source checks; all nine games. No browser, registry or game-runtime proof.');
