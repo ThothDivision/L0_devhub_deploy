@@ -2,7 +2,7 @@
 
 These are catalog/configuration presets, not a claim of playable, capacity-approved
 or paid deployments. The Games menu unifies Minecraft, Terraria, Factorio, Palworld,
-Valheim, Arma 3, ARK: Survival Evolved, GoldenEye: Source, Romestead and Don't Starve Together. Existing image, port, memory and
+Valheim, Arma 3, ARK: Survival Evolved, GoldenEye: Source, Romestead, Don't Starve Together and Team Fortress 2. Existing image, port, memory and
 environment defaults are preserved; Minecraft now explicitly names /data. No upstream source code, game binaries or passwords are copied.
 
 ## Audited upstream revisions (2026-10-08)
@@ -61,6 +61,14 @@ our source of truth; image tags below remain mutable and are NOT digest pins.
   (2022-05-21, sha256:fa61065f8d2d…), nightly (2025-07-12), steamcmd-rebase and -slim
   variants; all linux/amd64 only. ENTRYPOINT entrypoint.sh, CMD supervisord; VOLUME /data;
   EXPOSE 10999-11000/udp 12346-12347/udp.
+- Team Fortress 2: [melkortf / tf2-servers](https://github.com/melkortf/tf2-servers/tree/2bcf13e498503514213deb52bfcfd2783371baf5)
+  (release 4.0.8). README, packages/tf2-base/{amd64,i386}.Dockerfile, entrypoint.sh,
+  server.cfg.template, healthcheck.sh, .github/workflows/build.yml and LICENSE (MIT,
+  copyright 2021 melkor.tf). Preset uses the 64-bit **ghcr.io/melkortf/tf2-base/amd64:latest**
+  (index sha256:959278f5b886…, created 2026-10-09, version label 4.0.8, ~2.1 GB compressed);
+  tags latest, 4, 4.0, 4.0.8, nightly and sha-*. ENTRYPOINT ./entrypoint.sh, CMD
+  `+sv_pure 1 +map cp_badlands +maxplayers 24`, user tf2, EXPOSE 27015/tcp, 27015/udp, 27020/udp.
+  The un-suffixed ghcr.io/melkortf/tf2-base is the 32-bit variant and is not used.
 
 ## Audited configure controls and profiles
 
@@ -79,6 +87,7 @@ not claims of game edition compatibility or preinstalled mods.
 | GoldenEye: Source | Standard 16 / small 8 / N64-style 4 players; hostname, start map, max players (1-32), optional join password, optional RCON password | Game files baked into OCI image; tag/digest is the only version |
 | Romestead | Auto-created or named world; players, optional password, world size/seed, cheats, update-on-start | latest/v1 OCI; Steam depot downloaded on start, independent of tag |
 | Don't Starve Together | Master + Caves cluster, 64-bit or legacy 32-bit binary; required masked cluster token. Name/password/players/PvP are cluster.ini file settings | latest/vanilla/nightly OCI; steamcmd updates game + mods on every start |
+| Team Fortress 2 | Direct-connect or Steam Datagram Relay; hostname, optional join password, required RCON password, optional GSLT, optional SourceTV password | latest/4/nightly OCI; TF2 baked in plus srcds -autoupdate |
 | ARK ASE | Private TheIsland or custom map/mods; session/map/players, join/admin passwords, numeric Workshop IDs, update/validation/backup switches | latest OCI; ASE runtime download/update independent |
 
 Field ranges are conservative **form bounds**, not certified upstream capacity.
@@ -189,6 +198,34 @@ supervisor stopwaitsecs 720); short stop timeouts can lose progress. latest was
 built 2022-05 (Debian buster); nightly 2025-07. GPL-2.0 applies to the image's
 scripts; we reference the published image only.
 
+## Team Fortress 2 operations
+
+Vanilla `tf2-base` (no SourceMod), 64-bit image. Only 27015/UDP is published;
+27015/TCP RCON and SourceTV 27020/UDP are never published (SourceTV stays enabled
+inside but is unreachable; STV_PASSWORD is offered masked). CLIENT_PORT and
+STEAM_PORT are internal. PORT is locked to 27015 because upstream binds with
+`-strictportbind`.
+
+**RCON_PASSWORD is required** (8-64 chars, masked, empty default): the image's
+built-in default is the public value `123456`, and its healthcheck and SIGTERM
+handler (`rcon ... quit`) use RCON on 127.0.0.1, so leaving it empty would break
+graceful stop/health and leaving the default would be unsafe. Upstream envsubsts
+RCON/join/SourceTV passwords and hostname into quoted server.cfg lines and passes
+RCON_PASSWORD unquoted on a bash command line, so whitespace, quotes, `;`, `\`, `$`,
+backticks (and `*` for RCON) are rejected. SERVER_TOKEN is an optional Steam Game
+Server Login Token (App ID 440; 32 hex chars); without it srcds logs in anonymously
+and may not be listed. ENABLE_FAKE_IP=1 enables Steam Datagram Relay. TICKRATE is
+not offered.
+
+The CMD is fixed at `+sv_pure 1 +map cp_badlands +maxplayers 24` and image deploy
+cannot change it; cp_badlands is the only map shipped. **Persistence decision:**
+a vanilla TF2 server has no world state, and mounting over tf/maps would hide
+cp_badlands, and over tf/cfg would hide the templates. The platform always attaches
+a volume, so it is mounted at the inert `/home/tf2/devhub-data` (unused by the
+image). Logs and any runtime `-autoupdate` downloads live in the container layer
+and are lost on redeploy. Custom maps/rotation need a derived image. Upstream
+does not publish a memory requirement; 2g is a request, not verified capacity.
+
 ## Transport and persistence
 
 All use the prebuilt-image /v1/deploy/image engine, not Git builds or HTTP ingress.
@@ -212,6 +249,7 @@ is NOT a ready-to-play multiport server. This preset task does not change routin
 | GoldenEye: Source | ghcr.io/solutionsasservice/gamesvr-gesource:latest (derived) | 27015/UDP; no public RCON | /app/gesource/logs |
 | Romestead | indifferentbroccoli/romestead-server-docker:latest | 8050/UDP | /home/steam/server-files |
 | Don't Starve Together | jamesits/dst-server:latest | 10999,11000,12346,12347/UDP; same public numbers required | /data |
+| Team Fortress 2 | ghcr.io/melkortf/tf2-base/amd64:latest | 27015/UDP; no public RCON or SourceTV | /home/tf2/devhub-data (inert; stateless) |
 
 Palworld upstream publishes amd64/arm64 images; Valheim's build and Arma's Compose
 specify linux/amd64. Terraria/Factorio retain existing image architecture behavior;
@@ -270,7 +308,7 @@ request/fanout/settings/mount plumbing needed to honor non-/data game paths.
 
 Run from ui: node scripts/check-game-presets.mjs (Node 24's TypeScript stripping).
 This is an offline catalog/schema regression validator, not a mock game server.
-It checks all ten identities, transport/persistence, multiports, typed fields,
+It checks all eleven identities, transport/persistence, multiports, typed fields,
 profiles, OCI/runtime version validation, missing/short credentials, masked
 summary values, backend policy and accessibility/navigation source guards.
 These source guards are NOT DOM/browser interaction proof.

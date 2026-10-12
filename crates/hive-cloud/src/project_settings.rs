@@ -2076,7 +2076,7 @@ fn upsert_env(row: &mut ProjectSettings, mut value: EnvVar) {
         value.key.trim().to_ascii_uppercase().as_str(),
         "PASSWORD" | "STEAM_LOGIN" | "BETA_ACCESSCODE" | "DISCORD_WEBHOOK_URL" | "STEAM_USER" | "STEAM_PASSWORD" | "STEAM_BRANCH_PASSWORD" | "SERVER_PASS"
             | "SERVER_PASSWORD" | "ADMIN_PASSWORD" | "RCON_PASSWORD" | "SUPERVISOR_HTTP_PASS"
-            | "GES_PASSWORD" | "GES_RCON_PASSWORD" | "DST_CLUSTER_TOKEN"
+            | "GES_PASSWORD" | "GES_RCON_PASSWORD" | "DST_CLUSTER_TOKEN" | "SERVER_TOKEN" | "STV_PASSWORD"
     );
     if !value.sensitive && (game_secret || looks_like_secret(&value.value)) {
         value.sensitive = true;
