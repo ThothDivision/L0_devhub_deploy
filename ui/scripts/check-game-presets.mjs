@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { GAME_SERVER_PRESETS, gamePresetEnvErrors, isSensitiveGameEnv, gameImageError, gameSummaryEnv } from '../lib/game-server-presets.ts';
+import { GAME_SERVER_PRESETS, GAME_SETUP_STEPS, gamePresetEnvErrors, isSensitiveGameEnv, gameImageError, gameSummaryEnv, gameReviewRows, gameFieldOptionLabel } from '../lib/game-server-presets.ts';
 const page=readFileSync(new URL('../app/new/page.tsx',import.meta.url),'utf8');
 const form=readFileSync(new URL('../components/game-hosting.tsx',import.meta.url),'utf8');
 const settings=readFileSync(new URL('../../crates/hive-cloud/src/project_settings.rs',import.meta.url),'utf8');
@@ -8,6 +8,8 @@ function check(ok,message){checks++;if(!ok)throw new Error(message);}
 const expected={minecraft:[25565,'tcp','/data',[]],terraria:[7777,'tcp','/opt/terraria/config',[]],factorio:[34197,'udp','/factorio',[]],palworld:[8211,'udp','/palworld',[]],valheim:[2456,'udp','/config',[2457,2458]],arma3:[2302,'udp','/arma3/server',[2303,2304,2305,2306]],'ark-ase':[7777,'udp','/app',[7778,27015]],gesource:[27015,'udp','/app/gesource/logs',[]],romestead:[8050,'udp','/home/steam/server-files',[]],dst:[10999,'udp','/data',[11000,12346,12347]],tf2:[27015,'udp','/home/tf2/devhub-data',[]]};
 // Presets whose upstream image exposes no env controls (command-line/cfg configured only).
 const NO_ENV_CONTROLS=new Set([]);
+const GROUPS=new Set(['basics','world','access','advanced']);
+check(JSON.stringify(GAME_SETUP_STEPS.map(s=>s.id))==='["basics","world","access","advanced"]'&&GAME_SETUP_STEPS.every(s=>s.title&&s.desc),'guided setup steps');
 check(GAME_SERVER_PRESETS.length===11,'eleven identities required');
 check(new Set(GAME_SERVER_PRESETS.map(p=>p.gameId)).size===11,'duplicate identities');
 for(const t of GAME_SERVER_PRESETS){
@@ -30,6 +32,19 @@ for(const t of GAME_SERVER_PRESETS){
   if(f.kind==='select')check(gamePresetEnvErrors(t,{...env,[f.key]:'fabricated-option'}).length>0,'bad select accepted');
   if(f.kind==='ids')for(const value of ['abc','1,,2','-1'])check(gamePresetEnvErrors(t,{...env,[f.key]:value}).length>0,'bad mods accepted');
  }
+ // Guided setup metadata: every field sits in a known step; required credentials are never hidden under Advanced.
+ for(const f of t.fields){
+  check(GROUPS.has(f.group),t.name+' field '+f.key+' missing/invalid group');
+  check(typeof f.label==='string'&&f.label.trim().length>0&&f.label!==f.key,t.name+' field '+f.key+' needs a friendly label');
+  for(const k of Object.keys(f.optionLabels??{}))check(f.kind==='select'&&f.options.includes(k),t.name+' optionLabels key '+k+' not an option');
+  if(f.kind==='select')for(const o of f.options)check(gameFieldOptionLabel(f,o).length>0,'empty option label');
+ }
+ for(const rule of t.requiredEnv)check(t.fields.find(f=>f.key===rule.key)?.group!=='advanced',t.name+' required '+rule.key+' hidden in Advanced');
+ check(t.fields.some(f=>f.group!=='advanced'),t.name+' has no guided (non-advanced) settings');
+ const review=gameReviewRows(t,Object.fromEntries(t.fields.map(f=>[f.key,f.kind==='select'?f.options[0]:f.kind==='integer'?String(f.min??1):'sentinel-'+f.key])));
+ check(review.length===t.fields.length&&review.every(r=>GROUPS.has(r.group)),t.name+' review rows incomplete');
+ for(const r of review){const f=t.fields.find(x=>x.key===r.key);if(f.kind==='secret'||isSensitiveGameEnv(f.key))check(!r.value.includes('sentinel')&&r.value==='Set (hidden)',t.name+' review leaks secret '+f.key);else if(f.kind!=='select'&&f.kind!=='integer')check(r.value==='sentinel-'+f.key,t.name+' review hides plain '+f.key);}
+ check(gameReviewRows(t,{}).every(r=>r.value==='Game default'||r.value==='Not set'),t.name+' empty review rows');
  for(const p of t.profiles)check(!gamePresetEnvErrors(t,{...env,...p.env}).length,'bad profile '+p.id);
  check(!JSON.stringify(gameSummaryEnv({...env,CUSTOM_KEY:'sentinel-secret'})).includes('sentinel'),'summary leaks values');
  check(!gamePresetEnvErrors(t,{...env,CUSTOM_KEY:'sentinel'}).join(' ').includes('sentinel'),'error leaks values');
@@ -74,7 +89,20 @@ for(const [k,v] of [['PASSWORD','correct-horse'],['AUTO_START_WORLD_NAME','My Wo
 check(form.includes('game.fields?.length ?'),'no-env-controls fallback missing');
 for(const key of ['PASSWORD','STEAM_LOGIN','BETA_ACCESSCODE','DISCORD_WEBHOOK_URL'])check(settings.includes('"'+key+'"')&&isSensitiveGameEnv(key),'secret policy missing '+key);
 check(page.includes('<GamesMenu')&&page.includes('<ConfigureGame')&&page.includes('TEMPLATES.filter(t => !t.gameId)'),'Games grouping not wired');
+// Game presets must never reach the generic template grid / env prefill / Environment Variables sections.
+check(!page.includes('GAME_SERVER_PRESETS')&&!page.includes('gamePresetEnvErrors'),'game presets leak into generic templates/env validation');
+check(page.includes('template.gameId ? [] :'),'generic image configure screen must not prefill game env');
+const tplBlock=page.slice(page.indexOf('const TEMPLATES: Template[] = ['),page.indexOf('];',page.indexOf('const TEMPLATES: Template[] = [')));
+check(tplBlock.length>0&&!/GAME|gameId|image:/.test(tplBlock),'TEMPLATES must not contain game/image presets');
+const gameKeys=new Set(GAME_SERVER_PRESETS.flatMap(t=>[...Object.keys(t.env),...t.fields.map(f=>f.key),...t.requiredEnv.map(r=>r.key)]));
+for(const key of gameKeys)check(!new RegExp('["\'`]'+key+'["\'`]|\\b'+key+'=').test(page),'game env key '+key+' leaks into new-project page');
 check(page.includes('volume_mount_path: opts.volumeMountPath')&&page.includes('image: opts.image'),'payload image/volume missing');
-for(const fragment of ['aria-label="Games"','htmlFor={"game-" + f.key}','id={"game-" + f.key}','Back to Games','Back to configuration','Review configuration','stage !== "review"','!game.extraPorts?.length || ingress','gameSummaryEnv(env)','type={f.kind === "secret" ? "password"','volumeMountPath: game.volumeMountPath','port: game.port','env, volumeMountPath','raw server errors are not shown'])check(form.includes(fragment),'form source guard missing '+fragment);
+const menuSrc=form.slice(form.indexOf('export function GamesMenu'),form.indexOf('function Step('));
+check(menuSrc.length>0&&!/\benv\b|fields|\.port\b|extraPorts|volumeMountPath|memory|setupNotes/.test(menuSrc),'Games menu must not show game settings before a game is chosen');
+check(/<details(?![^>]*\bopen\b)[^>]*><summary[^>]*>Advanced \(raw environment variables\)<\/summary>/.test(form),'raw env must be a collapsed Advanced section');
+check(form.indexOf('Advanced (raw environment variables)')>form.lastIndexOf('<Step n='),'raw env section must come after the guided steps');
+check(form.indexOf('What you need before you start')<form.indexOf('<Step n=')&&form.includes('game.setupNotes.map'),'before-you-start checklist missing');
+for(const fragment of ['GAME_SETUP_STEPS','fieldsIn("basics")','fieldsIn("advanced")','gameReviewRows(game, env)','gameFieldOptionLabel(f, v)','aria-invalid','show(f.key)','Confirm and continue'])check(form.includes(fragment),'guided setup fragment missing '+fragment);
+for(const fragment of ['aria-label="Games"','htmlFor={"game-" + f.key}','id: "game-" + f.key','Back to Games','Back to configuration','Review configuration','stage !== "review"','!game.extraPorts?.length || ingress','gameSummaryEnv(rawEnv)','type={f.kind === "secret" ? "password"','volumeMountPath: game.volumeMountPath','port: game.port','env, volumeMountPath','raw server errors are not shown'])check(form.includes(fragment),'form source guard missing '+fragment);
 check(settings.includes('game_secret || looks_like_secret(&value.value)'),'encrypted policy missing');
 console.log('PASS '+checks+' offline catalog/schema/source checks; all eleven games. No browser, registry or game-runtime proof.');

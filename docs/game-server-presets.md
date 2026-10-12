@@ -100,16 +100,32 @@ Factorio player limits/passwords/mod portal authentication belong to prepared
 server-settings.json, not invented env controls. Arma mission/player/game/admin
 settings belong to prepared configs; MODS_PRESET is a Launcher HTML preset path,
 not fabricated Workshop ID support. Terraria remains vanilla, no tModLoader.
-Advanced env editing remains available for existing non-transport settings and
+## Guided setup (UX)
+
+Games are not generic templates: they are only reachable from the Games menu,
+which lists names/descriptions only. No game settings, env keys, passwords or
+ports appear (and nothing prefills the generic Environment Variables sections of
+/new) until a game is chosen. The game screen then shows a "What you need before
+you start" checklist (platform/memory, ports, required credentials, saved-data
+path, plus the setupNotes) and numbered steps built from each field's `group`
+(`GAME_SETUP_STEPS`: 1 Server basics, 2 World & map, 3 Access & passwords,
+4 Advanced options; empty world/access steps are skipped). Fields carry friendly
+labels, help, optional `optionLabels`/`placeholder`, and show validation inline
+once touched or after "Review configuration" is pressed. Required credentials are
+never placed in Advanced. Raw env editing lives only in a collapsed
+"Advanced (raw environment variables)" section after the steps.
+
+Raw (advanced) env editing remains available for existing non-transport settings and
 additional upstream keys; public ports/admin exposure are fixed to safe metadata.
 Port changes require a separate audited custom-image flow; game-specific
 port/env coupling cannot drift through these screens.
 
 Configure → review → create is explicit, with back navigation and readiness
 checkboxes for image/platform/resources/volume/backup/backend policy; multiport
-profiles additionally require verified direct serving-node ingress. The entire
-summary hides env VALUES, even under unrecognized keys, to prevent cross-key
-credential leaks. Secrets are masked in inputs; errors name fields only, never
+profiles additionally require verified direct serving-node ingress. The review
+shows plain values only for typed non-secret guided fields (`gameReviewRows`);
+secret fields show "Set (hidden)", and raw/unrecognized keys keep hidden VALUES
+to prevent cross-key credential leaks. Secrets are masked in inputs; errors name fields only, never
 reflect submitted credentials or raw backend error strings. No config export.
 
 **Local runtime limitation:** the running native backend has not received the
@@ -310,7 +326,10 @@ Run from ui: node scripts/check-game-presets.mjs (Node 24's TypeScript stripping
 This is an offline catalog/schema regression validator, not a mock game server.
 It checks all eleven identities, transport/persistence, multiports, typed fields,
 profiles, OCI/runtime version validation, missing/short credentials, masked
-summary values, backend policy and accessibility/navigation source guards.
+summary values, backend policy and accessibility/navigation source guards, plus
+guided-setup metadata (every field has a valid group and label, required keys are
+not under Advanced, review rows never show secrets) and that no game preset/env
+leaks into the generic template grid or Environment Variables areas of /new.
 These source guards are NOT DOM/browser interaction proof.
 
 Also run the repository frontend type/build checks and applicable Rust compilation

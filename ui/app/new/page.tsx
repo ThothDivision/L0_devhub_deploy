@@ -15,7 +15,7 @@ import { PreparingDeployment } from "@/components/clone-animation";
 import Image from "next/image";
 import { MarketplaceDeploymentModal } from "@/components/marketplace-deployment-modal";
 import { DeploymentModelHelp } from "@/components/deployment-model-help";
-import { GAME_SERVER_PRESETS, gamePresetEnvErrors, isSensitiveGameEnv, type GameServerPreset, type GamePresetFields } from "@/lib/game-server-presets";
+import { isSensitiveGameEnv, type GameServerPreset, type GamePresetFields } from "@/lib/game-server-presets";
 
 import { GamesMenu, ConfigureGame } from "@/components/game-hosting";
 
@@ -86,13 +86,10 @@ const TEMPLATES: Template[] = [
   { name: "Cloudflare Workers", desc: "Deploy serverless functions to the edge.", repo: "https://github.com/cloudflare/templates", root: "worker-typescript-template", tag: "CF", color: "#f6821f", icon: "/frameworks/cloudflare-workers.png" },
   { name: "HTML Starter", desc: "A clean static site, deployed instantly.", repo: "https://github.com/mdn/beginner-html-site", tag: "H", color: "#e34f26", icon: "/frameworks/html5.png" },
   { name: "Container (Dockerfile)", desc: "Railway-style: build & run any Dockerfile.", repo: "https://github.com/crccheck/docker-hello-world", tag: "D", color: "#2496ed", icon: "/frameworks/docker.png" },
-  // Pre-built image, not a git clone — see `examples/minecraft-server/` in
-  // this repo for the equivalent compose.yaml and the raw-TCP/`/tcp`-suffix
-  // explanation. Real Java Edition server (itzg/minecraft-server), a
-  // world-standard, actively-maintained public image — EULA=TRUE is
-  // Mojang's own required acceptance flag, not a platform invention.
-
-  ...GAME_SERVER_PRESETS,
+  // Game servers are deliberately NOT generic templates: they live only in the
+  // <GamesMenu> catalog (lib/game-server-presets.ts) and open the guided
+  // <ConfigureGame> setup, so no game settings or env keys ever prefill the
+  // generic template grid or its Environment Variables section.
 
   // Web3 / smart contracts (EVM) — one entry per directory of Chainlink's
   // smart-contract-examples monorepo. Each is a self-contained Hardhat
@@ -104,6 +101,12 @@ const TEMPLATES: Template[] = [
   { name: "Smart Contract — Random SVG NFT", desc: "On-chain generative SVG NFT minted with Chainlink VRF (Hardhat).", repo: "https://github.com/smartcontractkit/smart-contract-examples", root: "random-svg-nft", branch: "main", tag: "Ξ", color: "#627eea" },
   { name: "Smart Contract — NFT Collection", desc: "Full NFT collection starter: ERC-721, deploy scripts, Chainlink (Hardhat).", repo: "https://github.com/smartcontractkit/smart-contract-examples", root: "ultimate-nft-repo", branch: "main", tag: "Ξ", color: "#8247e5" },
 ];
+
+/** Generic (non-game) env validation: key shape and single-line values only. */
+function genericEnvErrors(env: Record<string, string>): string[] {
+  return Object.entries(env).some(([key, value]) => ["__proto__", "prototype", "constructor"].includes(key) || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || /[\r\n\x00]/.test(value))
+    ? ["Environment keys must be letters, numbers or _ and values must be single-line."] : [];
+}
 
 function slug(s: string) {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
@@ -1006,7 +1009,9 @@ function ConfigureImageTemplate({
   const [memory, setMemory] = useState(template.memory ?? "");
   const [extraPorts, setExtraPorts] = useState<{ port: string; protocol: string; label: string }[]>(() => (template.extraPorts ?? []).map(row => ({ ...row, port: String(row.port) })));
   const [envVars, setEnvVars] = useState<{ key: string; value: string }[]>(() => {
-    const rows = Object.entries(template.env ?? {}).map(([key, value]) => ({ key, value }));
+    // Game presets never reach this generic screen (they use ConfigureGame);
+    // never seed game env here even if one is routed by mistake.
+    const rows = template.gameId ? [] : Object.entries(template.env ?? {}).map(([key, value]) => ({ key, value }));
     return rows.length ? rows : [{ key: "", value: "" }];
   });
   const [team, setTeam] = useState<string>(() => currentTeam());
@@ -1022,7 +1027,7 @@ function ConfigureImageTemplate({
     return out;
   };
 
-  const envErrors = gamePresetEnvErrors(template, buildEnv());
+  const envErrors = genericEnvErrors(buildEnv());
 
   return (
     <div className="mx-auto max-w-2xl">
@@ -1120,8 +1125,8 @@ function ConfigureImageTemplate({
           </button>
         </div>
 
-        {/* Environment Variables — pre-filled from the template (e.g. this
-            image's required EULA=TRUE) but fully editable/removable. */}
+        {/* Environment Variables — pre-filled from a non-game image template's
+            own env (games use the guided ConfigureGame setup) and fully editable. */}
         <div className="mb-6">
           <label className="mb-1.5 flex items-center gap-2 text-sm text-secondary">
             <KeyRound className="h-4 w-4 text-muted" /> Environment Variables
@@ -1155,7 +1160,7 @@ function ConfigureImageTemplate({
 
         <Button
           onClick={async () => {
-            if (gamePresetEnvErrors(template, buildEnv()).length) return;
+            if (genericEnvErrors(buildEnv()).length) return;
             if (typeof window !== "undefined") {
               await switchTeam(team === "personal" ? "__personal__" : team);
             }
