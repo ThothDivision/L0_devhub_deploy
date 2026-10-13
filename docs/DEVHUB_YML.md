@@ -1,8 +1,22 @@
 # devhub.yml and the DevHub GitHub Action
 
 `devhub.yml` is the standard, declarative DevHub project file. It sits at the
-root of an application repository and is read by the **Deploy to Autheo DevHub**
-GitHub Action defined in this repository's [`action.yml`](../action.yml).
+root of an application repository and is read in two places:
+
+- the **Deploy to Autheo DevHub** GitHub Action ([`action.yml`](../action.yml)), and
+- the **DevHub build itself** ([`crates/fluid-build/src/devhub_config.rs`](../crates/fluid-build/src/devhub_config.rs),
+  applied in `hive-cloud` `run_build`), so deploys from DevHub's own GitHub
+  integration, redeploys and webhooks follow the same file.
+
+Precedence everywhere: **explicit deploy request > `devhub.yml` > persisted project
+settings**. At build time the platform applies `root_dir` and `build.cache`
+(the log shows `devhub.yml v1 loaded …` and `Root directory` source
+`devhub_yml`). `env` values are applied only by the Action — the build never
+persists values from a repository file and logs just the keys. `target`,
+`branch` and `deploy.*` are request-time settings used by the Action. Like
+`vercel.json`, the file must be a regular (non-symlink) file under 64 KiB;
+an invalid file fails the build instead of being ignored, and having both
+`devhub.yml` and `devhub.yaml` is an error.
 
 ## Quick start
 
