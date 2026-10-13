@@ -1,0 +1,13 @@
+{
+  "name": "Deploy to Autheo DevHub",
+  "description": "Deploy this repository to Autheo DevHub (L0) using devhub.yml.",
+  "iconName": "devhub-deploy",
+  "categories": [
+    "Deployment"
+  ],
+  "filePatterns": [
+    "devhub\\.ya?ml$",
+    "package\\.json$",
+    "vercel\\.json$"
+  ]
+}

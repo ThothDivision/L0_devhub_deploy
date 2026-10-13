@@ -1,0 +1,24 @@
+# devhub.yml — standard Autheo DevHub project config (v1)
+# Read by the "Deploy to Autheo DevHub" GitHub Action (ThothDivision/L0_devhub_deploy).
+# Schema: https://raw.githubusercontent.com/ThothDivision/L0_devhub_deploy/main/schemas/devhub.schema.json
+version: 1
+
+# DevHub project name (lowercase DNS label). Omit to let DevHub assign one.
+project: my-app
+
+# Monorepo subdirectory to build. "." = repository root.
+root_dir: .
+
+# auto = classify by branch (production branch -> production, others/PRs -> preview).
+target: auto
+
+build:
+  cache: true            # false = clean install (npm ci, no cached node_modules)
+
+# Non-secret runtime env. Put secrets in the action's `env` input from GitHub secrets.
+env:
+  NODE_ENV: production
+
+deploy:
+  wait: true             # follow build logs and fail the job if the build errors
+  timeout_minutes: 20

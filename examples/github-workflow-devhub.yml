@@ -1,0 +1,22 @@
+# Copy to .github/workflows/devhub.yml in your app repository.
+name: Deploy to DevHub
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ThothDivision/L0_devhub_deploy@main
+        with:
+          token: ${{ secrets.DEVHUB_TOKEN }}
+          # api-url: https://dev.autheo.com/cloud   # default
+          # env: |
+          #   DATABASE_URL=${{ secrets.DATABASE_URL }}

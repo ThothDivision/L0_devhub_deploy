@@ -1,0 +1,78 @@
+name: "Deploy to Autheo DevHub"
+description: "Deploy a repository to Autheo DevHub (L0) from GitHub Actions, configured by a standard devhub.yml."
+author: "ThothDivision"
+branding:
+  icon: "upload-cloud"
+  color: "purple"
+
+inputs:
+  token:
+    description: "DevHub API key (shadw_...) from DevHub -> API keys. Store it as a repository secret."
+    required: true
+  api-url:
+    description: "DevHub API base. The hosted DevHub serves its API under /cloud."
+    required: false
+    default: "https://dev.autheo.com/cloud"
+  team:
+    description: "Team slug (x-hive-team). Usually inferred from the API key."
+    required: false
+    default: ""
+  config:
+    description: "Path to devhub.yml. Missing file = all defaults."
+    required: false
+    default: "devhub.yml"
+  project:
+    description: "Override devhub.yml project."
+    required: false
+    default: ""
+  target:
+    description: "Override target: auto | production | preview."
+    required: false
+    default: ""
+  env:
+    description: "Extra runtime env, one KEY=VALUE per line (use secrets here). Merged over devhub.yml env."
+    required: false
+    default: ""
+  wait:
+    description: "Wait for the build to finish and fail the job if it errors (true/false). Overrides devhub.yml."
+    required: false
+    default: ""
+  dry-run:
+    description: "Print the deploy request without calling DevHub."
+    required: false
+    default: "false"
+
+outputs:
+  build-id:
+    description: "DevHub build id"
+    value: ${{ steps.deploy.outputs.build-id }}
+  project:
+    description: "DevHub project name"
+    value: ${{ steps.deploy.outputs.project }}
+  state:
+    description: "Final build state (ready/error) when waiting, otherwise queued"
+    value: ${{ steps.deploy.outputs.state }}
+  url:
+    description: "Deployment URL when DevHub reports one"
+    value: ${{ steps.deploy.outputs.url }}
+
+runs:
+  using: "composite"
+  steps:
+    - id: deploy
+      shell: bash
+      env:
+        DEVHUB_TOKEN: ${{ inputs.token }}
+        DEVHUB_API_URL: ${{ inputs.api-url }}
+        DEVHUB_TEAM: ${{ inputs.team }}
+        DEVHUB_CONFIG: ${{ inputs.config }}
+        DEVHUB_PROJECT: ${{ inputs.project }}
+        DEVHUB_TARGET: ${{ inputs.target }}
+        DEVHUB_EXTRA_ENV: ${{ inputs.env }}
+        DEVHUB_WAIT: ${{ inputs.wait }}
+        DEVHUB_DRY_RUN: ${{ inputs.dry-run }}
+        DEVHUB_REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        DEVHUB_BRANCH: ${{ github.head_ref || github.ref_name }}
+        DEVHUB_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        DEVHUB_EVENT: ${{ github.event_name }}
+      run: python3 "${{ github.action_path }}/scripts/devhub-action/deploy.py"
